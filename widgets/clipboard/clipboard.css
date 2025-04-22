@@ -1,0 +1,17 @@
+#clipboard { border-radius: 0.4rem; }
+list { padding: 1rem; }
+
+/* Clipboard item */
+list row {
+    padding: 0.5rem;
+    border: 1px solid @dark4;
+    background: @dark2;
+    border-radius: 0.4rem;
+    margin-bottom: 0.5rem;
+}
+
+list .image {
+    border-radius: 0.3rem;
+    background-size: cover;
+    background-position: center;
+}

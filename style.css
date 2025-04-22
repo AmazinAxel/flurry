@@ -1,0 +1,53 @@
+/* Graphite Nord theme colors: https://github.com/vinceliuice/Graphite-gtk-theme/blob/main/src/sass/gtk/_colors-public.scss */
+
+
+/* For text input placeholders */
+@define-color placeholder_text_color #fff;
+
+/* Polar Night colors */
+@define-color dark1 #2e3440;
+@define-color dark2 #3b4252;
+@define-color dark3 #434c5e;
+@define-color dark4 #4c566a;
+
+/* Snow Storm colors */
+@define-color light1 #eceff4;
+@define-color light2 #e5e9f0;
+@define-color light3 #d8dee9;
+
+/* Nord Aurora colors */
+@define-color red #bf616a;
+@define-color orange #d08770;
+@define-color yellow #ebcb8b;
+@define-color green #a3be8c;
+@define-color purple #b48ead;
+
+/* Frost */
+@define-color blue1 #b5d2d9;
+@define-color blue2 #81a1c1;
+@define-color blue3 #5e81ac;
+@define-color blue4 #8fbcbb;
+
+button:focus { outline: none; }
+window {
+  background: transparent;
+  font-family: 'Sora';
+}
+
+calendar, .quickSettings {
+  border: 0;
+  border-radius: 0 5px 0 0;
+  background-color: @dark2;
+}
+
+#emojiPicker entry {
+  background-color: @dark3;
+  border-radius: 7px 7px 0 0;
+}
+
+.button:focus, .button:hover, list row:focus, list row:hover {
+  background-color: @blue2;
+  box-shadow: 0 0 5px 3px @blue3;
+  border: 1px solid @blue1;
+  transform: translateY(-2px) scale(1.01);
+}
