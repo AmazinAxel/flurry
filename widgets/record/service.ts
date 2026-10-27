@@ -6,8 +6,9 @@ import Battery from 'gi://AstalBattery';
 import { copyUri } from '../../lib/clipboard';
 import { locked } from '../lockscreen/lockscreen';
 
-const captureDir = '/home/alec/Videos/Captures';
-const clipsDir = '/home/alec/Videos/Clips';
+const videosDir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_VIDEOS);
+const captureDir = `${videosDir}/Captures`;
+const clipsDir = `${videosDir}/Clips`;
 
 const now = () => GLib.DateTime.new_now_local().format('%Y-%m-%d_%H-%M-%S');
 

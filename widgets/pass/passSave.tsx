@@ -58,9 +58,8 @@ const save = async () => {
     return notifySend({ appName: 'Pass', title: 'Unable to save password' });
   copyLogin(user, password);
 
-  // Sync with homelab
   execAsync('pass-sync')
-    .catch(() => notifySend({ appName: 'Pass', title: 'Pass sync to homelab failed' }));
+    .catch(() => notifySend({ appName: 'Pass', title: 'Pass sync failed' }));
 };
 export default () => inputControl('passSave', () =>
   <box halign={Gtk.Align.CENTER} valign={Gtk.Align.CENTER}>

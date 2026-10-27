@@ -7,16 +7,13 @@ import app from 'ags/gtk4/app';
 import inputControl from '../lib/inputControl';
 import idle from '../lib/idle';
 import type WebKitT from 'gi://WebKit?version=6.0';
+import config from '../config';
 
 const { TOP, BOTTOM, RIGHT } = Astal.WindowAnchor;
 
-export type PageName = 'plan' | 'claude' | 'custom';
+export type PageName = 'plan' | 'assistant' | 'custom';
 
-const urls: Record<PageName, string> = {
-  plan: 'https://alechomelab.jerboa-frog.ts.net/',
-  claude: 'https://claude.ai/new/',
-  custom: 'https://beta-docs.skriptlang.org/syntaxes/'
-};
+const urls: Partial<Record<PageName, string>> = config.sideview;
 
 // Mirrors dark/light mode
 const interfaceSettings = new Gio.Settings({ schema: 'org.gnome.desktop.interface' });
@@ -124,12 +121,13 @@ const ensurePage = (name: PageName) => {
   const bg = new Gdk.RGBA();
   bg.parse('#2e3440');
   webview.set_background_color(bg);
-  webview.load_uri(urls[name]);
+  webview.load_uri(urls[name]!);
   webviews[name] = webview;
   stack.add_named(webview, name);
 };
 
 export const showPage = async (name: PageName) => {
+  if (!urls[name]) return;
   const window = getWindow();
   if (window.visible && currentPage === name) return hideSideview();
 

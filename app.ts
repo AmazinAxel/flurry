@@ -9,6 +9,7 @@ import lockscreenStyle from './widgets/lockscreen/lockscreen.css';
 import app from 'ags/gtk4/app';
 import { Gtk } from 'ags/gtk4';
 import { execAsync } from 'ags/process';
+import GLib from 'gi://GLib';
 
 import status, { setStatusMargin } from './widgets/status/status';
 import sideview, { showPage, closeSideview, hideSideview, toggleSideviewFocus, toggleSideviewSize, type PageName } from './widgets/sideview';
@@ -72,9 +73,9 @@ const requests: Record<string, (arg?: string) => void> = {
 };
 
 const reminders = async () => {
-  const lastSync = Number(await readFileAsync('/home/alec/Projects/flake/ags/lastSync.txt').catch(() => 0));
+  const lastSync = Number(await readFileAsync(`${GLib.get_user_state_dir()}/flurry/lastSync`).catch(() => 0));
 
-  if ((Date.now() - lastSync) > 540000000) { // Last sync was ~7 days ago
+  if (GLib.find_program_in_path('sys-sync') && (Date.now() - lastSync) > 540000000) { // Last sync was ~7 days ago
     notifySend({
       appName: 'Sync',
       title: 'Sync system',
@@ -87,13 +88,14 @@ const reminders = async () => {
     return;
   }
 
-  const folderSize = await execAsync(['du', '-sb', '/home/alec/Downloads'])
+  const downloads = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)!;
+  const folderSize = await execAsync(['du', '-sb', downloads])
     .then((out) => parseInt(out)).catch(() => 0);
   if (folderSize > 100000000) { // Greater than 100MB
     notifySend({
       appName: 'Cleanup',
       title: 'Empty Downloads',
-      actions: [{ id: 1, label: 'View folder', command: 'nemo /home/alec/Downloads' }],
+      actions: [{ id: 1, label: 'View folder', command: `nemo ${downloads}` }],
     });
   }
 };

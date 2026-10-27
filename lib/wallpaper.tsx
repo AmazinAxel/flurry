@@ -3,6 +3,7 @@ import app from 'ags/gtk4/app';
 import Gdk from 'gi://Gdk';
 import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import cairo from 'cairo';
 import { createState } from 'ags';
 import perMonitor from './perMonitor';
@@ -37,7 +38,7 @@ const decode = (path: string, p: GdkPixbuf.Pixbuf): Wallpaper => {
 let current = '';
 
 const pick = () => {
-  const files = listFiles('/home/alec/Wallpapers').filter((f) => f != current);
+  const files = listFiles(`${GLib.get_home_dir()}/Wallpapers`).filter((f) => f != current);
   return files.length ? files[Math.floor(Math.random() * files.length)] : null;
 };
 
