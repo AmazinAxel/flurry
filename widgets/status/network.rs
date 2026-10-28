@@ -190,7 +190,8 @@ pub async fn refresh() {
         ((b == &current_net) as i32)
             .cmp(&((a == &current_net) as i32))
             .then(next[b].level.cmp(&next[a].level))
-            .then(next[a].ssid.cmp(&next[b].ssid))
+            // localeCompare: case-insensitive first
+            .then(next[a].ssid.to_lowercase().cmp(&next[b].ssid.to_lowercase()).then(next[a].ssid.cmp(&next[b].ssid)))
     });
     nets().set(next);
     if order != paths().peek() {

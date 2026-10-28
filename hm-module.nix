@@ -22,6 +22,7 @@ in {
       Unit = {
         PartOf = [ "graphical-session.target" ];
         After = [ "graphical-session-pre.target" ];
+        X-Restart-Triggers = [ "${cfg.package}" ]; # restart the running shell when a switch changes it
       };
       Service = {
         ExecStart = lib.getExe cfg.package;

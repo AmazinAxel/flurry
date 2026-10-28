@@ -53,9 +53,9 @@ fn build() -> Node {
 
 pub fn status_window() -> Rc<Win> {
     let w = Win::new(Spec { name: "status", anchor: Anchor::Bottom | Anchor::Left, ..Default::default() }, |_| build());
-    for s in [crate::lib::time::now().map(|_| ()), is_playing().map(|_| ()), playlist_index().map(|_| ())] {
-        w.watch(&s);
-    }
+    w.watch(&crate::lib::time::now());
+    w.watch(&is_playing());
+    w.watch(&playlist_index());
     w.watch(&audio::speakers());
     w.watch(&audio::default_name());
     w.watch(&crate::lib::battery::battery());
@@ -65,26 +65,20 @@ pub fn status_window() -> Rc<Win> {
     w.watch(&crate::widgets::status::modules::mpris::players());
     w.watch(&crate::widgets::record::service::is_rec());
     w.on_pointer(|ev, _| {
-        let PointerEvent::Scroll { y, dy, wheel, .. } = ev else { return };
+        let PointerEvent::Scroll { x, y, dy, wheel } = ev else { return };
         let Some(win) = window::get("status") else { return };
-        let Some((_, h)) = win.size() else { return };
-        // which block the pointer is over: the media block sits above the info block
-        let tree = build_laid_out(h as f32);
-        let over_media = tree.find("media").is_some_and(|n| (y as f32) < n.rect.bottom() + n.style.margin.bottom);
-        if over_media {
+        // each block has its own scroll controller; the gaps between them scroll nothing
+        let (x, y) = (x as f32, y as f32);
+        let inside = |id: &str| win.rect_of(id).is_some_and(|r| x >= r.left() && x < r.right() && y >= r.top() && y < r.bottom());
+        if inside("media") {
             media_scroll(dy, wheel);
-        } else if let Some(s) = audio::default_speaker() {
+        } else if inside("info")
+            && let Some(s) = audio::default_speaker()
+        {
             audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.002));
         }
     });
     w
-}
-
-fn build_laid_out(h: f32) -> Node {
-    let mut n = build();
-    let w = n.measure_w().1;
-    n.allocate(0.0, 0.0, w, h);
-    n
 }
 
 /// toggleInfoArea

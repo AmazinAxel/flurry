@@ -123,9 +123,14 @@ pub fn input_control(name: &'static str, build: impl Fn(&View) -> Node + 'static
                 w.redraw();
                 return true;
             }
-            let used = Entry::key(&b.entry, ev);
-            w.redraw();
-            return used;
+            if Entry::key(&b.entry, ev) {
+                w.redraw();
+                return true;
+            }
+        }
+        // GTK default focus chain: Tab / Shift+Tab
+        if matches!(ev.sym, Keysym::Tab | Keysym::ISO_Left_Tab) && !ev.ctrl && !ev.alt {
+            return w.focus_step(!ev.shift && ev.sym == Keysym::Tab);
         }
         false
     });

@@ -16,8 +16,7 @@ thread_local! {
     static PLAYING: State<bool> = State::new(false);
     static INDEX: State<usize> = State::new(0);
     static SOCK: RefCell<Option<Conn>> = const { RefCell::new(None) };
-    static QUEUE: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
-    static RUNNING: Cell<bool> = const { Cell::new(false) };
+    static QUEUE_LOCK: Rc<runtime::Queue> = Rc::default();
     static STARTED: Cell<bool> = const { Cell::new(false) };
     static SCROLL: Cell<f64> = const { Cell::new(0.0) };
 }
@@ -91,10 +90,8 @@ fn mpd(cmds: &[&str]) -> runtime::Receiver<Vec<String>> {
     let (tx, rx) = runtime::oneshot();
     let cmds: Vec<String> = cmds.iter().map(|s| s.to_string()).collect();
     runtime::spawn(async move {
-        while RUNNING.with(|r| r.get()) {
-            runtime::sleep(1).await;
-        }
-        RUNNING.with(|r| r.set(true));
+        let queue = QUEUE_LOCK.with(Clone::clone);
+        let _turn = queue.lock().await;
         let mut lines = vec![];
         for cmd in &cmds {
             lines = match send(cmd).await {
@@ -105,7 +102,6 @@ fn mpd(cmds: &[&str]) -> runtime::Receiver<Vec<String>> {
                 }
             };
         }
-        RUNNING.with(|r| r.set(false));
         tx.send(lines);
     });
     rx

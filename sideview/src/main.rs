@@ -350,9 +350,11 @@ fn main() {
             let phys = PhysicalSize::new(cw * state.scale as u32, ch * state.scale as u32);
             match &rendering {
                 Some(rc) => {
-                    rc.resize(phys);
-                    for wv in pages.values() {
-                        wv.resize(phys);
+                    // WebView::resize resizes the shared context and every web view; resizing the
+                    // context first would make it a no-op (sizes already equal)
+                    match pages.values().next() {
+                        Some(wv) => wv.resize(phys),
+                        None => rc.resize(phys),
                     }
                 }
                 None => {

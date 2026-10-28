@@ -436,3 +436,23 @@ impl Win {
         self.rects.borrow().iter().find(|(i, _)| i == id).map(|(_, r)| *r)
     }
 }
+
+impl Win {
+    /// Tab / Shift+Tab: next or previous focusable in tree order, wrapping around (GTK focus chain).
+    pub fn focus_step(&self, forward: bool) -> bool {
+        let list = self.focusables();
+        if list.is_empty() {
+            return false;
+        }
+        let cur = self.focused().and_then(|f| list.iter().position(|(id, _)| *id == f));
+        let n = list.len();
+        let next = match (cur, forward) {
+            (None, true) => 0,
+            (None, false) => n - 1,
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+        };
+        self.grab_focus(&list[next].0.clone());
+        true
+    }
+}

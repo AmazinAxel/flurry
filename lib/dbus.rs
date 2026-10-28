@@ -98,7 +98,10 @@ fn get(slot: &'static std::thread::LocalKey<RefCell<Option<Rc<Bus>>>>, kind: Bus
 
 impl Bus {
     fn pump(&self) {
-        let _ = self.ch.read_write(Some(Duration::ZERO));
+        if self.ch.read_write(Some(Duration::ZERO)).is_err() {
+            // bus gone (logout): stop watching or poll() would spin on the hung-up fd
+            runtime::unwatch(self.ch.watch().fd);
+        }
         self.dispatch();
     }
 

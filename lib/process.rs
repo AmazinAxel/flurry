@@ -152,6 +152,13 @@ pub fn spawn_lines(
 ) -> Option<Proc> {
     let mut c = command(argv)?;
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // long-lived helpers (gpu-screen-recorder, ffmpeg) must not outlive the shell
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut c, || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
     let mut child = c.spawn().ok()?;
     let pid = child.id();
     read_stream(child.stdout.take()?.into(), lines(stdout), || {});

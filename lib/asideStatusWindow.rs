@@ -116,7 +116,8 @@ pub fn aside_status_window() -> Rc<Win> {
             }
             return done(&w);
         }
-        if wrap_focus(&w, ev, false) {
+        let tab = matches!(ev.sym, Keysym::Tab | Keysym::ISO_Left_Tab) && !ev.ctrl && !ev.alt;
+        if wrap_focus(&w, ev, false) || (tab && w.focus_step(!ev.shift && ev.sym == Keysym::Tab)) {
             if let Some(f) = w.focused() {
                 bluetooth::on_focus(&f);
                 network::on_focus(&f);

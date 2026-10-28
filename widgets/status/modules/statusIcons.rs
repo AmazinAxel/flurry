@@ -52,12 +52,14 @@ pub fn status(base: &Style) -> Node {
         Node::icon(s, name, 14.0)
     };
     let b = battery().peek();
+    // visible={Boolean(battery.percentage)}: decided once, as soon as UPower has answered
     let has = HAS_BATTERY.with(|h| match h.get() {
         Some(v) => v,
-        None => {
+        None if b.loaded => {
             h.set(Some(b.percentage != 0.0));
             b.percentage != 0.0
         }
+        None => false,
     });
     let pct = (b.percentage * 100.0).round() as i64;
     let low = pct < 99;

@@ -95,7 +95,8 @@ pub fn default_speaker() -> Option<Sink> {
 }
 
 fn with<R>(f: impl FnOnce(&mut Pw) -> R) -> Option<R> {
-    PW.with(|p| p.borrow_mut().as_mut().map(f))
+    // try_borrow: a callback re-entering while PW is borrowed must not panic across the C boundary
+    PW.with(|p| p.try_borrow_mut().ok()?.as_mut().map(f))
 }
 
 fn update_sink(id: u32, f: impl FnOnce(&mut Sink)) {
@@ -171,6 +172,21 @@ pub fn start() {
                 ready().set(true);
             }
         })
+        .error(move |id, _, res, _| {
+            // core connection lost (pipewire restarted): drop everything and reconnect, like AstalWp
+            if id == 0 && res == -libc::EPIPE {
+                runtime::idle(|| {
+                    let fd = PW.with(|p| p.borrow_mut().take().map(|p| p._main.loop_().fd().as_raw_fd()));
+                    if let Some(fd) = fd {
+                        runtime::unwatch(fd);
+                    }
+                    speakers().set(vec![]);
+                    default_name().set(None);
+                    ready().set(false);
+                    runtime::timeout(1000, start);
+                });
+            }
+        })
         .register();
     std::mem::forget(core_listener);
 
@@ -189,13 +205,13 @@ pub fn start() {
             _registry_listener: Some(listener),
         })
     });
-    runtime::watch(fd, || {
-        PW.with(|p| {
-            if let Some(p) = p.borrow().as_ref() {
-                p._main.loop_().iterate(std::time::Duration::ZERO);
-            }
+    // the loop is dispatched without holding PW: its callbacks (registry, params) borrow PW themselves
+    let main_loop = PW.with(|p| p.borrow().as_ref().map(|p| p._main.clone()));
+    if let Some(main_loop) = main_loop {
+        runtime::watch(fd, move || {
+            main_loop.loop_().iterate(std::time::Duration::ZERO);
         });
-    });
+    }
 }
 
 fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option<String>) {

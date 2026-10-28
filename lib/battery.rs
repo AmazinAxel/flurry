@@ -14,6 +14,8 @@ pub struct Battery {
     pub state: i64,
     pub icon: String,
     pub present: bool,
+    /// GetAll answered (the status bar decides once whether to show the battery)
+    pub loaded: bool,
 }
 
 impl Battery {
@@ -72,5 +74,6 @@ pub fn start() {
         if let Some(p) = r.ok().and_then(|m| m.read1::<PropMap>().ok()) {
             apply(&p);
         }
+        battery().update(|b| b.loaded = true);
     });
 }

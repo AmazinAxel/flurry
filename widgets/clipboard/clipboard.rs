@@ -9,7 +9,7 @@ use xkbcommon::xkb::Keysym;
 
 use crate::lib::backgroundSection::background_section;
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
-use crate::lib::process::{exec, output};
+use crate::lib::process::exec;
 use crate::lib::searchDialog::search_entry;
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::style::*;

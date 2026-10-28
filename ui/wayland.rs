@@ -194,7 +194,8 @@ fn read_events() {
     {
         // compositor gone: exit so the session (systemd) can restart us with the next one
         eprintln!("flurry: lost the Wayland connection: {e}");
-        std::process::exit(1);
+        // _exit: skip thread-local destructors (surfaces would try to talk to the dead connection)
+        unsafe { libc::_exit(1) };
     }
     dispatch_pending();
 }
