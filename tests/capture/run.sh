@@ -8,7 +8,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
 if [[ ${1:-} != __inner ]]; then
-  flurry=$(command -v "${1:-flurry}")
+  flurry=$(realpath "$(command -v "${1:-flurry}")")
   out=$(realpath -m "${2:-$here/../golden}")
   mkdir -p "$out"
   tools='with import <nixpkgs> {}; buildEnv { name = "flurry-capture"; paths = [
@@ -45,6 +45,7 @@ mkdir -p "$H/.cache/cliphist"
 printf 'hello from the clipboard' | cliphist store
 printf 'https://example.org/a/very/long/link/that/should/wrap/inside/the/clipboard/list/item' | cliphist store
 printf 'second line\nthird line' | cliphist store
+magick -size 320x200 gradient:"#bf616a-#5e81ac" png:- | cliphist store
 
 mkdir -p "$tmp/bin"
 printf '#!/bin/sh\nexit 0\n' > "$tmp/bin/gpu-screen-recorder"

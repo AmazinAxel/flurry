@@ -219,6 +219,17 @@ pub fn shell_split(s: &str) -> Vec<String> {
     out
 }
 
+/// Runs with stdout written to `path` (binary-safe); true on exit status 0.
+pub async fn to_file(argv: &[&str], path: &str) -> bool {
+    let Some(mut c) = command(argv) else { return false };
+    let Ok(f) = std::fs::File::create(path) else { return false };
+    c.stdin(Stdio::null()).stdout(f).stderr(Stdio::null());
+    match c.spawn() {
+        Ok(child) => wait(child).await == Some(0),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,16 +260,5 @@ mod tests {
         let (a, b) = got.borrow_mut().take().expect("finished");
         assert_eq!(a, Ok("hi".into()));
         assert_eq!(b, Err("bad".into()));
-    }
-}
-
-/// Runs with stdout written to `path` (binary-safe); true on exit status 0.
-pub async fn to_file(argv: &[&str], path: &str) -> bool {
-    let Some(mut c) = command(argv) else { return false };
-    let Ok(f) = std::fs::File::create(path) else { return false };
-    c.stdin(Stdio::null()).stdout(f).stderr(Stdio::null());
-    match c.spawn() {
-        Ok(child) => wait(child).await == Some(0),
-        Err(_) => false,
     }
 }

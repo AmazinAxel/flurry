@@ -1,4 +1,5 @@
-#![allow(non_snake_case)]
+#![allow(non_snake_case, special_module_name)]
+#![allow(clippy::type_complexity, clippy::module_inception)]
 
 mod config;
 mod lib;
@@ -8,7 +9,7 @@ mod widgets;
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 
 use lib::{asideState, mediaPlayer, streamingMode::streaming_mode, xdg};
 use ui::{runtime, window};
@@ -94,19 +95,6 @@ fn serve() {
     });
 }
 
-/// Client mode: forwards the arguments to the running shell.
-fn client(args: &[String]) -> i32 {
-    let Ok(mut s) = UnixStream::connect(socket_path()) else {
-        eprintln!("flurry is not running");
-        return 1;
-    };
-    let line = args.join(" ") + "\n";
-    let _ = s.write_all(line.as_bytes());
-    let mut reply = [0u8; 16];
-    let _ = s.read(&mut reply);
-    0
-}
-
 fn reminders() {
     let last: u64 = std::fs::read_to_string(format!("{}/flurry/lastSync", xdg::state_dir())).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
@@ -121,10 +109,14 @@ fn reminders() {
         return;
     }
     let downloads = xdg::user_dir("DOWNLOAD");
-    if dir_size(std::path::Path::new(&downloads)) > 100_000_000 {
+    // the walk can take a while on a full folder: off the loop
+    ui::runtime::spawn(async move {
+        let d = downloads.clone();
         // Greater than 100MB
-        lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), format!("nemo {downloads}"))]);
-    }
+        if ui::runtime::blocking(move || dir_size(std::path::Path::new(&d))).await.unwrap_or(0) > 100_000_000 {
+            lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), format!("nemo {downloads}"))]);
+        }
+    });
 }
 
 /// `du -sb`: apparent size of everything under `p`.
@@ -142,10 +134,6 @@ fn dir_size(p: &std::path::Path) -> u64 {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
-        std::process::exit(client(&args));
-    }
     if !ui::wayland::connect() {
         eprintln!("flurry: cannot connect to the Wayland display");
         std::process::exit(1);
@@ -190,7 +178,6 @@ fn main() {
         lib::brightness::monitor();
         service::start();
         lib::apps::reload();
-        lib::apps::watch();
         reminders();
         service::start_clipping_service();
         ui::text::release_fontconfig();

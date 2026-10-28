@@ -18,10 +18,14 @@ pub fn decode_png(bytes: &[u8]) -> Option<Pixmap> {
     from_rgba(rgba, info.width, info.height)
 }
 
-pub fn decode_jpeg(bytes: &[u8]) -> Option<Pixmap> {
+fn jpeg_decoder(bytes: &[u8]) -> zune_jpeg::JpegDecoder<&[u8]> {
     let opts = zune_jpeg::zune_core::options::DecoderOptions::default()
         .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
-    let mut d = zune_jpeg::JpegDecoder::new_with_options(bytes, opts);
+    zune_jpeg::JpegDecoder::new_with_options(bytes, opts)
+}
+
+pub fn decode_jpeg(bytes: &[u8]) -> Option<Pixmap> {
+    let mut d = jpeg_decoder(bytes);
     let px = d.decode().ok()?;
     let (w, h) = d.dimensions()?;
     from_rgba(px, w as u32, h as u32)
@@ -34,6 +38,23 @@ pub fn decode(bytes: &[u8]) -> Option<Pixmap> {
         [0xff, 0xd8, ..] => decode_jpeg(bytes),
         _ => None,
     }
+}
+
+/// Decodes into the buffer `alloc(w, h, fill)` provides, as premultiplied RGBA; `fill` reports
+/// success. JPEGs (opaque, so already premultiplied) decode straight in, with no intermediate copy.
+pub fn decode_into<T>(bytes: &[u8], alloc: impl FnOnce(u32, u32, &dyn Fn(&mut [u8]) -> bool) -> Option<T>) -> Option<T> {
+    if bytes.starts_with(&[0xff, 0xd8]) {
+        let mut d = jpeg_decoder(bytes);
+        d.decode_headers().ok()?;
+        let (w, h) = d.dimensions()?;
+        let d = std::cell::RefCell::new(d);
+        return alloc(w as u32, h as u32, &|dst| d.borrow_mut().decode_into(dst).is_ok());
+    }
+    let pix = decode(bytes)?;
+    alloc(pix.width(), pix.height(), &|dst| {
+        dst.copy_from_slice(pix.data());
+        true
+    })
 }
 
 fn from_rgba(mut rgba: Vec<u8>, w: u32, h: u32) -> Option<Pixmap> {
@@ -49,7 +70,7 @@ fn from_rgba(mut rgba: Vec<u8>, w: u32, h: u32) -> Option<Pixmap> {
 }
 
 /// Average Rec.601 luma of a 16x9 nearest-neighbour sample (wallpaper.tsx `decode`).
-pub fn is_light(p: &Pixmap) -> bool {
+pub fn is_light(p: tiny_skia::PixmapRef) -> bool {
     let mut sum = 0.0;
     for y in 0..9 {
         for x in 0..16 {

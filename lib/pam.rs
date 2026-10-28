@@ -38,7 +38,7 @@ const PAM_ERROR_MSG: c_int = 3;
 const PAM_TEXT_INFO: c_int = 4;
 
 pub enum Event {
-    Info(String),
+    Info,
     Error(String),
     Done(bool),
 }
@@ -138,7 +138,7 @@ pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(E
             b.drain(..5 + len);
             on_event(match kind {
                 0 => Event::Done(text == "1"),
-                1 => Event::Info(text),
+                1 => Event::Info,
                 _ => Event::Error(text),
             });
         }

@@ -41,8 +41,6 @@ fn connect() -> Option<UnixStream> {
 
 thread_local! {
     static SOCK: RefCell<Option<UnixStream>> = const { RefCell::new(None) };
-    static QUEUE: RefCell<Vec<(u32, String, runtime::Sender<Option<Json>>)>> = const { RefCell::new(Vec::new()) };
-    static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Blocking round trip on a short-lived local socket; sway replies within microseconds.

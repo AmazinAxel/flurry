@@ -7,7 +7,8 @@ use std::rc::Rc;
 use crate::lib::state::State;
 use crate::ui::image;
 use crate::ui::node::{Img, Kind, Node, Style};
-use crate::ui::wayland::{Anchor, Layer, ShmImage};
+use crate::ui::runtime;
+use crate::ui::wayland::{Anchor, Layer, ShmImage, ShmPixels};
 use crate::ui::window::{Spec, Win};
 
 #[derive(Clone)]
@@ -61,19 +62,26 @@ fn pick() -> Option<String> {
     (!files.is_empty()).then(|| files.swap_remove(random(files.len())))
 }
 
-fn load(path: String) -> Option<Wallpaper> {
-    let pix = image::decode(&std::fs::read(&path).ok()?)?;
-    let light = image::is_light(&pix);
-    let shm = ShmImage::new(pix.width(), pix.height(), |dst| dst.copy_from_slice(pix.data()))?;
-    Some(Wallpaper { path, shm, light })
+/// Reads and decodes straight into shared memory; runs on a worker thread.
+fn decode(path: &str) -> Option<(ShmPixels, bool)> {
+    let pixels = image::decode_into(&std::fs::read(path).ok()?, |w, h, fill| {
+        let mut p = ShmPixels::new(w, h)?;
+        fill(p.data()).then_some(p)
+    })?;
+    let light = image::is_light(pixels.pixmap());
+    Some((pixels, light))
 }
 
 /// Swaps in another random wallpaper (decoded on demand: a preloaded one would cost a second
-/// full-size image in memory all the time).
+/// full-size image in memory all the time). The decode never blocks the loop (lock, unlock, startup).
 pub fn random_wallpaper() {
-    if let Some(w) = pick().and_then(load) {
-        current().set(Some(w));
-    }
+    let Some(path) = pick() else { return };
+    runtime::spawn(async move {
+        let p = path.clone();
+        if let Some(Some((pixels, light))) = runtime::blocking(move || decode(&p)).await {
+            current().set(Some(Wallpaper { path, shm: ShmImage::from_pixels(pixels), light }));
+        }
+    });
 }
 
 /// The wallpaper as a cover-fit picture node (BackgroundSection header, lockscreen).

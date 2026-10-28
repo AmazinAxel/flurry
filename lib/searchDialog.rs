@@ -30,7 +30,6 @@ pub fn search_entry(base: &Style, entry: &EntryRef, icon: &'static str, focused:
     s.min_height = 36.0;
     s.outline = Some((2.0, -3.0, rgba(255, 255, 255, 0x1c as f32 / 255.0)));
     let mut img_style = s.inherit();
-    img_style.color = light1();
     img_style.margin = Sides::trbl(0.0, 6.0, 2.0, 2.0);
     let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
     let _ = focused;
@@ -39,6 +38,18 @@ pub fn search_entry(base: &Style, entry: &EntryRef, icon: &'static str, focused:
         entry::text_node(entry, s.inherit(), look),
     ])
     .focusable("entry")
+}
+
+/// Graphite `entry` (passSave fields, wifi password) with flurry's square corners.
+pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str) -> Node {
+    let mut s = base.inherit();
+    s.min_height = 36.0;
+    s.padding = Sides::vh(0.0, 8.0);
+    s.background = Background::Color(rgba(255, 255, 255, 0.04));
+    // Graphite entry text; :focus-within never matches (GTK does not consider layer windows active)
+    s.color = rgba(255, 255, 255, 0.7);
+    let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
+    Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look)]).focusable(id).expand(true, false)
 }
 
 pub fn hex_sel() -> tiny_skia::Color {
@@ -53,7 +64,7 @@ pub fn row_style(base: &Style, selected: bool, sensitive: bool) -> Style {
     let mut s = button(base);
     s.padding = Sides::all(8.0);
     if selected {
-        s = focus_outline(button_active(s));
+        s = focus_outline(s);
         s.translate_y = -2.0;
     }
     if !sensitive {
@@ -115,13 +126,17 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
                 }
                 return true;
             }
-            if ev.sym != Keysym::Up && ev.sym != Keysym::Down {
-                return false;
-            }
+            // arrows, or Ctrl+j/k (plain letters go to the search entry)
+            let delta = match ev.sym {
+                Keysym::Down => 1,
+                Keysym::Up => -1,
+                Keysym::j if ev.ctrl => 1,
+                Keysym::k if ev.ctrl => -1,
+                _ => return false,
+            };
             let len = items.borrow().len();
             if len > 0 {
                 let cur = selected.borrow().map(|i| i as i64).unwrap_or(-1);
-                let delta = if ev.sym == Keysym::Down { 1 } else { -1 };
                 *selected.borrow_mut() = Some(crate::lib::wrapFocus::wrap_index(cur, delta, len as i64) as usize);
             }
             true
@@ -140,7 +155,6 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
 
     input_control(name, build, Opts {
         on_show: spec.on_show.clone(),
-        searchable: true,
         on_key: Some(on_key),
         focus: Some("entry"),
         entries: vec![EntryBinding { id: "entry", entry, on_activate: Some(activate), on_key: None }],

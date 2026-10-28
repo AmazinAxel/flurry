@@ -384,7 +384,13 @@ pub fn set_volume(sink: &Sink, volume: f64) {
             })
             .collect()
     };
-    update_sink(sink.id, |s| s.volume = v);
+    // channels too: a drag sends many steps before PipeWire echoes back, and scaling stale channels
+    // by a fresh volume shrank every step (dragging to max landed at a fraction)
+    let c = channels.clone();
+    update_sink(sink.id, |s| {
+        s.volume = v;
+        s.channels = c;
+    });
     apply(sink, Some(channels), None);
 }
 

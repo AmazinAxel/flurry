@@ -45,11 +45,7 @@ impl Default for Spec {
 
 /// What a window's build function sees.
 pub struct View {
-    pub w: f32,
-    pub h: f32,
     pub focus: Option<String>,
-    /// Output name for per-monitor windows
-    pub output: String,
 }
 
 impl View {
@@ -72,13 +68,13 @@ pub struct Win {
     key: RefCell<Option<KeyHandler>>,
     pointer: RefCell<Option<Rc<dyn Fn(PointerEvent, &str)>>>,
     on_show: RefCell<Vec<Rc<dyn Fn()>>>,
-    on_hide: RefCell<Vec<Rc<dyn Fn()>>>,
     pub visibility: State<bool>,
     image: RefCell<Option<Rc<wayland::ShmImage>>>,
 }
 
 thread_local! {
     static WINDOWS: RefCell<HashMap<&'static str, Rc<Win>>> = RefCell::default();
+    static TRIM: RefCell<Option<super::runtime::Timer>> = const { RefCell::new(None) };
 }
 
 pub fn get(name: &str) -> Option<Rc<Win>> {
@@ -111,7 +107,6 @@ impl Win {
             key: RefCell::default(),
             pointer: RefCell::default(),
             on_show: RefCell::default(),
-            on_hide: RefCell::default(),
             visibility: State::new(false),
             image: RefCell::default(),
         });
@@ -144,10 +139,12 @@ impl Win {
             self.sync_outputs();
         } else {
             self.surfaces.borrow_mut().clear();
-            // hand the freed buffers and layout scratch back to the kernel right away
-            unsafe { libc::malloc_trim(0) };
-            for f in self.on_hide.borrow().clone() {
-                f();
+            // hand freed buffers back to the kernel once things settle, never in the hide path
+            let t = super::runtime::timeout(1000, || unsafe {
+                libc::malloc_trim(0);
+            });
+            if let Some(old) = TRIM.with(|x| x.borrow_mut().replace(t)) {
+                old.cancel();
             }
         }
         self.visibility.set(v);
@@ -170,9 +167,6 @@ impl Win {
 
     pub fn on_show(&self, f: impl Fn() + 'static) {
         self.on_show.borrow_mut().push(Rc::new(f));
-    }
-    pub fn on_hide(&self, f: impl Fn() + 'static) {
-        self.on_hide.borrow_mut().push(Rc::new(f));
     }
     pub fn on_key(&self, f: impl Fn(&KeyEvent) -> bool + 'static) {
         *self.key.borrow_mut() = Some(Rc::new(f));
@@ -201,10 +195,9 @@ impl Win {
 
     fn create(self: &Rc<Self>, spec: &Spec, output_name: String, output: Option<wayland_client::protocol::wl_output::WlOutput>) -> Surface {
         let weak = Rc::downgrade(self);
-        let name = output_name.clone();
-        let build: wayland::BuildFn = Rc::new(move |w, h| {
+        let build: wayland::BuildFn = Rc::new(move |_, _| {
             let Some(win) = weak.upgrade() else { return Node::label(Default::default(), "") };
-            let view = View { w, h, focus: win.focus.borrow().clone(), output: name.clone() };
+            let view = View { focus: win.focus.borrow().clone() };
             (win.build)(&view)
         });
         let layer = LayerSpec {
@@ -256,6 +249,14 @@ impl Win {
         s
     }
 
+    /// Steps `f` on every frame of each surface, re-rendering while it returns true.
+    pub fn animate(&self, f: impl Fn() -> bool + 'static) {
+        let f: Rc<dyn Fn() -> bool> = Rc::new(f);
+        for (_, s) in self.surfaces.borrow().iter() {
+            s.animate(f.clone());
+        }
+    }
+
     pub fn redraw(&self) {
         for (_, s) in self.surfaces.borrow().iter() {
             s.redraw();
@@ -279,29 +280,6 @@ impl Win {
         for (_, s) in self.surfaces.borrow().iter() {
             s.set_keymode(k);
         }
-    }
-
-    pub fn set_exclusive(&self, zone: i32) {
-        self.spec.borrow_mut().exclusive = zone;
-        for (_, s) in self.surfaces.borrow().iter() {
-            s.set_exclusive(zone);
-        }
-    }
-
-    pub fn set_width(&self, w: u32) {
-        self.spec.borrow_mut().width = w;
-        if self.visible() {
-            // layer size is fixed at creation in our Surface; recreate
-            self.surfaces.borrow_mut().clear();
-        }
-    }
-
-    pub fn size(&self) -> Option<(u32, u32)> {
-        self.surfaces.borrow().first().map(|(_, s)| s.size())
-    }
-
-    pub fn has_keyboard(&self) -> bool {
-        self.surfaces.borrow().iter().any(|(_, s)| s.has_keyboard())
     }
 
     pub fn grab_focus(&self, id: &str) {

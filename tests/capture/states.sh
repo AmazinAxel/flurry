@@ -1,5 +1,5 @@
 # Sourced by run.sh: drives flurry through every window/state and grabs a screenshot of each.
-inst=$(ags list 2>/dev/null | head -1)
+inst=$(ags list 2>/dev/null | head -1 || true)
 if [[ -n $inst ]]; then # the AGS build
   req() { ags request -i "$inst" "$@"; sleep 0.3; }
   toggle() { ags toggle -i "$inst" "$1"; sleep 0.3; }
@@ -30,7 +30,7 @@ swaymsg workspace 2 >/dev/null; shot workspaces 0.15
 sleep 1
 
 toggle launcher; key 'fo'; shot launcher
-key -k Down; shot launcher-down
+key -M ctrl j -m ctrl; shot launcher-down
 key -k Escape
 
 toggle clipboard; shot clipboard
@@ -50,13 +50,16 @@ key -k Escape
 
 toggle powermenu; shot powermenu
 key -k Escape
+toggle osd; shot osd 0.2
+toggle osd
 
 req toggleQuicksettings; shot quickSettings
 req toggleCalendar; shot calendar
-key -k Down; shot calendar-down
+key -k Right; shot calendar-next
+key -M ctrl -k Left -m ctrl; shot calendar-prev-year
 req toggleBluetooth; shot bluetooth
 req toggleWifi; shot wifi
-key -k Down; shot wifi-down
+key j; shot wifi-down
 req closeAsideStatusMenuWidget
 
 req lock; shot lockscreen 1

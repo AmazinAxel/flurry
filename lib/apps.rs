@@ -129,25 +129,6 @@ pub fn reload() {
     APPS.with(|a| *a.borrow_mut() = apps);
 }
 
-/// Rescans when any applications dir changes.
-pub fn watch() {
-    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-    if fd < 0 {
-        return;
-    }
-    for d in app_dirs() {
-        if let Ok(c) = std::ffi::CString::new(d.to_string_lossy().as_bytes()) {
-            unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_CREATE | libc::IN_DELETE | libc::IN_MODIFY | libc::IN_MOVED_TO | libc::IN_MOVED_FROM) };
-        }
-    }
-    let rescan = crate::ui::runtime::idle_once(reload);
-    crate::ui::runtime::watch(fd, move || {
-        let mut buf = [0u8; 4096];
-        while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-        rescan();
-    });
-}
-
 fn fuzzy_match_string(pattern: &[u8], s: &[u8]) -> i32 {
     let not_found = -10;
     if pattern.is_empty() {
@@ -216,12 +197,12 @@ fn score(term: &str, a: &App) -> f64 {
 pub fn fuzzy_query(term: &str) -> Vec<App> {
     let mut arr = APPS.with(|a| a.borrow().clone());
     if term.is_empty() {
-        arr.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        arr.sort_by_key(|a| std::cmp::Reverse(a.frequency));
         return arr;
     }
     if term.chars().count() == 1 {
         arr.retain(|a| score(term, a) != 0.0);
-        arr.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        arr.sort_by_key(|a| std::cmp::Reverse(a.frequency));
         return arr;
     }
     arr.retain(|a| score(term, a) >= 0.5);

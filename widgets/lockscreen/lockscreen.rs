@@ -22,7 +22,7 @@ use crate::ui::window;
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Failed {
     None,
-    Failed,
+    Password,
     Fprint,
 }
 
@@ -82,7 +82,7 @@ fn check_login() {
             if n >= 5 {
                 logind::reboot();
             } else {
-                auth_failed().set(Failed::Failed);
+                auth_failed().set(Failed::Password);
             }
         }
         BUSY.with(|b| b.set(false));
@@ -133,7 +133,7 @@ fn clock_style(failed: Failed) -> Style {
     s.color = alpha(blue1(), 0.9);
     s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(32.0, alpha(blue2(), 0.8))];
     match failed {
-        Failed::Failed => {
+        Failed::Password => {
             s.color = red();
             s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(16.0, red())];
         }
@@ -151,19 +151,19 @@ fn clock_style(failed: Failed) -> Style {
 }
 
 fn build(_w: f32, _h: f32) -> Node {
+    // wallpaper and the dark gradient (the hidden password entry) are the surface's backdrop
     let base = window();
-    let picture = wallpaper::picture(base.inherit(), 0.0);
-    // the hidden password entry fills the screen and doubles as the dark gradient
-    let cover = Style { background: Background::Vertical(rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.5)), ..base.inherit() };
     let mut clock = Node::label(clock_style(auth_failed().peek()), format_now("%H\n%M")).align(Align::Center, Align::Center);
     if let Kind::Label(LabelSpec { line_height, .. }) = &mut clock.kind {
         *line_height = Some(0.75);
     }
-    Node::overlay(base.inherit(), vec![picture.expand(true, true), Node::hbox(cover, 0.0, vec![]).expand(true, true), clock])
+    Node::overlay(base.inherit(), vec![clock])
 }
 
 fn assign_lock_window(output: &wayland::Output) {
-    let Some(s) = wayland::lock_surface(&output.wl, Rc::new(build)) else { return };
+    let image = wallpaper::current().peek().map(|w| w.shm);
+    let gradient = (rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.5));
+    let Some(s) = wayland::lock_surface(&output.wl, Rc::new(build), image, gradient) else { return };
     s.on_key(handle_keys);
     SURFACES.with(|l| l.borrow_mut().push((output.name.clone(), s)));
 }
@@ -272,7 +272,7 @@ impl Fprint {
         self.running.set(true);
         let me = self.clone();
         pam::authenticate("astal-fprint", None, move |ev| match ev {
-            pam::Event::Info(_) => {}
+            pam::Event::Info => {}
             pam::Event::Error(msg) => {
                 if msg.contains("Failed to match") {
                     me.mismatches.set(me.mismatches.get() + 1);
@@ -282,7 +282,7 @@ impl Fprint {
                     t.cancel();
                 }
                 if me.mismatches.get() >= 5 {
-                    auth_failed().set(Failed::Failed);
+                    auth_failed().set(Failed::Password);
                 } else {
                     auth_failed().set(Failed::Fprint);
                     let t = runtime::timeout(400, || {
@@ -332,6 +332,7 @@ pub fn start() {
     const REASON: &str = "Lock screen before sleep";
     inhibit_sleep(REASON);
     sleeping().subscribe(|| {
+        auth_failed().set(Failed::None); // never sleep or wake on a stale red/orange clock
         if !sleeping().peek() {
             inhibit_sleep(REASON);
         } else if is_locked() {

@@ -47,9 +47,9 @@ pub fn search(q: &str) -> Vec<String> {
     hits.into_iter().take(5).map(|h| h.0).collect()
 }
 
-fn copy_pair(name: &String) {
+fn copy_pair(name: &str) {
     window::set_visible("pass", false);
-    let name = name.clone();
+    let name = name.to_string();
     runtime::spawn(async move {
         let out = exec(&["pass", "show", &name]).await.unwrap_or_default();
         let mut lines = out.split('\n');
@@ -83,7 +83,7 @@ pub fn pass() {
     search_dialog("pass", SearchSpec {
         placeholder: "Passwords",
         search: Box::new(search),
-        activate: Rc::new(copy_pair),
+        activate: Rc::new(|n: &String| copy_pair(n)),
         shift_activate: None,
         row: Box::new(|n, s| {
             let mut l = s.inherit();

@@ -107,7 +107,7 @@ pub fn focus_menu() {
             let header = search_entry(&base, &ec, "emoji-flags-symbolic", v.focused("entry"));
             background_section(&base, header, None, 0.0, 400.0)
         },
-        Opts { searchable: true, focus: Some("entry"), entries: vec![EntryBinding { id: "entry", entry: e, on_activate: Some(start), on_key: None }], ..Default::default() },
+        Opts { focus: Some("entry"), entries: vec![EntryBinding { id: "entry", entry: e, on_activate: Some(start), on_key: None }], ..Default::default() },
     );
 }
 
@@ -151,15 +151,9 @@ pub fn focus_task() -> Rc<Win> {
     // animate the 10s break bar on frame callbacks only while it runs
     let fw = Rc::downgrade(&w);
     break_wait().subscribe(move || {
-        fn tick(w: std::rc::Weak<Win>) {
-            let Some(win) = w.upgrade() else { return };
-            if !active() || BREAK_START.with(|s| s.get()).is_none() {
-                return;
-            }
-            win.redraw();
-            runtime::timeout(100, move || tick(w.clone()));
+        if let Some(w) = fw.upgrade() {
+            w.animate(|| active() && BREAK_START.with(|s| s.get()).is_some());
         }
-        tick(fw.clone());
     });
     w
 }

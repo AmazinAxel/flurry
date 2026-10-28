@@ -113,7 +113,7 @@ fn load_playlist() {
         cmds.insert(0, "crossfade 2".into());
     }
     let refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
-    let _ = mpd(&refs);
+    mpd(&refs);
 }
 
 fn start() {
@@ -124,7 +124,7 @@ fn start() {
 
 pub fn upd_track(next: bool) {
     start();
-    let _ = mpd(&[if next { "next" } else { "previous" }, "play"]);
+    mpd(&[if next { "next" } else { "previous" }, "play"]);
     is_playing().set(true);
 }
 
@@ -134,7 +134,7 @@ pub fn play_pause() {
     runtime::spawn(async move {
         let status = rx.await.unwrap_or_default();
         let playing = status.iter().any(|l| l == "state: play");
-        let _ = mpd(&[if playing { "pause 1" } else { "play" }]);
+        mpd(&[if playing { "pause 1" } else { "play" }]);
     });
     let p = is_playing();
     p.set(!p.peek());
@@ -144,7 +144,7 @@ pub fn chng_playlist(next: bool) {
     let n = PLAYLISTS.len();
     let i = playlist_index();
     i.set((i.peek() + if next { 1 } else { n - 1 }) % n);
-    let _ = mpd(&["pause 1"]);
+    mpd(&["pause 1"]);
     is_playing().set(false);
     load_playlist();
     play_pause();
@@ -152,7 +152,7 @@ pub fn chng_playlist(next: bool) {
 
 /// Status bar media block scroll: accumulate and send whole volume steps.
 pub fn media_scroll(dy: f64, wheel: bool) {
-    let step = crate::lib::scrollStep::scroll_step(dy, wheel, 5.0, 0.2);
+    let step = crate::lib::scrollStep::scroll_step(dy, wheel, 5.0, 0.3);
     let n = SCROLL.with(|a| {
         let v = a.get() - step;
         let n = v.trunc();
@@ -160,6 +160,6 @@ pub fn media_scroll(dy: f64, wheel: bool) {
         n as i64
     });
     if n != 0 {
-        let _ = mpd(&[&format!("volume {n}")]);
+        mpd(&[&format!("volume {n}")]);
     }
 }

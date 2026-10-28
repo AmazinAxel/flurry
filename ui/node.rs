@@ -63,8 +63,6 @@ pub enum Align {
 pub enum Background {
     None,
     Color(Color),
-    /// top-to-bottom linear gradient
-    Vertical(Color, Color),
 }
 
 #[derive(Clone, Debug)]
@@ -85,7 +83,6 @@ pub struct Style {
     pub text_shadow: Vec<Shadow>,
     pub icon_shadow: Vec<Shadow>,
     pub translate_y: f32,
-    pub radius: f32,
     /// CSS line-height in px (Pango absolute line height, extra space split above/below)
     pub line_height: Option<f32>,
 }
@@ -110,7 +107,6 @@ impl Default for Style {
             text_shadow: vec![],
             icon_shadow: vec![],
             translate_y: 0.0,
-            radius: 0.0,
             line_height: None,
         }
     }
@@ -564,13 +560,6 @@ impl Node {
         .unwrap_or(r)
     }
 
-    pub fn find(&self, id: &str) -> Option<&Node> {
-        if self.id.as_deref() == Some(id) {
-            return Some(self);
-        }
-        self.children.iter().filter(|c| c.visible).find_map(|c| c.find(id))
-    }
-
     /// Bounding box of everything painted, shadows and outlines included (None: paints nothing).
     pub fn painted_bounds(&self) -> Option<Rect> {
         if !self.visible {
@@ -604,7 +593,7 @@ impl Node {
             if let Some(b) = c.painted_bounds() {
                 let b = b.transform(Transform::from_translate(0.0, s.translate_y)).unwrap_or(b);
                 add(match self.kind {
-                    Kind::Scroll { .. } => b.intersect(&self.content_rect()).unwrap_or(b),
+                    Kind::Scroll { .. } => vclip(b, self.content_rect()).unwrap_or(b),
                     _ => b,
                 });
             }
@@ -642,18 +631,6 @@ impl Node {
         match &self.style.background {
             Background::None => {}
             Background::Color(c) => fill_rect(pm, r, *c, ts),
-            Background::Vertical(a, b) => {
-                if let Some(shader) = tiny_skia::LinearGradient::new(
-                    (0.0, r.top()).into(),
-                    (0.0, r.bottom()).into(),
-                    vec![tiny_skia::GradientStop::new(0.0, *a), tiny_skia::GradientStop::new(1.0, *b)],
-                    tiny_skia::SpreadMode::Pad,
-                    Transform::identity(),
-                ) {
-                    let paint = Paint { shader, anti_alias: false, ..Default::default() };
-                    pm.fill_rect(r, &paint, ts, None);
-                }
-            }
         }
         for s in self.style.box_shadow.iter().filter(|s| s.inset) {
             paint_inset_shadow(pm, r, s, ts);
@@ -686,15 +663,13 @@ impl Node {
 
         let clip = matches!(self.kind, Kind::Scroll { .. });
         if clip {
-            // children render into a clipped layer
-            let (w, h) = (pm.width(), pm.height());
-            if let Some(mut layer) = Pixmap::new(w, h) {
+            // clipped vertically only (the scrolling axis): rows' focus outlines may overhang the sides
+            let kids = self.children.iter().filter_map(Node::painted_bounds).reduce(union);
+            if let Some((mut layer, (ox, oy))) = kids.and_then(|k| vclip(k, c)).and_then(|r| clip_layer(r, ts)) {
                 for ch in &self.children {
-                    ch.paint(&mut layer.as_mut(), ts);
+                    ch.paint(&mut layer.as_mut(), ts.post_translate(-ox, -oy));
                 }
-                let mut mask = tiny_skia::Mask::new(w, h).unwrap();
-                mask.fill_path(&PathBuilder::from_rect(c), FillRule::Winding, false, ts);
-                pm.draw_pixmap(0, 0, layer.as_ref(), &PixmapPaint::default(), Transform::identity(), Some(&mask));
+                pm.draw_pixmap(ox as i32, oy as i32, layer.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
             }
         } else {
             for ch in &self.children {
@@ -711,11 +686,31 @@ impl Node {
     }
 }
 
+/// `b` limited to `c`'s vertical extent.
+fn vclip(b: Rect, c: Rect) -> Option<Rect> {
+    Rect::from_ltrb(b.left(), b.top().max(c.top()), b.right(), b.bottom().min(c.bottom()))
+}
+
 fn union(a: Rect, b: Rect) -> Rect {
     Rect::from_ltrb(a.left().min(b.left()), a.top().min(b.top()), a.right().max(b.right()), a.bottom().max(b.bottom())).unwrap_or(a)
 }
 
-pub fn fill_rect(pm: &mut PixmapMut, r: Rect, c: Color, ts: Transform) {
+/// A transparent layer covering the pixels a non-antialiased fill of `r` touches, and its device origin.
+pub(crate) fn clip_layer(r: Rect, ts: Transform) -> Option<(Pixmap, (f32, f32))> {
+    let d = r.transform(ts)?;
+    let (x0, y0) = (d.left().round(), d.top().round());
+    let layer = Pixmap::new((d.right().round() - x0).max(1.0) as u32, (d.bottom().round() - y0).max(1.0) as u32)?;
+    Some((layer, (x0, y0)))
+}
+
+pub(crate) fn hash(v: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut s = std::hash::DefaultHasher::new();
+    v.hash(&mut s);
+    s.finish()
+}
+
+pub fn fill_rect(pm:&mut PixmapMut, r: Rect, c: Color, ts: Transform) {
     let mut paint = Paint::default();
     paint.set_color(c);
     paint.anti_alias = false;
@@ -742,12 +737,22 @@ fn paint_border(pm: &mut PixmapMut, r: Rect, b: Sides, c: [Color; 4], ts: Transf
 }
 
 /// Renders `draw` into an alpha layer in device space, blurs it, and composites it tinted.
-fn blurred(pm: &mut PixmapMut, bounds: Rect, radius: f32, color: Color, ts: Transform, draw: impl FnOnce(&mut PixmapMut, Transform)) {
-    let scale = ts.sx;
+/// `content` identifies what `draw` paints, so identical shadows reuse the blurred layer.
+pub(crate) fn blurred(pm: &mut PixmapMut, bounds: Rect, radius: f32, color: Color, ts: Transform, content: u64, draw: impl FnOnce(&mut PixmapMut, Transform)) {
+    thread_local! {
+        static SHADOWS: std::cell::RefCell<std::collections::HashMap<u64, Rc<Pixmap>>> = Default::default();
+    }
+    let scale = (ts.sx * ts.sx + ts.ky * ts.ky).sqrt(); // also right when rotated
     let pad = (radius * scale * 1.5).ceil() + 2.0;
     let dev = bounds.transform(ts).unwrap_or(bounds);
     let (ox, oy) = ((dev.left() - pad).floor(), (dev.top() - pad).floor());
     let (w, h) = ((dev.width() + pad * 2.0).ceil() as u32 + 1, (dev.height() + pad * 2.0).ceil() as u32 + 1);
+    let c = color.to_color_u8();
+    let key = hash(&(content, w, h, (dev.left() - ox).to_bits(), (dev.top() - oy).to_bits(), radius.to_bits(), scale.to_bits(), [c.red(), c.green(), c.blue(), c.alpha()]));
+    if let Some(l) = SHADOWS.with(|s| s.borrow().get(&key).cloned()) {
+        pm.draw_pixmap(ox as i32, oy as i32, Pixmap::as_ref(&l), &PixmapPaint::default(), Transform::identity(), None);
+        return;
+    }
     let Some(mut layer) = Pixmap::new(w, h) else { return };
     draw(&mut layer.as_mut(), ts.post_translate(-ox, -oy));
     blur(&mut layer, radius * scale);
@@ -761,6 +766,14 @@ fn blurred(pm: &mut PixmapMut, bounds: Rect, radius: f32, color: Color, ts: Tran
         px[3] = (al * 255.0).round() as u8;
     }
     pm.draw_pixmap(ox as i32, oy as i32, layer.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    SHADOWS.with(|s| {
+        let mut s = s.borrow_mut();
+        // bounded: changing text (clock, titles) would otherwise grow it forever
+        if s.len() >= 64 {
+            s.clear();
+        }
+        s.insert(key, Rc::new(layer));
+    });
 }
 
 fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
@@ -778,7 +791,7 @@ fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
     if s.blur <= 0.0 {
         fill_rect(&mut layer.as_mut(), sr, s.color, lts);
     } else {
-        blurred(&mut layer.as_mut(), sr, s.blur, s.color, lts, |p, t| fill_rect(p, sr, Color::BLACK, t));
+        blurred(&mut layer.as_mut(), sr, s.blur, s.color, lts, hash(&(sr.width().to_bits(), sr.height().to_bits())), |p, t| fill_rect(p, sr, Color::BLACK, t));
     }
     let clear = Paint { blend_mode: tiny_skia::BlendMode::Clear, anti_alias: false, ..Default::default() };
     layer.fill_rect(r, &clear, lts, None);
@@ -787,7 +800,9 @@ fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
 
 fn paint_inset_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
     // inset: the area between the padding box and a rect shrunk by spread (offset by x/y)
-    let Some(inner) = Rect::from_ltrb(r.left() + s.spread + s.x, r.top() + s.spread + s.y, r.right() - s.spread + s.x, r.bottom() - s.spread + s.y) else {
+    // inner clipped to the box, so the even-odd fill stays inside it
+    let inner = Rect::from_ltrb(r.left() + s.spread + s.x, r.top() + s.spread + s.y, r.right() - s.spread + s.x, r.bottom() - s.spread + s.y);
+    let Some(inner) = inner.and_then(|i| i.intersect(&r)) else {
         fill_rect(pm, r, s.color, ts);
         return;
     };
@@ -795,11 +810,9 @@ fn paint_inset_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
     pb.push_rect(r);
     pb.push_rect(inner);
     let Some(path) = pb.finish() else { return };
-    let mut clip = tiny_skia::Mask::new(pm.width(), pm.height()).unwrap();
-    clip.fill_path(&PathBuilder::from_rect(r), FillRule::Winding, false, ts);
     let mut paint = Paint::default();
     paint.set_color(s.color);
-    pm.fill_path(&path, &paint, FillRule::EvenOdd, ts, Some(&clip));
+    pm.fill_path(&path, &paint, FillRule::EvenOdd, ts, None);
 }
 
 pub(crate) fn paint_text_shadow(pm: &mut PixmapMut, layout: &Layout, x: f32, y: f32, s: &Shadow, ts: Transform) {
@@ -808,7 +821,7 @@ pub(crate) fn paint_text_shadow(pm: &mut PixmapMut, layout: &Layout, x: f32, y: 
         text::draw(pm, layout, x + s.x, y + s.y, s.color, ts);
         return;
     }
-    blurred(pm, bounds, s.blur, s.color, ts, |p, t| text::draw(p, layout, x + s.x, y + s.y, Color::BLACK, t));
+    blurred(pm, bounds, s.blur, s.color, ts, layout.content_hash(), |p, t| text::draw(p, layout, x + s.x, y + s.y, Color::BLACK, t));
 }
 
 fn paint_icon_shadow(pm: &mut PixmapMut, name: &str, size: f32, x: f32, y: f32, s: &Shadow, ts: Transform) {
@@ -817,7 +830,7 @@ fn paint_icon_shadow(pm: &mut PixmapMut, name: &str, size: f32, x: f32, y: f32, 
         icons::draw(pm, name, size, x + s.x, y + s.y, s.color, ts);
         return;
     }
-    blurred(pm, bounds, s.blur, s.color, ts, |p, t| icons::draw(p, name, size, x + s.x, y + s.y, Color::BLACK, t));
+    blurred(pm, bounds, s.blur, s.color, ts, hash(&(name, size.to_bits())), |p, t| icons::draw(p, name, size, x + s.x, y + s.y, Color::BLACK, t));
 }
 
 fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f32, ts: Transform) {
@@ -834,9 +847,11 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
     let t = ts.pre_translate(dx, dy).pre_scale(dw / sw, dh / sh).pre_translate(-sx, -sy);
     let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
     if radius <= 0.0 {
-        let mut clip = tiny_skia::Mask::new(pm.width(), pm.height()).unwrap();
-        clip.fill_path(&PathBuilder::from_rect(c), FillRule::Winding, false, ts);
-        pm.draw_pixmap(0, 0, pix, &paint, t, Some(&clip));
+        // pattern fill over the visible part of the image, no clip mask
+        let Some(area) = Rect::from_xywh(dx, dy, dw, dh).and_then(|d| d.intersect(&c)) else { return };
+        let pt = Transform::from_translate(dx, dy).pre_scale(dw / sw, dh / sh).pre_translate(-sx, -sy);
+        let shader = tiny_skia::Pattern::new(pix, tiny_skia::SpreadMode::Pad, paint.quality, 1.0, pt);
+        pm.fill_rect(area, &Paint { shader, anti_alias: false, ..Default::default() }, ts, None);
         return;
     }
     // GTK `filter: blur()` blurs the rendered node; edges fade out over the radius.

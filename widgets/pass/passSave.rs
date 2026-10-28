@@ -6,11 +6,11 @@ use crate::lib::backgroundSection::{background_section, header_style};
 use crate::lib::clipboard::{copy, copy_login, pipe};
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::process::exec_str;
-use crate::lib::searchDialog::{hex_sel, sel_fg};
+use crate::lib::searchDialog::plain_entry;
 use crate::lib::state::State;
 use crate::lib::style::*;
-use crate::ui::entry::{self, EntryRef, Look};
-use crate::ui::node::{Align, Background, Node, Sides, Style, rgba};
+use crate::ui::entry;
+use crate::ui::node::{Align, Node, Sides};
 use crate::ui::{runtime, window};
 
 const LOWER: &str = "abcdefghijklmnopqrstuvwxyz";
@@ -43,19 +43,6 @@ pub fn random_password(length: usize) -> String {
 
 thread_local! {
     static GENERATED: State<bool> = State::new(false);
-}
-
-/// Graphite `entry` (focus ring #dbdee5 inside) with flurry's square corners.
-fn entry_node(base: &Style, e: &EntryRef, id: &'static str, focused: bool) -> Node {
-    let mut s = base.inherit();
-    s.min_height = 36.0;
-    s.padding = Sides::vh(0.0, 8.0);
-    s.background = Background::Color(rgba(255, 255, 255, 0.04));
-    // Graphite entry text; :focus-within never matches (GTK does not consider layer windows active)
-    s.color = rgba(255, 255, 255, 0.7);
-    let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
-    let _ = focused;
-    Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look)]).focusable(id).expand(true, false)
 }
 
 pub fn pass_save() {
@@ -99,17 +86,17 @@ pub fn pass_save() {
 
     let build = {
         let (site, user, pass) = (site.clone(), user.clone(), pass.clone());
-        move |v: &window::View| {
+        move |_: &window::View| {
             let base = window();
             let generated = GENERATED.with(|g| g.peek());
             let mut icon = base.inherit();
             icon.color = if generated { blue2() } else { dark4() };
             icon.margin = Sides::trbl(0.0, 3.0, 0.0, 0.0);
             let content = Node::vbox(base.inherit(), 4.0, vec![
-                entry_node(&base, &site, "site", v.focused("site")),
-                entry_node(&base, &user, "user", v.focused("user")),
+                plain_entry(&base, &site, "site"),
+                plain_entry(&base, &user, "user"),
                 Node::hbox(base.inherit(), 4.0, vec![
-                    entry_node(&base, &pass, "pass", v.focused("pass")),
+                    plain_entry(&base, &pass, "pass"),
                     Node::icon(icon, "dialog-password-symbolic", 16.0).align(Align::Fill, Align::Center),
                 ]),
             ]);

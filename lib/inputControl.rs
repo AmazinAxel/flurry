@@ -23,7 +23,6 @@ pub struct EntryBinding {
 #[derive(Default)]
 pub struct Opts {
     pub on_show: Option<Action>,
-    pub searchable: bool,
     pub actions: Actions,
     pub ctrl_actions: Actions,
     pub on_key: Option<Rc<dyn Fn(&KeyEvent) -> bool>>,
@@ -37,16 +36,17 @@ pub struct Opts {
 pub const DIM: [f32; 4] = [0.0, 0.0, 0.0, 0.3];
 
 /// lib/wrapFocus.ts: arrows move focus (with wrap) unless a modifier is held or the focused widget
-/// consumes them (entries own Left/Right).
-pub fn wrap_focus(win: &Win, ev: &KeyEvent, owns_horizontal: bool) -> bool {
+/// consumes them (entries own Left/Right and typed letters). hjkl work like arrows outside entries.
+pub fn wrap_focus(win: &Win, ev: &KeyEvent, entry_focused: bool) -> bool {
+    let vim = matches!(ev.sym, Keysym::h | Keysym::j | Keysym::k | Keysym::l);
     let dir = match ev.sym {
-        Keysym::Up => Dir::Up,
-        Keysym::Down => Dir::Down,
-        Keysym::Left => Dir::Left,
-        Keysym::Right => Dir::Right,
+        Keysym::Up | Keysym::k => Dir::Up,
+        Keysym::Down | Keysym::j => Dir::Down,
+        Keysym::Left | Keysym::h => Dir::Left,
+        Keysym::Right | Keysym::l => Dir::Right,
         _ => return false,
     };
-    if win.focused().is_none() || ev.ctrl || ev.alt || ev.shift || (owns_horizontal && matches!(dir, Dir::Left | Dir::Right)) {
+    if win.focused().is_none() || ev.ctrl || ev.alt || ev.shift || (entry_focused && (vim || matches!(dir, Dir::Left | Dir::Right))) {
         return false;
     }
     win.wrap_focus(dir);

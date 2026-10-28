@@ -253,12 +253,11 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         if a != b && !shown.is_empty() {
             // selected glyphs in the selection color, clipped to the selection
             let (sa, sb) = (x_at(e.display_index(a)), x_at(e.display_index(b)));
-            if let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height()) {
-                let mut mask = tiny_skia::Mask::new(pm.width(), pm.height()).unwrap();
-                mask.fill_path(&tiny_skia::PathBuilder::from_rect(sel), tiny_skia::FillRule::Winding, false, ts);
-                let mut layer = tiny_skia::Pixmap::new(pm.width(), pm.height()).unwrap();
-                text::draw(&mut layer.as_mut(), &layout, x, y, look.selection_fg, ts);
-                pm.draw_pixmap(0, 0, layer.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), Some(&mask));
+            if let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height())
+                && let Some((mut layer, (ox, oy))) = super::node::clip_layer(sel, ts)
+            {
+                text::draw(&mut layer.as_mut(), &layout, x, y, look.selection_fg, ts.post_translate(-ox, -oy));
+                pm.draw_pixmap(ox as i32, oy as i32, layer.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
             }
         }
         if look.caret && a == b {

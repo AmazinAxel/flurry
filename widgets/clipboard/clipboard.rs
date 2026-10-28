@@ -143,12 +143,26 @@ fn request_thumb(item: &Item) {
             } else {
                 decode_bytes(item.id, &file).await
             };
-        let thumb = if ready { load_scaled(&file).map(|p| Thumb::Ready(Rc::new(p))).unwrap_or(Thumb::Failed) } else { Thumb::Failed };
+        // decoding a screenshot takes tens of ms: off the loop
+        let pix = if ready { runtime::blocking(move || load_scaled(&file)).await.flatten() } else { None };
+        let thumb = pix.map(|p| Thumb::Ready(Rc::new(p))).unwrap_or(Thumb::Failed);
         THUMBS.with(|t| t.borrow_mut().insert(item.id, thumb));
         if let Some(w) = window::get("clipboard") {
             w.redraw();
         }
     });
+}
+
+/// Image/video rows stay hidden until their thumbnail exists, so they are requested up front
+/// (requesting from the row builder never fired: hidden rows are never built).
+fn request_thumbs() {
+    if streaming_mode().peek() {
+        return;
+    }
+    let media: Vec<Item> = ITEMS.with(|i| i.borrow().iter().filter(|x| x.image.is_some() || x.video).cloned().collect());
+    for item in &media {
+        request_thumb(item);
+    }
 }
 
 fn describe(item: &Item) -> String {
@@ -166,7 +180,6 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
         return Some(Node::label(row.inherit(), describe(item)).xalign(0.0));
     }
     if item.image.is_some() || item.video {
-        request_thumb(item);
         return match THUMBS.with(|t| t.borrow().get(&item.id).cloned()) {
             Some(Thumb::Ready(p)) => {
                 let (w, h) = (p.width() as f32, p.height() as f32);
@@ -195,14 +208,21 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
 
 fn visible_rows() -> Vec<Item> {
     let q = QUERY.with(|q| q.borrow().clone());
-    let mut items: Vec<Item> = ITEMS.with(|i| i.borrow().clone());
-    items.sort_by(|a, b| b.id.cmp(&a.id));
     let streaming = streaming_mode().peek();
+    // filter first, clone only what is shown
+    let mut items: Vec<Item> = THUMBS.with(|t| {
+        let t = t.borrow();
+        ITEMS.with(|i| {
+            i.borrow()
+                .iter()
+                .filter(|i| streaming || (i.image.is_none() && !i.video) || !matches!(t.get(&i.id), Some(Thumb::Loading) | None))
+                .filter(|i| q.is_empty() || i.search.contains(&q))
+                .cloned()
+                .collect()
+        })
+    });
+    items.sort_by_key(|i| std::cmp::Reverse(i.id));
     items
-        .into_iter()
-        .filter(|i| streaming || (i.image.is_none() && !i.video) || !matches!(THUMBS.with(|t| t.borrow().get(&i.id).cloned()), Some(Thumb::Loading) | None))
-        .filter(|i| q.is_empty() || i.search.contains(&q))
-        .collect()
 }
 
 fn select_top(keep: bool) {
@@ -289,6 +309,7 @@ async fn refresh_items() {
             THUMBS.with(|t| t.borrow_mut().retain(|id, _| !stale.contains(id)));
         }
         select_top(true);
+        request_thumbs();
     }
     if let Some(w) = window::get("clipboard") {
         w.redraw();
@@ -410,18 +431,18 @@ pub fn clipboard() {
             s.margin.bottom = if i + 1 == count { 0.0 } else { 8.0 };
             s.color = light1();
             if selected {
-                s = focus_outline(button_active(s));
+                s = focus_outline(s);
                 s.translate_y = -2.0;
             }
             let Some(inner) = item_node(&base, item, &s) else { continue };
             let row = Node::vbox(s, 0.0, vec![inner]);
-            let h = row.measure_h(500.0 - 32.0 - 6.0 - 20.0).1;
+            let h = row.measure_h(500.0 - 32.0 - 6.0).1;
             geometry.push((item.id, y, h + row.style.margin.bottom));
             y += h + row.style.margin.bottom;
             nodes.push(row);
         }
         scroll_into_view(&geometry, 460.0 - 20.0);
-        let list = Node::vbox(Style { padding: Sides::all(10.0), ..base.inherit() }, 0.0, nodes);
+        let list = Node::vbox(Style { padding: Sides::vh(10.0, 0.0), ..base.inherit() }, 0.0, nodes);
         let scroll = Node { children: vec![list], ..Node::new(Kind::Scroll { max_height: 460.0, offset: SCROLL.with(Cell::get) }, base.inherit()) }.show(count > 0);
         let header = search_entry(&base, &ec, "system-search-symbolic", v.focused("entry"));
         background_section(&base, header, Some(scroll), 700.0, 500.0)
@@ -429,7 +450,6 @@ pub fn clipboard() {
     let ctrl = |k: Keysym, f: fn()| -> (Keysym, crate::lib::inputControl::Action) { (k, Rc::new(f)) };
     let w = input_control("clipboard", build, Opts {
         on_show: Some(Rc::new(|| select_top(false))),
-        searchable: true,
         focus: Some("entry"),
         actions: vec![
             ctrl(Keysym::Return, || {
@@ -441,6 +461,8 @@ pub fn clipboard() {
             ctrl(Keysym::Down, || move_selection(1)),
         ],
         ctrl_actions: vec![
+            ctrl(Keysym::k, || move_selection(-1)),
+            ctrl(Keysym::j, || move_selection(1)),
             ctrl(Keysym::c, || {
                 if let Some(i) = visible_rows().get(1) {
                     activate(i); // copy 2nd recent entry
@@ -461,8 +483,7 @@ pub fn clipboard() {
     });
     w.watch(&streaming_mode());
     streaming_mode().subscribe(|| {
-        ITEMS.with(|i| i.borrow_mut().clear()); // rebuild
-        runtime::spawn(refresh_items());
+        request_thumbs(); // rows themselves just redraw (watched above): no refetch gap
     });
     runtime::spawn(refresh_items());
     watch_db();

@@ -80,22 +80,6 @@ pub fn idle(f: impl FnOnce() + 'static) {
     RT.with(|rt| rt.idle.borrow_mut().push_back(Box::new(f)));
 }
 
-/// Returns a function that queues `f` at most once per idle pass.
-pub fn idle_once(f: impl Fn() + 'static) -> impl Fn() + Clone {
-    let f = Rc::new(f);
-    let queued = Rc::new(Cell::new(false));
-    move || {
-        if queued.replace(true) {
-            return;
-        }
-        let (f, queued) = (f.clone(), queued.clone());
-        idle(move || {
-            queued.set(false);
-            f();
-        });
-    }
-}
-
 pub fn spawn(fut: impl Future<Output = ()> + 'static) {
     RT.with(|rt| {
         let id = rt.task_seq.get() + 1;
@@ -194,6 +178,7 @@ pub fn iterate(block: bool) {
 }
 
 /// Future resolving after `ms` milliseconds.
+#[cfg(test)]
 pub fn sleep(ms: u64) -> impl Future<Output = ()> {
     let (tx, rx) = oneshot();
     timeout(ms, move || tx.send(()));
@@ -263,6 +248,24 @@ pub fn readable(fd: RawFd) -> impl Future<Output = ()> {
     async move { rx.await.unwrap_or(()) }
 }
 
+/// Runs CPU/disk-bound `f` (image decodes, directory walks) on a worker thread so the loop never
+/// stalls; resolves when it finishes (None if it panicked). The pipe's hangup wakes the loop.
+pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        return Some(f());
+    }
+    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+        drop(wr);
+    });
+    readable(rd.as_raw_fd()).await;
+    rx.try_recv().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,21 +290,6 @@ mod tests {
         timeout(10, move || c.borrow_mut().push(9)).cancel();
         drive(|| log.borrow().len() == 2);
         assert_eq!(*log.borrow(), vec![1, 2]);
-    }
-
-    #[test]
-    fn idle_once_coalesces() {
-        let n = Rc::new(Cell::new(0));
-        let m = n.clone();
-        let f = idle_once(move || m.set(m.get() + 1));
-        f();
-        f();
-        f();
-        iterate(false);
-        assert_eq!(n.get(), 1);
-        f();
-        iterate(false);
-        assert_eq!(n.get(), 2);
     }
 
     #[test]

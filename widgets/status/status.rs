@@ -75,7 +75,7 @@ pub fn status_window() -> Rc<Win> {
         } else if inside("info")
             && let Some(s) = audio::default_speaker()
         {
-            audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.002));
+            audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.003));
         }
     });
     w

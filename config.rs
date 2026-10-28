@@ -2,7 +2,7 @@ use crate::settings;
 
 /// Sideview pages: defaults, overridden/extended by settings.sideview.
 pub fn sideview() -> Vec<(&'static str, &'static str)> {
-    let mut pages = vec![("assistant", "https://claude.ai/new/"), ("custom", "https://beta-docs.skriptlang.org/syntaxes/")];
+    let mut pages = vec![("assistant", "flurry:claude"), ("custom", "https://beta-docs.skriptlang.org/syntaxes/")];
     for (k, v) in settings::SIDEVIEW {
         match pages.iter_mut().find(|(p, _)| p == k) {
             Some(p) => p.1 = v,

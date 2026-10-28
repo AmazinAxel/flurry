@@ -11,11 +11,11 @@ use crate::lib::dbus::{prop_bool, prop_str};
 use crate::lib::deviceMenu::{DeviceMenu, aside_button, device_menu};
 use crate::lib::iwd::{self, DEVICE, NETWORK, STATION};
 use crate::lib::process::exec;
-use crate::lib::searchDialog::{hex_sel, sel_fg};
+use crate::lib::searchDialog::plain_entry;
 use crate::lib::state::State;
 use crate::lib::streamingMode::streaming_mode;
-use crate::ui::entry::{self, Entry, EntryRef, Look};
-use crate::ui::node::{Align, Background, Node, Sides, Style, rgba};
+use crate::ui::entry::{self, Entry, EntryRef};
+use crate::ui::node::{Align, Node, Sides, Style};
 use crate::ui::runtime;
 use crate::ui::wayland::KeyEvent;
 
@@ -271,18 +271,6 @@ pub fn start() {
     });
 }
 
-fn password_entry(base: &Style, e: &EntryRef, focused: bool) -> Node {
-    let mut s = base.inherit();
-    s.min_height = 36.0;
-    s.padding = Sides::vh(0.0, 8.0);
-    s.margin = Sides::all(4.0);
-    s.background = Background::Color(rgba(255, 255, 255, 0.04));
-    s.color = rgba(255, 255, 255, 0.7);
-    let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
-    let _ = focused;
-    Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look)]).focusable("wifi-password").expand(true, false)
-}
-
 pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
     if streaming_mode().peek() {
         return Node::label(base.inherit(), "Streaming mode enabled").align(Align::Center, Align::Fill).expand(true, false);
@@ -310,7 +298,9 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
         if let Some((p, e)) = &pw
             && p == path
         {
-            rows.push(password_entry(base, e, focus == Some("wifi-password")));
+            let mut entry = plain_entry(base, e, "wifi-password");
+            entry.style.margin = Sides::all(4.0);
+            rows.push(entry);
         }
     }
     let icon = if on { "network-wireless-symbolic" } else { "network-wireless-offline-symbolic" };

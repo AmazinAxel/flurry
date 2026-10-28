@@ -8,7 +8,7 @@ use crate::lib::audio;
 use crate::lib::brightness::{self, brightness, set_brightness};
 use crate::lib::deviceMenu::{aside_button, separator};
 use crate::lib::style::*;
-use crate::ui::node::{Align, Kind, Node, Sides, Style, alpha, fill_rect, shadow};
+use crate::ui::node::{Align, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash};
 use crate::widgets::status::quicksettings::sound::{self, apply_selection, name_substitute, node_name, selected};
 use crate::widgets::status::status::volume_icon;
 
@@ -35,21 +35,8 @@ pub fn slider(base: &Style, id: &str, value: f64) -> Node {
         let rot = ts.pre_translate(cx, cy).pre_rotate(45.0);
         let knob = |size: f32| Rect::from_xywh(-size / 2.0, -size / 2.0, size, size);
         if let Some(k) = knob(19.0) {
-            let s = shadow(0.0, 0.0, 4.0, alpha(dark1(), 0.8));
-            let mut layer = tiny_skia::Pixmap::new(pm.width(), pm.height()).unwrap();
-            fill_rect(&mut layer.as_mut(), k, tiny_skia::Color::BLACK, rot);
-            crate::ui::image::blur(&mut layer, s.blur * ts.sx);
-            let c = s.color;
-            for px in layer.data_mut().as_chunks_mut::<4>().0 {
-                let a = px[3] as f32 / 255.0 * c.alpha();
-                px[0] = (c.red() * a * 255.0) as u8;
-                px[1] = (c.green() * a * 255.0) as u8;
-                px[2] = (c.blue() * a * 255.0) as u8;
-                px[3] = (a * 255.0) as u8;
-            }
-            pm.draw_pixmap(0, 0, layer.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
+            blurred(pm, k, 4.0, alpha(dark1(), 0.8), rot, hash(&"knob"), |p, t| fill_rect(p, k, tiny_skia::Color::BLACK, t));
             let mut paint = tiny_skia::Paint::default();
-            paint.anti_alias = true;
             paint.set_color(blue2());
             pm.fill_path(&PathBuilder::from_rect(k), &paint, tiny_skia::FillRule::Winding, rot, None);
             if let Some(inner) = knob(9.0) {
@@ -95,7 +82,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             .focusable(id)
         })
         .collect();
-    let selector = Node::vbox(Style { padding: Sides::all(5.0), ..base.inherit() }, 0.0, sinks);
+    let selector = Node::vbox(Style { padding: Sides::vh(5.0, 0.0), ..base.inherit() }, 0.0, sinks);
     Node::vbox(base.inherit(), 0.0, vec![Node::vbox(base.inherit(), 0.0, rows), separator(base), selector]).expand(true, false)
 }
 

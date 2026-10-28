@@ -24,8 +24,7 @@ fn osd_bar(value: f64) -> Node {
             fill_rect(pm, f, blue2(), ts);
         }
     });
-    let mut s = Style::default();
-    s.box_shadow = vec![shadow(0.0, 0.0, 10.0, blue3())];
+    let s = Style { box_shadow: vec![shadow(0.0, 0.0, 10.0, blue3())], ..Default::default() };
     Node::new(Kind::Custom { width: 400.0, height: 12.0, paint }, s).size(400.0, 0.0)
 }
 
@@ -41,7 +40,7 @@ pub fn osd() {
         let mut img = base.inherit();
         img.margin = Sides::trbl(0.0, 8.0, 0.0, 0.0);
         img.icon_shadow = vec![shadow_(), glow(15.0, light3())];
-        let mut n = Node::hbox(s, 0.0, vec![Node::icon(img, icon, 24.0), osd_bar(val).align(crate::ui::node::Align::Fill, crate::ui::node::Align::Center)]);
+        let mut n = Node::hbox(s, 0.0, vec![Node::icon(img, icon, 24.0), osd_bar(val).align(crate::ui::node::Align::Fill, crate::ui::node::Align::Fill)]);
         // SLIDE_UP revealer: content slides down out of the window as it hides
         let h = n.measure_h(n.measure_w().1).1 + 5.0;
         n.style.translate_y = (1.0 - f.progress()) * h;

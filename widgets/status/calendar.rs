@@ -10,12 +10,12 @@ use crate::ui::node::{Align, Background, Node, Shadow, Sides, Style, alpha, rgba
 use crate::ui::wayland::KeyEvent;
 
 thread_local! {
-    /// selected day as days since the unix epoch (local)
-    static SELECTED: Cell<i64> = const { Cell::new(0) };
+    /// shown month as year * 12 + month - 1
+    static SHOWN: Cell<i64> = const { Cell::new(0) };
 }
 
 /// Civil date <-> day number (Howard Hinnant's algorithm).
-pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -24,7 +24,7 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;
@@ -41,75 +41,77 @@ fn weekday(day: i64) -> i64 {
     (day + 4).rem_euclid(7)
 }
 
+/// Today as a day number (local).
 fn today() -> i64 {
-    let now = crate::lib::time::now().peek();
-    let (y, m, d) = (format(now, "%Y").parse().unwrap_or(1970), format(now, "%m").parse().unwrap_or(1), format(now, "%d").parse().unwrap_or(1));
+    let ymd = format(crate::lib::time::now().peek(), "%Y %m %d");
+    let mut it = ymd.split(' ').map(|v| v.parse().unwrap_or(1));
+    let (y, m, d) = (it.next().unwrap_or(1970), it.next().unwrap_or(1), it.next().unwrap_or(1));
     days_from_civil(y, m, d)
 }
 
-/// set_date(now) when the calendar menu opens
+/// Back to the current month when the calendar menu opens.
 pub fn reset() {
-    SELECTED.with(|s| s.set(today()));
+    let (y, m, _) = civil_from_days(today());
+    SHOWN.with(|s| s.set(y * 12 + m - 1));
 }
 
-/// Arrow keys move the selected day (GtkCalendar keynav).
+/// Left/Right (h/l) switch months, with Ctrl years.
 pub fn key(ev: &KeyEvent) -> bool {
-    let delta = match ev.sym {
-        Keysym::Left => -1,
-        Keysym::Right => 1,
-        Keysym::Up => -7,
-        Keysym::Down => 7,
+    let dir = match ev.sym {
+        Keysym::Left | Keysym::h => -1,
+        Keysym::Right | Keysym::l => 1,
         _ => return false,
     };
-    SELECTED.with(|s| s.set(s.get() + delta));
+    SHOWN.with(|s| s.set(s.get() + dir * if ev.ctrl { 12 } else { 1 }));
     true
 }
 
+/// strftime on a day number (noon, so DST never shifts the date).
+fn day_format(day: i64, fmt: &str) -> String {
+    format(day * 86400 + 43200, fmt)
+}
+
+/// Seven equal-width cells.
+fn week_row(style: &Style, cells: Vec<Node>) -> Node {
+    let mut row = Node::hbox(style.clone(), 0.0, cells);
+    row.homogeneous = true;
+    row
+}
+
 pub fn calendar(base: &Style) -> Node {
-    let sel = SELECTED.with(Cell::get);
-    let today = today();
-    let (y, m, _) = civil_from_days(sel);
+    let shown = SHOWN.with(Cell::get);
+    let (y, m) = (shown.div_euclid(12), shown.rem_euclid(12) + 1);
     let first = days_from_civil(y, m, 1);
-    let start = first - weekday(first);
+    let start = first - weekday(first); // grid starts on the Sunday on or before the 1st
+    let today = today();
     let line = rgba(255, 255, 255, 0.12);
 
-    let mut cal = base.inherit();
+    let mut cal = base.inherit().border(Sides::all(1.0), line);
     cal.color = light1();
-    cal = cal.border(Sides::all(1.0), line);
     cal.min_width = 0.0;
+    let cell = Style { padding: Sides::trbl(9.0, 7.0, 9.0, 7.0), ..cal.inherit() };
 
-    let mut header = cal.inherit();
-    header.padding = Sides::all(3.0);
-    header = header.border(Sides::trbl(0.0, 0.0, 1.0, 0.0), line);
-    header.min_height = 24.0 + 12.0;
-    let month = format(sel * 86400 + 43200, "%B");
-    let head = Node::hbox(header.clone(), 0.0, vec![
-        Node::label(header.inherit(), month).expand(true, false).align(Align::Fill, Align::Center),
-        Node::label(Style { padding: Sides::vh(0.0, 10.0), ..header.inherit() }, y.to_string()).align(Align::Fill, Align::Center),
-    ]);
+    // "October 2026", left-aligned
+    let mut header = cal.inherit().border(Sides::trbl(0.0, 0.0, 1.0, 0.0), line);
+    header.padding = Sides::vh(3.0, 10.0);
+    header.min_height = 36.0;
+    let title = Node::label(header.inherit(), day_format(first, "%B %Y")).xalign(0.0).expand(true, false).align(Align::Fill, Align::Center);
+    let head = Node::hbox(header, 0.0, vec![title]);
 
-    let mut names = cal.inherit();
+    // weekday names, as tall as a day row (GtkCalendar's grid rows are homogeneous)
+    let sample = Node::label(cell.clone(), "30");
+    let mut names = Style { min_height: sample.measure_h(sample.measure_w().1).1, ..cal.inherit() };
     names.font.size = 14.0;
-    // GtkCalendar's grid has homogeneous rows: the weekday row is as tall as a day row
-    let sample = Node::label(Style { padding: Sides::trbl(9.0, 7.0, 9.0, 7.0), ..cal.inherit() }, "30");
-    let row_h = sample.measure_h(sample.measure_w().1).1;
-    names.min_height = row_h;
-    let mut grid_rows = vec![];
-    let mut names_row = Node::hbox(cal.inherit(), 0.0, (0..7).map(|i| Node::label(names.clone(), format((start + i) * 86400 + 43200, "%a")).expand(true, false)).collect());
-    names_row.homogeneous = true;
-    grid_rows.push(names_row);
+    let mut rows = vec![week_row(&cal.inherit(), (0..7).map(|i| Node::label(names.clone(), day_format(start + i, "%a")).expand(true, false)).collect())];
+
     for week in 0..6 {
         let cells = (0..7)
             .map(|i| {
                 let day = start + week * 7 + i;
                 let (_, dm, dd) = civil_from_days(day);
-                let mut s = cal.inherit();
-                s.padding = Sides::trbl(9.0, 7.0, 9.0, 7.0);
+                let mut s = cell.clone();
                 if dm != m {
-                    s.color = alpha(s.color, 0.3);
-                }
-                if day == sel {
-                    s.background = Background::Color(alpha(s.color, 0.06));
+                    s.color = alpha(s.color, 0.3); // adjacent months greyed
                 }
                 if day == today {
                     s.background = Background::Color(blue2());
@@ -120,11 +122,9 @@ pub fn calendar(base: &Style) -> Node {
                 Node::label(s, dd.to_string()).expand(true, false)
             })
             .collect();
-        let mut row = Node::hbox(cal.inherit(), 0.0, cells);
-        row.homogeneous = true;
-        grid_rows.push(row);
+        rows.push(week_row(&cal.inherit(), cells));
     }
-    let grid = Node::vbox(Style { margin: Sides::all(3.0), ..cal.inherit() }, 0.0, grid_rows);
+    let grid = Node::vbox(Style { margin: Sides::all(3.0), ..cal.inherit() }, 0.0, rows);
     Node::vbox(cal, 0.0, vec![head, grid]).expand(true, false).focusable("calendar")
 }
 

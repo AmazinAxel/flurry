@@ -1,5 +1,5 @@
 // Flash windows (osd, workspaces): shown instantly, hidden after `ms` with a slide-out
-// (GTK revealer, eased quintic-out per request) driven by frame-rate timeouts while animating.
+// (GTK revealer, eased quintic-out per request) stepped on frame callbacks while animating.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -49,16 +49,19 @@ impl Flash {
     }
 
     fn animate(self: &Rc<Self>, win: Rc<Win>) {
-        if self.hiding.get().is_none() {
-            return;
-        }
-        if self.progress() <= 0.0 {
-            self.hiding.set(None);
-            win.hide();
-            return;
-        }
-        win.redraw();
-        let f = self.clone();
-        runtime::timeout(16, move || f.animate(win.clone()));
+        let (f, w) = (self.clone(), Rc::downgrade(&win));
+        win.animate(move || {
+            if f.hiding.get().is_none() {
+                return false; // shown again
+            }
+            if f.progress() <= 0.0 {
+                f.hiding.set(None);
+                if let Some(w) = w.upgrade() {
+                    w.hide();
+                }
+                return false;
+            }
+            true
+        });
     }
 }

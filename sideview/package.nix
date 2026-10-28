@@ -8,7 +8,7 @@ rustPlatform.buildRustPackage {
   version = "0.1.0";
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ];
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./claude ];
   };
   # fetchCargoVendor (not cargoLock) so the mozjs workaround below finds $cargoDepsCopy
   cargoHash = "sha256-LTwjPZjFCxQHQHVatUHouxkobxnOcVDWkJsi8kc8b40=";

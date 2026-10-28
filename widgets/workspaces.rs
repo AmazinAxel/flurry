@@ -1,6 +1,5 @@
 // Workspace flash on workspace change (widgets/workspaces.tsx).
 
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -17,7 +16,6 @@ thread_local! {
     static FOCUSED: State<i64> = State::new(0);
     static OCCUPIED: State<BTreeSet<i64>> = State::new(BTreeSet::new());
     static SCRATCHPAD: State<usize> = State::new(0);
-    static REQUEST: Cell<u64> = const { Cell::new(0) };
 }
 
 fn update() {

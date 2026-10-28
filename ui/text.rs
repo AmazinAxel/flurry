@@ -326,11 +326,26 @@ pub struct Layout {
     pub size: f32,
     pub lines: Vec<Line>,
     pub ascent: f32,
-    pub descent: f32,
     pub line_height: f32,
 }
 
 impl Layout {
+    /// Identifies the painted glyphs (shadow caches).
+    pub fn content_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut s = std::hash::DefaultHasher::new();
+        self.family.as_ref().map(Rc::as_ptr).hash(&mut s);
+        self.size.to_bits().hash(&mut s);
+        self.line_height.to_bits().hash(&mut s);
+        for l in &self.lines {
+            for g in &l.glyphs {
+                (g.face, g.id, g.x.to_bits(), g.y.to_bits()).hash(&mut s);
+            }
+            u32::MAX.hash(&mut s);
+        }
+        s.finish()
+    }
+
     pub fn width(&self) -> f32 {
         self.lines.iter().map(|l| l.width).fold(0.0, f32::max)
     }
@@ -399,8 +414,44 @@ fn shape_face(
     }
 }
 
+type LayoutKey = (String, &'static str, u16, u32, u32, Option<u32>, bool, bool);
+
+thread_local! {
+    /// Shaped layouts: a label is measured and painted several times per render, and most text is
+    /// unchanged between renders. Bounded; cleared wholesale when full.
+    static LAYOUTS: RefCell<HashMap<LayoutKey, Layout>> = RefCell::default();
+    static CHAR_WIDTHS: RefCell<HashMap<(&'static str, u16, u32), f32>> = RefCell::default();
+}
+
+const LAYOUT_CACHE: usize = 512;
+
 /// Lays out `text`; `max_width` triggers wrapping (Wrap::Word) or ellipsizing (`ellipsize`).
 pub fn layout(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool) -> Layout {
+    let key = (
+        text.to_string(),
+        font.family,
+        font.weight,
+        font.size.to_bits(),
+        font.letter_spacing.to_bits(),
+        max_width.map(f32::to_bits),
+        wrap == Wrap::Word,
+        ellipsize,
+    );
+    if let Some(l) = LAYOUTS.with(|c| c.borrow().get(&key).cloned()) {
+        return l;
+    }
+    let l = layout_uncached(text, font, max_width, wrap, ellipsize);
+    LAYOUTS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= LAYOUT_CACHE {
+            c.clear();
+        }
+        c.insert(key, l.clone());
+    });
+    l
+}
+
+fn layout_uncached(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool) -> Layout {
     let fam = family(&font.pattern());
     let (ascent, descent) = fam.faces.first().map(|f| f.extents()).unwrap_or((0.8, 0.2));
     let (ascent, descent) = (ascent * font.size, descent * font.size);
@@ -414,7 +465,7 @@ pub fn layout(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellip
         }
     }
     let _ = SUB;
-    Layout { family: Some(fam), size: font.size, lines, ascent, descent, line_height: (ascent + descent).ceil() }
+    Layout { family: Some(fam), size: font.size, lines, ascent, line_height: (ascent + descent).ceil() }
 }
 
 fn to_line(glyphs: &[(usize, u32, f32, f32, f32, usize)]) -> Line {
@@ -500,9 +551,7 @@ pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, 
                 let sx = w / png.width() as f32;
                 let sy = h / png.height() as f32;
                 let t = ts.pre_translate(px, py).pre_scale(sx, sy);
-                let mut pp = tiny_skia::PixmapPaint::default();
-                pp.quality = tiny_skia::FilterQuality::Bilinear;
-                pp.opacity = color.alpha();
+                let pp = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, opacity: color.alpha(), ..Default::default() };
                 pixmap.draw_pixmap(0, 0, png.as_ref(), &pp, t, None);
             } else if let Some(path) = face.outline(g.id) {
                 let t = ts.pre_translate(x + g.x, baseline + g.y).pre_scale(s, s);
@@ -519,12 +568,18 @@ pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, 
 
 /// Average char width, used for GTK's max-width-chars (pango approximate_char_width).
 pub fn approx_char_width(font: &Font) -> f32 {
+    let key = (font.family, font.weight, font.size.to_bits());
+    if let Some(w) = CHAR_WIDTHS.with(|c| c.borrow().get(&key).copied()) {
+        return w;
+    }
     // pango_font_metrics approximate_char_width: the language sample string over its length
     const SAMPLE: &str = "The quick brown fox jumps over the lazy dog.";
-    let chars = layout(SAMPLE, font, None, Wrap::None, false).width() / SAMPLE.chars().count() as f32;
+    let chars = layout_uncached(SAMPLE, font, None, Wrap::None, false).width() / SAMPLE.chars().count() as f32;
     // GtkLabel uses MAX (approximate_char_width, approximate_digit_width)
-    let digits = layout("0123456789", font, None, Wrap::None, false).width() / 10.0;
-    chars.max(digits)
+    let digits = layout_uncached("0123456789", font, None, Wrap::None, false).width() / 10.0;
+    let w = chars.max(digits);
+    CHAR_WIDTHS.with(|c| c.borrow_mut().insert(key, w));
+    w
 }
 
 /// Releases fontconfig's caches once every family is resolved.

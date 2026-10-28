@@ -2,6 +2,8 @@
 // stdin (widgets/sideview.rs). Commands, one per line:
 //   show <page> <url> | hide | focus <true|false> <ignore|exclusive> | width <px> | dark <true|false>
 
+mod claude;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Read;
@@ -14,7 +16,7 @@ use dpi::PhysicalSize;
 use euclid::Scale;
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle};
 use servo::{
-    Code, CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, Location, Modifiers, MouseButton,
+    Code, ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, Location, Modifiers, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, Opts, Preferences, RenderingContext, ServoBuilder, Theme,
     UserContentManager, UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
@@ -68,8 +70,15 @@ impl EventLoopWaker for Waker {
 #[derive(Default)]
 struct Frame {
     dirty: Cell<bool>,
+    /// console messages addressed to us (\u{1} prefix): the claude page's channel out
+    messages: RefCell<Vec<String>>,
 }
 impl WebViewDelegate for Frame {
+    fn show_console_message(&self, _: WebView, _: ConsoleLogLevel, message: String) {
+        if let Some(m) = message.strip_prefix('\u{1}') {
+            self.messages.borrow_mut().push(m.to_string());
+        }
+    }
     fn notify_new_frame_ready(&self, _: WebView) {
         self.dirty.set(true);
     }
@@ -211,7 +220,12 @@ fn main() {
     let mut pages: HashMap<String, WebView> = HashMap::new();
     let mut current: Option<String> = None;
     let mut visible = false;
+    // configured since the last map: presenting before that blocks in eglSwapBuffers on a frame
+    // callback the unmapped surface never gets (re-shows hung until the helper was killed)
+    let mut mapped = false;
     let mut rendering: Option<Rc<WindowRenderingContext>> = None;
+    let mut chat = claude::Chat::default();
+    let mut claude_page: Option<String> = None;
     let frame = Rc::new(Frame::default());
     let mut repeat_key: Option<(xkb::Keycode, Instant)> = None;
 
@@ -283,8 +297,16 @@ fn main() {
                         continue;
                     };
                     current = Some(name.to_string());
+                    let mut target = || {
+                        if url == claude::URL {
+                            claude_page = Some(name.to_string());
+                            claude::page_url()
+                        } else {
+                            url::Url::parse(url).ok()
+                        }
+                    };
                     if !pages.contains_key(name)
-                        && let Ok(u) = url::Url::parse(url)
+                        && let Some(u) = target()
                     {
                         let wv = WebViewBuilder::new(&servo, rc.clone())
                             .url(u)
@@ -307,6 +329,7 @@ fn main() {
                 }
                 (Some("hide"), _, _) => {
                     visible = false;
+                    mapped = false;
                     if let Some(l) = s.layer.take() {
                         l.destroy();
                     }
@@ -370,6 +393,7 @@ fn main() {
                     }
                 }
             }
+            mapped = true;
             paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });
             frame.dirty.set(true);
             continue; // run the deferred show now
@@ -438,11 +462,33 @@ fn main() {
         }
 
         servo.spin_event_loop();
+        // the claude page: its requests out, Claude Code's events back in
+        for m in frame.messages.take() {
+            if m == "claude:new" {
+                chat.reset();
+            } else if let Some(line) = m.strip_prefix("claude:") {
+                if !chat.send(line) {
+                    let wv = claude_page.as_ref().and_then(|c| pages.get(c));
+                    if let Some(wv) = wv {
+                        wv.evaluate_javascript(r#"window.__claude({"type":"exit"})"#, |_| {}); // claude not found: unblock the page
+                    }
+                }
+            } else if let Some(url) = m.strip_prefix("open:") {
+                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+            } else {
+                eprintln!("flurry-sideview: {m}"); // page errors (window.onerror)
+            }
+        }
+        if let Some(wv) = claude_page.as_ref().and_then(|c| pages.get(c)) {
+            for line in chat.read() {
+                wv.evaluate_javascript(format!("window.__claude({line})"), |_| {});
+            }
+        }
         if let Some(wv) = current.as_ref().and_then(|c| pages.get(c)) {
             for ev in state.events.drain(..) {
                 wv.notify_input_event(ev);
             }
-            if visible
+            if visible && mapped
                 && frame.dirty.replace(false)
                 && let Some(rc) = &rendering
             {
@@ -460,9 +506,11 @@ fn main() {
             libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
+            // -1 (no chat process) is ignored by poll
+            libc::pollfd { fd: chat.fd(), events: libc::POLLIN, revents: 0 },
         ];
         let timeout = repeat_key.map(|(_, at)| at.saturating_duration_since(Instant::now()).as_millis() as i32).unwrap_or(-1);
-        unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout) };
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if fds[0].revents & libc::POLLIN != 0 {
             let _ = guard.read();
         } else {

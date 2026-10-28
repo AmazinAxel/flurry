@@ -10,7 +10,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-use tiny_skia::{Pixmap, Transform};
+use tiny_skia::{Color, PixmapMut, Transform};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_keyboard, wl_output,
@@ -54,7 +54,7 @@ struct Ctx {
     cursor_shape: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     seat: wl_seat::WlSeat,
     ddm: Option<wl_data_device_manager::WlDataDeviceManager>,
-    data_device: Option<wl_data_device::WlDataDevice>,
+    _data_device: Option<wl_data_device::WlDataDevice>,
     selection: Option<(wl_data_offer::WlDataOffer, Vec<String>)>,
     offers: HashMap<ObjectId, Vec<String>>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -102,7 +102,7 @@ impl KeyEvent {
 
 #[derive(Clone, Copy, Debug)]
 pub enum PointerEvent {
-    Motion { x: f64, y: f64 },
+    Motion { x: f64 },
     Button { x: f64, y: f64, pressed: bool },
     /// dy in GDK scroll units; `wheel` true for discrete mouse wheel steps
     Scroll { x: f64, y: f64, dy: f64, wheel: bool },
@@ -147,7 +147,7 @@ pub fn connect() -> bool {
         cursor_shape: globals.bind(&qh, bind(1..=1), ()).ok(),
         seat: globals.bind(&qh, bind(5..=9), ()).expect("wl_seat"),
         ddm: globals.bind(&qh, bind(3..=3), ()).ok(),
-        data_device: None,
+        _data_device: None,
         selection: None,
         offers: HashMap::new(),
         keyboard: None,
@@ -168,7 +168,7 @@ pub fn connect() -> bool {
     });
     if let Some(ddm) = &c0.ddm {
         let dd = ddm.get_data_device(&c0.seat, &qh, ());
-        CTX.with(|c| *c.borrow_mut() = Some(Ctx { data_device: Some(dd), ..c0 }));
+        CTX.with(|c| *c.borrow_mut() = Some(Ctx { _data_device: Some(dd), ..c0 }));
     } else {
         CTX.with(|c| *c.borrow_mut() = Some(c0));
     }
@@ -424,11 +424,52 @@ pub struct Inner {
     on_key: RefCell<Option<Rc<dyn Fn(&KeyEvent)>>>,
     on_pointer: RefCell<Option<Rc<dyn Fn(PointerEvent)>>>,
     after_render: RefCell<Option<Rc<dyn Fn(&Node)>>>,
-    /// Offset of the content subsurface, to map pointer coordinates
-    content_origin: Cell<(f32, f32)>,
+    /// called each frame; the surface re-renders while it returns true
+    animation: RefCell<Option<Rc<dyn Fn() -> bool>>>,
     image: RefCell<Option<Rc<ShmImage>>>,
     img_viewport: RefCell<Option<wp_viewport::WpViewport>>,
     dim_buffer: RefCell<Option<wl_buffer::WlBuffer>>,
+    /// what the main surface shows under the content: (image ptr or 0 for dim, w, h)
+    backdrop_key: Cell<Option<(usize, u32, u32)>>,
+    gradient: Option<Gradient>,
+}
+
+/// A full-size vertical gradient as a 1px-wide buffer stretched by the viewport (lockscreen cover).
+struct Gradient {
+    wl: wl_surface::WlSurface,
+    sub: wl_subsurface::WlSubsurface,
+    viewport: wp_viewport::WpViewport,
+    colors: (Color, Color),
+    buffer: RefCell<Option<Buffer>>,
+}
+
+impl Gradient {
+    fn update(&self, w: u32, h: u32, scale: i32) {
+        let bh = h * scale as u32;
+        if self.buffer.borrow().as_ref().map(|b| b.size) != Some((1, bh)) {
+            let Some(b) = new_buffer(1, bh) else { return };
+            let dst = unsafe { std::slice::from_raw_parts_mut(b.ptr, b.len) };
+            let Some(mut pm) = PixmapMut::from_bytes(dst, 1, bh) else { return };
+            let stops = vec![tiny_skia::GradientStop::new(0.0, self.colors.0), tiny_skia::GradientStop::new(1.0, self.colors.1)];
+            if let Some(shader) = tiny_skia::LinearGradient::new((0.0, 0.0).into(), (0.0, bh as f32).into(), stops, tiny_skia::SpreadMode::Pad, Transform::identity())
+                && let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, 1.0, bh as f32)
+            {
+                pm.fill_rect(r, &tiny_skia::Paint { shader, anti_alias: false, ..Default::default() }, Transform::identity(), None);
+            }
+            self.wl.attach(Some(&b.wl), 0, 0);
+            self.wl.damage_buffer(0, 0, 1, bh as i32);
+            *self.buffer.borrow_mut() = Some(b);
+        }
+        self.viewport.set_destination(w as i32, h as i32);
+        self.wl.commit();
+    }
+
+    fn destroy(&self) {
+        self.viewport.destroy();
+        self.sub.destroy();
+        self.wl.destroy();
+        self.buffer.borrow_mut().take();
+    }
 }
 
 pub struct Surface(Rc<Inner>);
@@ -484,16 +525,18 @@ impl Surface {
                 on_key: RefCell::default(),
                 on_pointer: RefCell::default(),
                 after_render: RefCell::default(),
-                content_origin: Cell::new((0.0, 0.0)),
+                animation: RefCell::default(),
                 image: RefCell::default(),
                 img_viewport: RefCell::default(),
                 dim_buffer: RefCell::default(),
+                backdrop_key: Cell::new(None),
+                gradient: None,
             }
         });
         let s = Rc::new(s);
         SURFACES.with(|m| m.borrow_mut().insert(s.wl.id(), Rc::downgrade(&s)));
         // initial commit: size from content first, so the configure already has the right size
-        s.apply_content_size();
+        s.apply_content_size(None);
         s.wl.commit();
         Surface(s)
     }
@@ -503,6 +546,11 @@ impl Surface {
     }
     pub fn on_pointer(&self, f: impl Fn(PointerEvent) + 'static) {
         *self.0.on_pointer.borrow_mut() = Some(Rc::new(f));
+    }
+    /// Re-renders on every frame callback while `f` returns true (animations at display rate).
+    pub fn animate(&self, f: Rc<dyn Fn() -> bool>) {
+        *self.0.animation.borrow_mut() = Some(f);
+        self.redraw();
     }
     /// Called with the laid-out tree after every render (focus/scroll bookkeeping).
     pub fn after_render(&self, f: impl Fn(&Node) + 'static) {
@@ -524,21 +572,6 @@ impl Surface {
             l.set_keyboard_interactivity(k);
             self.0.wl.commit();
         }
-    }
-    pub fn set_exclusive(&self, zone: i32) {
-        if let Role::Layer(l) = &*self.0.role.borrow() {
-            l.set_exclusive_zone(zone);
-            self.0.wl.commit();
-        }
-    }
-    pub fn size(&self) -> (u32, u32) {
-        self.0.size.get()
-    }
-    pub fn scale(&self) -> i32 {
-        self.0.scale.get()
-    }
-    pub fn has_keyboard(&self) -> bool {
-        FOCUS.with(|f| f.borrow().as_ref() == Some(&self.0.wl.id()))
     }
     /// Shows a shared image (wallpaper) cover-cropped to the surface, without copying it.
     pub fn set_image(&self, img: Rc<ShmImage>) {
@@ -566,6 +599,9 @@ impl Inner {
             sub.destroy();
             s.destroy();
         }
+        if let Some(g) = &self.gradient {
+            g.destroy();
+        }
         if let Some(b) = self.dim_buffer.borrow_mut().take() {
             b.destroy();
         }
@@ -585,7 +621,7 @@ impl Inner {
     }
 
     /// Sizes non-stretched axes from the content's natural size (GTK layer windows do the same).
-    fn apply_content_size(&self) {
+    fn apply_content_size(&self, built: Option<&Node>) {
         let Role::Layer(layer) = &*self.role.borrow() else { return };
         let a = self.spec_anchor;
         let stretch_w = a.contains(Anchor::Left) && a.contains(Anchor::Right);
@@ -593,9 +629,16 @@ impl Inner {
         if (stretch_w || self.fixed.0 > 0) && (stretch_h || self.fixed.1 > 0) {
             return;
         }
-        let Some(build) = self.build.borrow().clone() else { return };
         let (cw, ch) = self.size.get();
-        let node = build(cw as f32, ch as f32);
+        let owned;
+        let node = match built {
+            Some(n) => n,
+            None => {
+                let Some(build) = self.build.borrow().clone() else { return };
+                owned = build(cw as f32, ch as f32);
+                &owned
+            }
+        };
         let (_, nw) = node.measure_w();
         let nw = nw + node.style.margin_h();
         let w = if stretch_w { 0 } else if self.fixed.0 > 0 { self.fixed.0 } else { nw.ceil().max(1.0) as u32 };
@@ -624,13 +667,17 @@ impl Inner {
             self.redraw_queued.set(true);
             return;
         }
-        if let Some(img) = self.image.borrow().clone() {
+        if self.content.is_none()
+            && let Some(img) = self.image.borrow().clone()
+        {
             self.attach_image(&img);
             return;
         }
         let Some(build) = self.build.borrow().clone() else { return };
         let before = self.size.get();
-        self.apply_content_size();
+        // one build per render: the same tree sizes the layer and gets painted
+        let mut node = build(before.0 as f32, before.1 as f32);
+        self.apply_content_size(Some(&node));
         if self.size.get() != before && matches!(*self.role.borrow(), Role::Layer(_)) {
             // wait for the configure with the new size
             self.wl.commit();
@@ -638,23 +685,13 @@ impl Inner {
         }
         let (w, h) = self.size.get();
         let scale = self.scale.get().max(1);
-        let mut node = build(w as f32, h as f32);
         node.allocate(0.0, 0.0, w as f32, h as f32);
 
         let (target, ox, oy, bw, bh) = if let Some((sub_wl, sub)) = &self.content {
-            // dim on the main surface, content in a subsurface clipped to what it paints
-            let [r, g, b, a] = self.dim.unwrap();
-            let conv = |v: f32| (v * a * u32::MAX as f32) as u32;
-            // created once and kept: a buffer destroyed before the commit would unmap the dim
-            let mut dim = self.dim_buffer.borrow_mut();
-            if dim.is_none() {
-                *dim = Some(ctx(|c| c.single_pixel.create_u32_rgba_buffer(conv(r), conv(g), conv(b), (a * u32::MAX as f32) as u32, &c.qh, ())));
-                self.wl.attach(dim.as_ref(), 0, 0);
-                self.wl.damage(0, 0, i32::MAX, i32::MAX);
-            }
-            drop(dim);
-            if let Some(v) = &self.viewport {
-                v.set_destination(w as i32, h as i32);
+            // backdrop on the main surface, content in a subsurface clipped to what it paints
+            self.attach_backdrop(w, h);
+            if let Some(g) = &self.gradient {
+                g.update(w, h, scale);
             }
             let bounds = node.paint_bounds();
             let x0 = bounds.left().floor().max(0.0);
@@ -666,24 +703,17 @@ impl Inner {
         } else {
             (self.wl.clone(), 0.0, 0.0, w, h)
         };
-        self.content_origin.set((ox, oy));
 
         let (pw, ph) = (bw * scale as u32, bh * scale as u32);
-        let Some(mut pixmap) = Pixmap::new(pw, ph) else { return };
+        let Some(buf) = self.take_buffer(pw, ph) else { return };
+        // ABGR8888 is tiny-skia's premultiplied RGBA byte order: paint straight into the shm buffer
+        let dst = unsafe { std::slice::from_raw_parts_mut(buf.0, buf.1) };
+        let Some(mut pm) = PixmapMut::from_bytes(dst, pw, ph) else { return };
+        pm.fill(Color::TRANSPARENT);
         let ts = Transform::from_scale(scale as f32, scale as f32).pre_translate(-ox, -oy);
-        node.paint(&mut pixmap.as_mut(), ts);
+        node.paint(&mut pm, ts);
         if let Some(cb) = self.after_render.borrow().clone() {
             cb(&node);
-        }
-
-        let Some(buf) = self.take_buffer(pw, ph) else { return };
-        // tiny-skia is premultiplied RGBA, wl_shm ARGB8888 is BGRA in memory
-        let dst = unsafe { std::slice::from_raw_parts_mut(buf.0, buf.1) };
-        for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(pixmap.data().chunks_exact(4)) {
-            d[0] = s[2];
-            d[1] = s[1];
-            d[2] = s[0];
-            d[3] = s[3];
         }
         target.set_buffer_scale(scale);
         target.attach(Some(&buf.2), 0, 0);
@@ -693,6 +723,37 @@ impl Inner {
         if target != self.wl {
             self.wl.commit();
         }
+    }
+
+    /// Main surface under the content subsurface: the image cover-cropped if set, else the dim color,
+    /// both stretched by the viewport (no full-size buffer of our own).
+    fn attach_backdrop(&self, w: u32, h: u32) {
+        let img = self.image.borrow().clone();
+        let key = (img.as_ref().map_or(0, |i| Rc::as_ptr(i) as usize), w, h);
+        if self.backdrop_key.replace(Some(key)) == Some(key) {
+            return;
+        }
+        let Some(v) = &self.viewport else { return };
+        v.set_destination(w as i32, h as i32);
+        match img {
+            Some(img) => {
+                let (sx, sy, sw, sh) = super::image::cover(img.width as f32, img.height as f32, w as f32, h as f32);
+                v.set_source(sx as f64, sy as f64, sw as f64, sh as f64);
+                self.wl.attach(Some(&img.buffer), 0, 0);
+            }
+            None => {
+                let [r, g, b, a] = self.dim.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                let conv = |v: f32| (v * a * u32::MAX as f32) as u32;
+                // created once and kept: a buffer destroyed before the commit would unmap the dim
+                let mut dim = self.dim_buffer.borrow_mut();
+                if dim.is_none() {
+                    *dim = Some(ctx(|c| c.single_pixel.create_u32_rgba_buffer(conv(r), conv(g), conv(b), (a * u32::MAX as f32) as u32, &c.qh, ())));
+                }
+                v.set_source(-1.0, -1.0, -1.0, -1.0);
+                self.wl.attach(dim.as_ref(), 0, 0);
+            }
+        }
+        self.wl.damage(0, 0, i32::MAX, i32::MAX);
     }
 
     fn request_frame(self: &Rc<Self>, target: &wl_surface::WlSurface) {
@@ -736,11 +797,8 @@ fn memfd(len: usize) -> Option<OwnedFd> {
     }
 }
 
+// ABGR8888 everywhere: the same byte order as tiny-skia, so pixmaps live in the buffers
 fn new_buffer(w: u32, h: u32) -> Option<Buffer> {
-    new_buffer_fmt(w, h, wl_shm::Format::Argb8888)
-}
-
-fn new_buffer_fmt(w: u32, h: u32, format: wl_shm::Format) -> Option<Buffer> {
     let len = (w * h * 4) as usize;
     let fd = memfd(len)?;
     let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
@@ -750,7 +808,7 @@ fn new_buffer_fmt(w: u32, h: u32, format: wl_shm::Format) -> Option<Buffer> {
     let busy = Arc::new(AtomicBool::new(false));
     let wl = ctx(|c| {
         let pool = c.shm.create_pool(fd.as_fd(), len as i32, &c.qh, ());
-        let b = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, format, &c.qh, busy.clone());
+        let b = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Abgr8888, &c.qh, busy.clone());
         pool.destroy();
         b
     });
@@ -767,14 +825,56 @@ pub struct ShmImage {
     len: usize,
 }
 
+/// Premultiplied RGBA pixels in mapped shared memory, fillable on a worker thread (the wallpaper
+/// decodes straight into it); `ShmImage::from_pixels` then hands the memory to the compositor.
+pub struct ShmPixels {
+    fd: Option<OwnedFd>,
+    ptr: usize,
+    len: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ShmPixels {
+    pub fn new(w: u32, h: u32) -> Option<ShmPixels> {
+        let len = (w as usize) * (h as usize) * 4;
+        let fd = memfd(len)?;
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(ShmPixels { fd: Some(fd), ptr: ptr as usize, len, width: w, height: h })
+    }
+
+    pub fn data(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+    }
+
+    pub fn pixmap(&self) -> tiny_skia::PixmapRef<'_> {
+        let data = unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) };
+        tiny_skia::PixmapRef::from_bytes(data, self.width, self.height).expect("sized at creation")
+    }
+}
+
+impl Drop for ShmPixels {
+    fn drop(&mut self) {
+        if self.fd.is_some() {
+            unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+        }
+    }
+}
+
 impl ShmImage {
-    /// `fill` writes premultiplied RGBA pixels into the buffer.
-    pub fn new(w: u32, h: u32, fill: impl FnOnce(&mut [u8])) -> Option<Rc<ShmImage>> {
-        let b = new_buffer_fmt(w, h, wl_shm::Format::Abgr8888)?;
-        fill(unsafe { std::slice::from_raw_parts_mut(b.ptr, b.len) });
-        let img = ShmImage { buffer: b.wl.clone(), width: w, height: h, ptr: b.ptr, len: b.len };
-        std::mem::forget(b); // ownership moves to ShmImage
-        Some(Rc::new(img))
+    pub fn from_pixels(mut p: ShmPixels) -> Rc<ShmImage> {
+        let fd = p.fd.take().expect("fresh pixels"); // the mapping now belongs to the ShmImage
+        let (w, h) = (p.width, p.height);
+        let buffer = ctx(|c| {
+            let pool = c.shm.create_pool(fd.as_fd(), p.len as i32, &c.qh, ());
+            let b = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Abgr8888, &c.qh, Arc::new(AtomicBool::new(false)));
+            pool.destroy();
+            b
+        });
+        Rc::new(ShmImage { buffer, width: w, height: h, ptr: p.ptr as *mut u8, len: p.len })
     }
 
     pub fn pixmap(&self) -> tiny_skia::PixmapRef<'_> {
@@ -810,18 +910,33 @@ pub fn is_locking() -> bool {
 }
 
 /// Creates the lock surface for `output`.
-pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn) -> Option<Surface> {
+/// A lock surface showing `image` (black without one) under a vertical `gradient`, with the built
+/// content in a subsurface clipped to what it paints: no full-screen repaint per keypress.
+pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn, image: Option<Rc<ShmImage>>, gradient: (Color, Color)) -> Option<Surface> {
     let inner = ctx(|c| {
         let lock = c.lock.as_ref()?;
         let wl = c.compositor.create_surface(&c.qh, ());
         let ls = lock.get_lock_surface(&wl, output, &c.qh, ());
         let scale = c.outputs.iter().find(|o| o.wl == *output).map(|o| o.scale).unwrap_or(1);
+        // subsurfaces stack in creation order: gradient, then content on top
+        let sub = |c: &Ctx| {
+            let sub_wl = c.compositor.create_surface(&c.qh, ());
+            let sub = c.subcompositor.get_subsurface(&sub_wl, &wl, &c.qh, ());
+            sub.set_desync();
+            let region = c.compositor.create_region(&c.qh, ());
+            sub_wl.set_input_region(Some(&region));
+            region.destroy();
+            (sub_wl, sub)
+        };
+        let (gwl, gsub) = sub(c);
+        let gradient = Gradient { viewport: c.viewporter.get_viewport(&gwl, &c.qh, ()), wl: gwl, sub: gsub, colors: gradient, buffer: RefCell::default() };
+        let content = sub(c);
         Some(Inner {
+            viewport: Some(c.viewporter.get_viewport(&wl, &c.qh, ())),
             wl,
             role: RefCell::new(Role::Lock(ls)),
             spec_anchor: Anchor::all(),
-            content: None,
-            viewport: None,
+            content: Some(content),
             dim: None,
             size: Cell::new((1, 1)),
             fixed: (0, 0),
@@ -835,10 +950,12 @@ pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn) -> Option<Surf
             on_key: RefCell::default(),
             on_pointer: RefCell::default(),
             after_render: RefCell::default(),
-            content_origin: Cell::new((0.0, 0.0)),
-            image: RefCell::default(),
+            animation: RefCell::default(),
+            image: RefCell::new(image),
             img_viewport: RefCell::default(),
             dim_buffer: RefCell::default(),
+            backdrop_key: Cell::new(None),
+            gradient: Some(gradient),
         })
     })?;
     let s = Rc::new(inner);
@@ -1000,11 +1117,6 @@ thread_local! {
 
 impl Dispatch<wl_pointer::WlPointer, ()> for Wl {
     fn event(_: &mut Self, _: &wl_pointer::WlPointer, ev: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        let at = |id: &ObjectId, x: f64, y: f64| {
-            let (ox, oy) = surface(id).map(|s| s.content_origin.get()).unwrap_or((0.0, 0.0));
-            let _ = (ox, oy);
-            (x, y)
-        };
         match ev {
             wl_pointer::Event::Enter { serial, surface: s, surface_x, surface_y } => {
                 let hidden = surface(&s.id()).map(|i| matches!(*i.role.borrow(), Role::Lock(_))).unwrap_or(false);
@@ -1019,8 +1131,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Wl {
                     }
                 });
                 HOVER.with(|h| *h.borrow_mut() = Some((s.id(), surface_x, surface_y)));
-                let (x, y) = at(&s.id(), surface_x, surface_y);
-                push(Ev::Pointer(s.id(), PointerEvent::Motion { x, y }));
+                push(Ev::Pointer(s.id(), PointerEvent::Motion { x: surface_x }));
             }
             wl_pointer::Event::Leave { surface: s, .. } => {
                 HOVER.with(|h| *h.borrow_mut() = None);
@@ -1035,7 +1146,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Wl {
                         id.clone()
                     })
                 }) {
-                    push(Ev::Pointer(id, PointerEvent::Motion { x: surface_x, y: surface_y }));
+                    push(Ev::Pointer(id, PointerEvent::Motion { x: surface_x }));
                 }
             }
             wl_pointer::Event::Button { button: 0x110, state, .. } => {
@@ -1134,8 +1245,19 @@ impl Dispatch<wl_callback::WlCallback, ObjectId> for Wl {
     fn event(_: &mut Self, _: &wl_callback::WlCallback, ev: wl_callback::Event, id: &ObjectId, _: &Connection, _: &QueueHandle<Self>) {
         if let (wl_callback::Event::Done { .. }, Some(s)) = (ev, surface(id)) {
             s.frame_pending.set(false);
-            if s.redraw_queued.replace(false) {
-                runtime::idle(move || s.render());
+            let queued = s.redraw_queued.replace(false);
+            let anim = s.animation.borrow().clone();
+            if queued || anim.is_some() {
+                runtime::idle(move || {
+                    // the step may hide the window, so it runs before the render and liveness is rechecked
+                    let more = anim.is_some_and(|a| a());
+                    if !more {
+                        s.animation.borrow_mut().take();
+                    }
+                    if queued || more {
+                        s.render();
+                    }
+                });
             }
         }
     }

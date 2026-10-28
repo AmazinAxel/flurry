@@ -40,6 +40,8 @@ thread_local! {
     static ON_RESOLVED: RefCell<Vec<Resolved>> = const { RefCell::new(Vec::new()) };
     /// action handlers for notifications flurry sent itself (notifySend)
     static LOCAL_ACTIONS: RefCell<HashMap<u32, Rc<dyn Fn(&str)>>> = RefCell::default();
+    /// expire timers, replaced along with their notification
+    static EXPIRY: RefCell<HashMap<u32, runtime::Timer>> = RefCell::default();
 }
 
 pub fn on_notified(f: impl Fn(u32, bool) + 'static) {
@@ -64,6 +66,9 @@ pub fn resolve(id: u32, reason: Reason) {
         return;
     }
     LOCAL_ACTIONS.with(|a| a.borrow_mut().remove(&id));
+    if let Some(t) = EXPIRY.with(|e| e.borrow_mut().remove(&id)) {
+        t.cancel();
+    }
     if let Some(bus) = dbus::session() {
         bus.emit(PATH, IFACE, "NotificationClosed", |m| m.append2(id, reason as u32));
     }
@@ -125,9 +130,16 @@ pub fn add(app_name: &str, replaces_id: u32, summary: &str, body: &str, actions:
     for f in ON_NOTIFIED.with(|l| l.borrow().clone()) {
         f(id, replaced);
     }
-    // default-timeout -1, ignore-timeout false
-    if expire_timeout > 0 {
-        runtime::timeout(expire_timeout as u64, move || resolve(id, Reason::Expired));
+    // default-timeout -1, ignore-timeout false; a replacement restarts (or clears) the timer
+    let timer = (expire_timeout > 0).then(|| runtime::timeout(expire_timeout as u64, move || resolve(id, Reason::Expired)));
+    if let Some(old) = EXPIRY.with(|e| {
+        let mut e = e.borrow_mut();
+        match timer {
+            Some(t) => e.insert(id, t),
+            None => e.remove(&id),
+        }
+    }) {
+        old.cancel();
     }
     id
 }

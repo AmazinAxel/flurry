@@ -27,7 +27,7 @@ pub fn aside_button(base: &Style, active: bool, connecting: bool, focused: bool,
         s.border_color = [blue2(); 4];
     }
     if focused {
-        s = focus_outline(button_active(s));
+        s = focus_outline(s);
     }
     if !sensitive {
         s.opacity = 0.35;
@@ -54,7 +54,7 @@ pub fn device_menu(m: DeviceMenu) -> Node {
         .focusable("power");
     let scan = aside_button(base, m.scanning, false, m.focus == Some("scan"), m.scan_sensitive);
     let scan_btn = Node::hbox(scan.clone(), 0.0, vec![Node::icon(scan.inherit(), "view-refresh-symbolic", 16.0)]).show(m.powered).focusable("scan");
-    let list = Node::vbox(Style { padding: Sides::all(5.0), ..base.inherit() }, 0.0, m.rows);
+    let list = Node::vbox(Style { padding: Sides::vh(5.0, 0.0), ..base.inherit() }, 0.0, m.rows);
     let scroll = Node { children: vec![list], ..Node::new(Kind::Scroll { max_height: 500.0, offset: m.scroll }, base.inherit()) }.expand(true, true).show(show_list);
     Node::vbox(base.inherit(), 0.0, vec![Node::hbox(base.inherit(), 0.0, vec![power_btn, scan_btn]), separator(base).show(show_list), scroll])
 }

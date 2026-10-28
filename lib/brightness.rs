@@ -65,7 +65,8 @@ pub fn monitor() {
     if unsafe { libc::bind(fd, (&raw const addr).cast(), std::mem::size_of::<libc::sockaddr_nl>() as u32) } < 0 {
         return;
     }
-    let tail = format!("/backlight/{}", screen());
+    // devpath is wherever the driver hangs it (amdgpu: .../card1-eDP-1/amdgpu_bl1), so match name + subsystem
+    let tail = format!("/{}", screen());
     runtime::watch(sock.as_raw_fd(), move || {
         let _keep = &sock;
         let mut buf = [0u8; 4096];
@@ -76,7 +77,7 @@ pub fn monitor() {
             }
             let msg = String::from_utf8_lossy(&buf[..n as usize]);
             let header = msg.split('\0').next().unwrap_or("");
-            if header.ends_with(&tail) {
+            if header.ends_with(&tail) && msg.split('\0').any(|f| f == "SUBSYSTEM=backlight") {
                 let v = read(&path()) as f64 / max() as f64;
                 brightness().set(v);
             }

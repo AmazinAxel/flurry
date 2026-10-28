@@ -25,7 +25,7 @@ in {
         X-Restart-Triggers = [ "${cfg.package}" ]; # restart the running shell when a switch changes it
       };
       Service = {
-        ExecStart = lib.getExe cfg.package;
+        ExecStart = "${cfg.package}/bin/flurry-shell";
         Restart = "on-failure";
         KillMode = "mixed";
       };
