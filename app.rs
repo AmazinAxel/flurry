@@ -1,0 +1,200 @@
+#![allow(non_snake_case)]
+
+mod config;
+mod lib;
+mod settings;
+mod ui;
+mod widgets;
+
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
+
+use lib::{asideState, mediaPlayer, streamingMode::streaming_mode, xdg};
+use ui::{runtime, window};
+use widgets::{clipboard, focus, lockscreen::lockscreen, notifications::notifications as notifs, record::service, sideview, status};
+
+fn socket_path() -> String {
+    format!("{}/flurry.sock", xdg::runtime_dir())
+}
+
+/// Requests from sway keybinds (`flurry <cmd> [arg]`), what `ags request` used to carry.
+fn request(cmd: &str, arg: Option<&str>) {
+    match cmd {
+        "toggle" => {
+            if let Some(w) = arg {
+                window::toggle(w);
+            }
+        }
+        "hideNotif" => notifs::clear_oldest_notification(),
+        "randomWallpaper" => lib::wallpaper::random_wallpaper(),
+        "lock" => lockscreen::lock_screen(),
+        "invokeOldestNotif" => notifs::invoke_oldest_notification(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
+        "toggleSideviewSize" => sideview::toggle_sideview_size(),
+        "sideview" => sideview::show_page(arg.unwrap_or("")),
+        "closeSideview" => sideview::close_sideview(),
+        "hideSideview" => sideview::hide_sideview(),
+        "toggleSideviewFocus" => sideview::toggle_sideview_focus(),
+        "record" => {
+            if service::is_rec().peek() {
+                service::stop_rec();
+            } else {
+                window::toggle("recordMenu");
+            }
+        }
+        "media" => match arg.unwrap_or("") {
+            "next" => mediaPlayer::upd_track(true),
+            "prev" => mediaPlayer::upd_track(false),
+            "toggle" => mediaPlayer::play_pause(),
+            "nextPlaylist" => mediaPlayer::chng_playlist(true),
+            "prevPlaylist" => mediaPlayer::chng_playlist(false),
+            _ => {}
+        },
+        "toggleQuicksettings" => asideState::set_aside_window("quickSettings"),
+        "toggleCalendar" => asideState::set_aside_window("calendar"),
+        "toggleBluetooth" => asideState::set_aside_window("bluetooth"),
+        "toggleWifi" => asideState::set_aside_window("wifi"),
+        "closeAsideStatusMenuWidget" => asideState::close_aside_window(),
+        "toggleInfoArea" => status::status::toggle_info_area(),
+        "toggleStreamingMode" => streaming_mode().set(!streaming_mode().peek()),
+        "toggleFocus" => focus::toggle_focus(),
+        "cancelBreak" => focus::cancel_break(),
+        _ => {}
+    }
+}
+
+fn serve() {
+    let path = socket_path();
+    let _ = std::fs::remove_file(&path);
+    let Ok(listener) = UnixListener::bind(&path) else { return };
+    let _ = listener.set_nonblocking(true);
+    let fd = listener.as_raw_fd();
+    runtime::watch(fd, move || {
+        while let Ok((mut s, _)) = listener.accept() {
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = s.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.contains(&b'\n') {
+                    break;
+                }
+            }
+            let line = String::from_utf8_lossy(&buf).trim().to_string();
+            // `ags request 'sideview plan'` style: the first two words
+            let mut words = line.split(' ');
+            if let Some(cmd) = words.next() {
+                request(cmd, words.next());
+            }
+            let _ = s.write_all(b"\n");
+        }
+    });
+}
+
+/// Client mode: forwards the arguments to the running shell.
+fn client(args: &[String]) -> i32 {
+    let Ok(mut s) = UnixStream::connect(socket_path()) else {
+        eprintln!("flurry is not running");
+        return 1;
+    };
+    let line = args.join(" ") + "\n";
+    let _ = s.write_all(line.as_bytes());
+    let mut reply = [0u8; 16];
+    let _ = s.read(&mut reply);
+    0
+}
+
+fn reminders() {
+    let last: u64 = std::fs::read_to_string(format!("{}/flurry/lastSync", xdg::state_dir())).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let has_sync = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("sys-sync").is_file()));
+    if has_sync && now.saturating_sub(last) > 540_000_000 {
+        // Last sync was ~7 days ago
+        lib::notifySend::notify_send("Sync", "Sync system", "", vec![(
+            1,
+            "Update & Sync".into(),
+            r#"footclient -e fish -c 'sys-sync; echo "Press a key to exit"; read --nchars=1'"#.into(),
+        )]);
+        return;
+    }
+    let downloads = xdg::user_dir("DOWNLOAD");
+    if dir_size(std::path::Path::new(&downloads)) > 100_000_000 {
+        // Greater than 100MB
+        lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), format!("nemo {downloads}"))]);
+    }
+}
+
+/// `du -sb`: apparent size of everything under `p`.
+fn dir_size(p: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(p) else { return 0 };
+    let mut total = meta.len();
+    if meta.is_dir()
+        && let Ok(rd) = std::fs::read_dir(p)
+    {
+        for e in rd.flatten() {
+            total += dir_size(&e.path());
+        }
+    }
+    total
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        std::process::exit(client(&args));
+    }
+    if !ui::wayland::connect() {
+        eprintln!("flurry: cannot connect to the Wayland display");
+        std::process::exit(1);
+    }
+
+    // first frame: wallpaper + focus menu
+    lib::time::start();
+    lib::wallpaper::random_wallpaper();
+    lib::wallpaper::wallpaper_window();
+    focus::focus_menu();
+    status::status::status_window();
+    sideview::sideview();
+    clipboard::clipboard::clipboard();
+    clipboard::compress::compress_window();
+    clipboard::compress::compress_progress();
+    widgets::record::record::record_menu();
+    focus::focus_task();
+    widgets::osd::osd::osd();
+    widgets::powermenu::powermenu::powermenu();
+    lib::asideStatusWindow::aside_status_window();
+    widgets::workspaces::workspaces();
+    notifs::notifications();
+    widgets::launcher::launcher::launcher();
+    widgets::pass::pass::pass();
+    widgets::pass::passSave::pass_save();
+    window::set_visible("focusMenu", true);
+    serve();
+
+    // services after the first frame is queued
+    runtime::idle(|| {
+        lib::logind::start();
+        lockscreen::start();
+        lib::notifd::start();
+        lib::battery::start();
+        lib::bluetooth::start();
+        lib::audio::start();
+        status::quicksettings::sound::start();
+        status::bluetooth::start();
+        status::network::start();
+        status::modules::statusIcons::start();
+        status::modules::mpris::start();
+        lib::brightness::monitor();
+        service::start();
+        lib::apps::reload();
+        lib::apps::watch();
+        reminders();
+        service::start_clipping_service();
+        ui::text::release_fontconfig();
+        unsafe { libc::malloc_trim(0) };
+    });
+    runtime::run();
+}

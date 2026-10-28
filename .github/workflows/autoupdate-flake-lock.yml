@@ -24,6 +24,8 @@ jobs:
         uses: DeterminateSystems/update-flake-lock@v23
         with:
           pr-title: "chore: update flake lock"
+          # nixpkgs-servo is bumped by hand: Servo is a long build
+          inputs: nixpkgs
         env:
           GH_TOKEN: ${{ github.token }}
 

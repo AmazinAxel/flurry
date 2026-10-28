@@ -1,29 +1,30 @@
-{ lib, stdenv, ags, astal, settings ? {}, wrapGAppsHook4, gobject-introspection, gjs, webkitgtk_6_0, glib-networking, libgudev, iwd, cliphist, wl-clipboard, swappy, ffmpeg-headless }: let
-  inherit (stdenv.hostPlatform) system;
-  libs = (with astal.packages.${system}; [ io astal4 apps auth battery bluetooth mpris notifd wireplumber wl4 ])
-    ++ [ webkitgtk_6_0 glib-networking libgudev ];
+{ lib, rustPlatform, settings ? {}, sideview, pkg-config, makeWrapper, harfbuzz, fontconfig, libxkbcommon, dbus, pipewire, pam,
+  iwd, cliphist, wl-clipboard, swappy, ffmpeg-headless }: let
   bins = [ iwd cliphist wl-clipboard swappy ffmpeg-headless ];
-in stdenv.mkDerivation {
-  name = "flurry";
+  rustString = builtins.toJSON; # urls are plain ASCII, valid as Rust string literals
+  pages = lib.mapAttrsToList (k: v: "(${rustString k}, ${rustString v})") (settings.sideview or {});
+in rustPlatform.buildRustPackage {
+  pname = "flurry";
+  version = "0.1.0";
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [ ./app.ts ./env.d.ts ./config.ts ./settings.ts ./style.css ./lib ./widgets ];
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./build.rs ./icons ./app.rs ./config.rs ./settings.rs ./lib ./ui ./widgets ];
   };
+  cargoLock.lockFile = ./Cargo.lock;
 
-  nativeBuildInputs = [ wrapGAppsHook4 gobject-introspection ags.packages.${system}.default ];
-  buildInputs = libs ++ [ gjs ];
+  nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook makeWrapper ];
+  buildInputs = [ harfbuzz fontconfig libxkbcommon dbus pipewire pam ];
+
 
   postPatch = ''
-    echo ${lib.escapeShellArg "export default ${builtins.toJSON settings};"} > settings.ts
+    cat > settings.rs <<'EOF'
+    pub const SIDEVIEW: &[(&str, &str)] = &[${lib.concatStringsSep ", " pages}];
+    EOF
   '';
 
-  installPhase = ''
-    mkdir -p $out/bin
-    ags bundle app.ts $out/bin/flurry
-  '';
-
-  preFixup = ''
-    gappsWrapperArgs+=(--prefix PATH : "${lib.makeBinPath bins}")
+  postInstall = ''
+    ln -s ${lib.getExe sideview} $out/bin/flurry-sideview
+    wrapProgram $out/bin/flurry --prefix PATH : "${lib.makeBinPath bins}"
   '';
 
   meta.mainProgram = "flurry";

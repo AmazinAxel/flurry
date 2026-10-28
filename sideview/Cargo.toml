@@ -1,0 +1,30 @@
+[package]
+name = "flurry-sideview"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "flurry-sideview"
+path = "src/main.rs"
+
+[dependencies]
+servo = { version = "0.7.0", default-features = false, features = ["bundled", "clipboard", "js_jit"] }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+xkbcommon = "0.8"
+raw-window-handle = "0.6"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+libc = "0.2"
+url = "2"
+euclid = "0.22"
+dpi = "0.1"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = true

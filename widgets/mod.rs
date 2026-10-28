@@ -1,0 +1,12 @@
+pub mod clipboard;
+pub mod focus;
+pub mod launcher;
+pub mod lockscreen;
+pub mod notifications;
+pub mod osd;
+pub mod pass;
+pub mod powermenu;
+pub mod record;
+pub mod sideview;
+pub mod status;
+pub mod workspaces;

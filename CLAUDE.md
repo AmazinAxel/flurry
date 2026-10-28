@@ -1,11 +1,14 @@
 # flurry map
 
-Astal/gnim GTK4 TSX shell, consumed by borealis. Public repo: no private info, no hardcoded user paths (use GLib dirs).
+Rust Wayland shell (no GTK, no async runtime), consumed by borealis. Public repo: no private info, no hardcoded user paths (use `lib/xdg.rs`).
 
-- `flake.nix`: `packages.default` (`package.nix`, `ags bundle`), `homeManagerModules.default` (`hm-module.nix`, `programs.flurry.{enable,settings,package}`, systemd user service, ags cli for `ags request`).
-- Settings are Nix-only: `package.nix` writes `settings.ts` at build; `config.ts` merges defaults. Never runtime config files.
-- `app.ts`: entry; imports all CSS + widgets, request handler (sway keybinds call `ags request ...`).
-- `widgets/`: status bar (`status/`), `sideview.tsx`, launcher, clipboard, notifications, osd, lockscreen, powermenu, pass, record, focus, emojiPicker, workspaces.
-- `lib/`: services/helpers (audio, bluetooth, iwd, brightness, sway, mediaPlayer, wallpaper, idle, power, logind, perMonitor, searchDialog).
-- Typecheck: `nix shell nixpkgs#typescript_5 -c tsc --noEmit -p . | rg -v nix/store` (brightness GUdev errors pre-existing).
+- `flake.nix`: `packages.default` (`package.nix`), `packages.sideview` (`sideview/package.nix`, Servo, built from the separately pinned `nixpkgs-servo` input), `homeManagerModules.default` (`hm-module.nix`, `programs.flurry.{enable,settings,package}`, systemd user service).
+- Settings are Nix-only: `package.nix` writes `settings.rs` at build; `config.rs` merges defaults. Never runtime config files.
+- `app.rs`: entry; `flurry <cmd> [arg]` is the request client (sway keybinds), no args runs the shell; request socket in `$XDG_RUNTIME_DIR/flurry.sock`.
+- `ui/`: the toolkit: `runtime.rs` (single poll loop, timers, idle, tiny executor), `wayland.rs` (layer/lock surfaces, shm, input), `node.rs` (GTK-like box model + painting), `text.rs` (fontconfig + HarfBuzz), `icons.rs` (baked by `build.rs`), `entry.rs`, `window.rs`.
+- `lib/`: services (dbus, logind, iwd, bluetooth, battery, audio=pipewire, notifd, apps, sway, mpd, pam, wallpaper) and shared widgets (searchDialog, inputControl, backgroundSection, deviceMenu); `style.rs` holds the resolved CSS values.
+- `widgets/`: one file per window, same layout as the old TS.
+- `sideview/`: separate crate `flurry-sideview` (Servo), spawned by `widgets/sideview.rs`, commands over stdin.
+- Dev: `nix-shell` (or `nix develop`), `cargo test`, `cargo clippy`, `cargo build --release`.
+- Visual check: `tests/capture/run.sh <flurry-binary> <out-dir>` captures every window in an isolated headless sway (never the live session); compare with `tests/capture/sbs.sh`.
 - Build: `nix build .#default`.

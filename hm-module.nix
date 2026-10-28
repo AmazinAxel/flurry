@@ -7,7 +7,7 @@ in {
     settings = lib.mkOption {
       type = lib.types.attrs;
       default = {};
-      description = "Baked into the bundle at build time.";
+      description = "Baked into the binary at build time.";
     };
     package = lib.mkOption {
       type = lib.types.package;
@@ -16,7 +16,7 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages = [ cfg.package self.inputs.ags.packages.${system}.default ]; # ags cli for requests
+    home.packages = [ cfg.package ]; # `flurry <cmd>` is also the request client
 
     systemd.user.services.flurry = {
       Unit = {
