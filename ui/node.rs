@@ -341,15 +341,12 @@ impl Node {
                         (dots.min(full), full)
                     }
                     Some(chars) if l.wrap => {
-                        let cap = chars * text::approx_char_width(font);
-                        let longest_word = l
-                            .text
-                            .split_whitespace()
-                            .map(|w| text::layout(w, font, None, Wrap::None, false).width())
-                            .fold(0.0, f32::max);
-                        // GtkLabel: a wrapping label asks for max-width-chars worth of width even for short text
+                        let char_w = text::approx_char_width(font);
+                        // GtkLabel: a wrapping label asks for max-width-chars worth of width even for short text;
+                        // overlong words break anywhere (Wrap::Word), so its minimum is one char, not the longest
+                        // word, which pushed long addresses past a max-width parent
                         let _ = full;
-                        (longest_word.min(cap), cap)
+                        (char_w, chars * char_w)
                     }
                     _ => (full, full),
                 }

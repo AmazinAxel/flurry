@@ -58,7 +58,8 @@ pub fn osd() {
     let s1 = show.clone();
     b.subscribe(move || s1(leak("display-brightness-symbolic"), brightness().peek()));
 
-    // volume/mute changes of the same default speaker, after the first sync
+    // volume/mute changes and default speaker switches, after the first sync; a default that is
+    // briefly unknown (new sink not bound yet) keeps the last one so the switch still shows
     let last: Rc<RefCell<Option<(u32, String)>>> = Rc::default();
     let s2 = show.clone();
     let l = last.clone();
@@ -66,13 +67,9 @@ pub fn osd() {
         if !audio::ready().peek() {
             return;
         }
-        let sp = audio::default_speaker();
-        let cur = sp.as_ref().map(|s| (s.id, format!("{}{}", s.volume, s.mute)));
-        let prev = l.replace(cur.clone());
-        if let (Some(s), Some((pid, pv)), Some((cid, cv))) = (sp, prev, cur)
-            && pid == cid
-            && pv != cv
-        {
+        let Some(s) = audio::default_speaker() else { return };
+        let cur = (s.id, format!("{}{}", s.volume, s.mute));
+        if l.replace(Some(cur.clone())).is_some_and(|prev| prev != cur) {
             s2(s.volume_icon(), s.volume);
         }
     };

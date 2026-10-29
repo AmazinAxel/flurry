@@ -27,6 +27,20 @@ pub struct Sink {
     channels: Vec<f32>,
     device: Option<u32>,
     profile_device: Option<i32>,
+    /// volume/mute come from the device Route (what wpctl reads), not node Props
+    routed: bool,
+}
+
+impl Sink {
+    fn set_props(&mut self, channels: Option<Vec<f32>>, mute: Option<bool>) {
+        if let Some(c) = channels {
+            self.volume = c.iter().fold(0.0f32, |a, b| a.max(b.cbrt())) as f64;
+            self.channels = c;
+        }
+        if let Some(m) = mute {
+            self.mute = m;
+        }
+    }
 }
 
 impl Sink {
@@ -49,6 +63,8 @@ impl Sink {
 struct Route {
     index: i32,
     device: i32,
+    channels: Option<Vec<f32>>,
+    mute: Option<bool>,
 }
 
 struct PortInfo {
@@ -227,16 +243,32 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
     let Ok(node) = reg.bind::<pw::node::Node, _>(&global_props(id)) else { return };
     let listener = node
         .add_listener_local()
+        // registry globals omit card.profile.device: without it no Route matched and volume went to
+        // node Props, which never reach the hardware mixer and drift from what wpctl shows
+        .info(move |info| {
+            let Some(props) = info.props() else { return };
+            let device: Option<u32> = props.get("device.id").and_then(|v| v.parse().ok());
+            let pd: Option<i32> = props.get("card.profile.device").and_then(|v| v.parse().ok());
+            let route = device.zip(pd).and_then(|(dev, pd)| {
+                with(|p| p.devices.get(&dev).and_then(|(_, _, routes)| routes.iter().find(|r| r.device == pd).map(|r| (r.channels.clone(), r.mute))))
+                    .flatten()
+            });
+            update_sink(id, |s| {
+                s.device = device.or(s.device);
+                s.profile_device = pd.or(s.profile_device);
+                if let Some((c, m)) = route {
+                    s.routed = true;
+                    s.set_props(c, m);
+                }
+            });
+        })
         .param(move |_, _, _, _, pod| {
             let Some(pod) = pod else { return };
-            if let Some((channels, mute)) = parse_props(pod.as_bytes()) {
+            if let Some(Value::Object(o)) = deserialize(pod.as_bytes()) {
+                let (channels, mute) = parse_props(o);
                 update_sink(id, |s| {
-                    if let Some(c) = channels {
-                        s.volume = c.iter().fold(0.0f32, |a, b| a.max(b.cbrt())) as f64;
-                        s.channels = c;
-                    }
-                    if let Some(m) = mute {
-                        s.mute = m;
+                    if !s.routed {
+                        s.set_props(channels, mute);
                     }
                 });
             }
@@ -276,10 +308,21 @@ fn bind_device(reg: &pw::registry::Registry, id: u32) {
             if dir != spa::sys::SPA_DIRECTION_OUTPUT as i32 {
                 return;
             }
+            let (channels, mute) = match o.properties.into_iter().find(|p| p.key == spa::sys::SPA_PARAM_ROUTE_props).map(|p| p.value) {
+                Some(Value::Object(props)) => parse_props(props),
+                _ => (None, None),
+            };
+            let (c, m) = (channels.clone(), mute);
             with(|p| {
                 if let Some((_, _, routes)) = p.devices.get_mut(&id) {
                     routes.retain(|r| r.device != device);
-                    routes.push(Route { index, device });
+                    routes.push(Route { index, device, channels: c, mute: m });
+                }
+            });
+            speakers().update(|list| {
+                for s in list.iter_mut().filter(|s| s.device == Some(id) && s.profile_device == Some(device)) {
+                    s.routed = true;
+                    s.set_props(channels.clone(), mute);
                 }
             });
         })
@@ -309,8 +352,7 @@ fn deserialize(bytes: &[u8]) -> Option<Value> {
     PodDeserializer::deserialize_any_from(bytes).ok().map(|(_, v)| v)
 }
 
-fn parse_props(bytes: &[u8]) -> Option<(Option<Vec<f32>>, Option<bool>)> {
-    let Value::Object(o) = deserialize(bytes)? else { return None };
+fn parse_props(o: Object) -> (Option<Vec<f32>>, Option<bool>) {
     let mut channels = None;
     let mut mute = None;
     for p in o.properties {
@@ -320,7 +362,7 @@ fn parse_props(bytes: &[u8]) -> Option<(Option<Vec<f32>>, Option<bool>)> {
             _ => {}
         }
     }
-    Some((channels, mute))
+    (channels, mute)
 }
 
 fn serialize(v: Value) -> Option<Vec<u8>> {

@@ -42,7 +42,7 @@
   #files:empty { display: none; }
   #files img { display: block; max-height: 56px; }
   textarea { display: block; box-sizing: border-box; width: 100%; resize: none; border: 0; border-radius: 0; outline: 0;
-    background: transparent; color: #eceff4; font: inherit; padding: 0; max-height: 40vh; }
+    background: transparent; color: #eceff4; font: inherit; padding: 0; min-height: 1.45em; max-height: 40vh; }
 </style>
 <div id="log"></div>
 <div id="input"><div id="field"><div id="files"></div><textarea id="box" rows="1" autofocus></textarea></div></div>
@@ -189,6 +189,9 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   box.addEventListener('input', grow);
   // the panel opens before its final size: keep the box fully shown and the log pinned
   window.addEventListener('resize', function () { grow(); if (follow) bottom(); });
+  // Libron arrives after the first layout and an empty box keeps the fallback font's metrics (shorter
+  // box, smaller caret) until its text changes: touch the text once the font is in
+  if (document.fonts) document.fonts.ready.then(function () { var v = box.value; box.value = v + ' '; box.value = v; grow(); });
   box.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
