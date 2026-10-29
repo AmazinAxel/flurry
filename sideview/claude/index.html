@@ -144,8 +144,6 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
       text += d.text; schedule();
     } else if (d && d.type === 'thinking_delta') {
       think += d.thinking; if (!text) schedule();
-    } else if (ev.type === 'assistant' && !text) {
-      text = (ev.message.content || []).filter(function (c) { return c.type === 'text'; }).map(function (c) { return c.text; }).join(''); schedule();
     } else if (ev.type === 'result') {
       finish(ev.is_error ? String(ev.result || (ev.errors || []).join('; ') || ev.subtype || 'error') : '');
     } else if (ev.type === 'exit') {

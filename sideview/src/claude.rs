@@ -76,11 +76,16 @@ impl Chat {
         })
     }
 
-    /// One stream-json user message; the conversation lives in the running process.
-    pub fn send(&mut self, line: &str) -> bool {
+    /// Starts Claude Code ahead of the first message (the launch is most of the first reply's wait).
+    pub fn prewarm(&mut self) {
         if self.proc.is_none() {
             self.proc = Self::spawn();
         }
+    }
+
+    /// One stream-json user message; the conversation lives in the running process.
+    pub fn send(&mut self, line: &str) -> bool {
+        self.prewarm();
         let Some((_, stdin, _)) = &mut self.proc else { return false };
         stdin.write_all(line.as_bytes()).and_then(|_| stdin.write_all(b"\n")).and_then(|_| stdin.flush()).is_ok()
     }
@@ -110,7 +115,8 @@ impl Chat {
         while let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=i).collect();
             let line = String::from_utf8_lossy(&line).trim().to_string();
-            if line.starts_with('{') {
+            // only what the page renders: text/thinking deltas and the end of a turn
+            if line.contains("\"text_delta\"") || line.contains("\"thinking_delta\"") || line.contains("\"type\":\"result\"") {
                 lines.push(line);
             }
         }

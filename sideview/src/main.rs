@@ -317,6 +317,9 @@ fn main() {
                         wv.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
                         pages.insert(name.to_string(), wv);
                     }
+                    if claude_page.as_deref() == Some(name) {
+                        chat.prewarm(); // first reply without waiting for Claude Code to start
+                    }
                     for (n, wv) in &pages {
                         if n == name {
                             wv.show();
@@ -466,6 +469,7 @@ fn main() {
         for m in frame.messages.take() {
             if m == "claude:new" {
                 chat.reset();
+                chat.prewarm(); // the next chat starts without a process launch
             } else if let Some(line) = m.strip_prefix("claude:") {
                 if !chat.send(line) {
                     let wv = claude_page.as_ref().and_then(|c| pages.get(c));
@@ -480,8 +484,10 @@ fn main() {
             }
         }
         if let Some(wv) = claude_page.as_ref().and_then(|c| pages.get(c)) {
-            for line in chat.read() {
-                wv.evaluate_javascript(format!("window.__claude({line})"), |_| {});
+            // one script-thread round trip per read, however many events arrived
+            let calls: String = chat.read().iter().map(|l| format!("window.__claude({l});")).collect();
+            if !calls.is_empty() {
+                wv.evaluate_javascript(calls, |_| {});
             }
         }
         if let Some(wv) = current.as_ref().and_then(|c| pages.get(c)) {
