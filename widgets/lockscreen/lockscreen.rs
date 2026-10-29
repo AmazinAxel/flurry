@@ -129,7 +129,7 @@ fn handle_keys(ev: &KeyEvent) {
 
 fn clock_style(failed: Failed) -> Style {
     let mut s = window();
-    s.font = font(WQY, 192.0);
+    s.font = font(IOSEVKA, 192.0);
     s.color = alpha(blue1(), 0.9);
     s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(32.0, alpha(blue2(), 0.8))];
     match failed {

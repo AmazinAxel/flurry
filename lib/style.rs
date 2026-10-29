@@ -35,7 +35,7 @@ pub fn font(family: &'static str, size: f32) -> Font {
 
 pub const SORA: &str = "Sora";
 pub const HAMMERSMITH: &str = "Hammersmith One";
-pub const WQY: &str = "WenQuanYi Zen Hei Mono";
+pub const IOSEVKA: &str = "Iosevka Nerd Font Mono";
 
 /// `window`: Sora 16px, @light1, text/icon shadow.
 pub fn window() -> Style {

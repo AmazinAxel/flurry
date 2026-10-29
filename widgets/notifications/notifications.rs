@@ -38,8 +38,8 @@ fn capitalize(s: &str) -> String {
 fn item(base: &Style, n: &Notification) -> Node {
     let mut card = status_element(base);
     card.margin = Sides::trbl(5.0, 5.0, 0.0, 0.0);
-    card.min_width = 240.0;
-    card.max_width = Some(240.0);
+    card.min_width = 280.0;
+    card.max_width = Some(280.0);
     let mut header = base.inherit();
     header.background = Background::Color(dark2());
     header.padding = Sides::all(8.0);
@@ -139,4 +139,3 @@ pub fn invoke_oldest_notification(i: usize) {
         notifd::dismiss(n.id);
     }
 }
-

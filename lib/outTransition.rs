@@ -1,5 +1,5 @@
 // Flash windows (osd, workspaces): shown instantly, hidden after `ms` with a slide-out
-// (GTK revealer, eased by cubic-bezier(0, 0.6, 0.3, 1)) stepped on frame callbacks while animating.
+// (GTK revealer, eased by cubic-bezier(0, 0.6, 0.3, 1) reversed: slow start, fast end) stepped on frame callbacks while animating.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -45,7 +45,7 @@ impl Flash {
             None => 1.0,
             Some(t) => {
                 let x = (t.elapsed().as_secs_f32() * 1000.0 / self.duration).min(1.0);
-                1.0 - ease(x)
+                ease(1.0 - x)
             }
         }
     }

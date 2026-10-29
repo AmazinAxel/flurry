@@ -441,8 +441,8 @@ pub fn clipboard() {
             y += h + row.style.margin.bottom;
             nodes.push(row);
         }
-        scroll_into_view(&geometry, 460.0 - 20.0);
-        let list = Node::vbox(Style { padding: Sides::vh(10.0, 0.0), ..base.inherit() }, 0.0, nodes);
+        scroll_into_view(&geometry, 460.0);
+        let list = Node::vbox(Style { padding: Sides::trbl(10.0, 0.0, 0.0, 0.0), ..base.inherit() }, 0.0, nodes);
         let scroll = Node::scroll(base.inherit(), 460.0, SCROLL.with(Cell::get), list).show(count > 0);
         let header = search_entry(&base, &ec, "system-search-symbolic", v.focused("entry"));
         background_section(&base, header, Some(scroll), 700.0, 500.0)
