@@ -18,7 +18,7 @@ use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, rgba};
 use crate::ui::{image, runtime, window};
 use crate::widgets::clipboard::compress::open_compress;
 
-pub const TMP_DIR: &str = "/tmp/ags";
+pub const TMP_DIR: &str = "/tmp/flurry";
 const MAX_W: f32 = 380.0;
 const MAX_H: f32 = 150.0;
 
@@ -443,7 +443,7 @@ pub fn clipboard() {
         }
         scroll_into_view(&geometry, 460.0 - 20.0);
         let list = Node::vbox(Style { padding: Sides::vh(10.0, 0.0), ..base.inherit() }, 0.0, nodes);
-        let scroll = Node { children: vec![list], ..Node::new(Kind::Scroll { max_height: 460.0, offset: SCROLL.with(Cell::get) }, base.inherit()) }.show(count > 0);
+        let scroll = Node::scroll(base.inherit(), 460.0, SCROLL.with(Cell::get), list).show(count > 0);
         let header = search_entry(&base, &ec, "system-search-symbolic", v.focused("entry"));
         background_section(&base, header, Some(scroll), 700.0, 500.0)
     };
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn parses_cliphist_entries() {
         assert_eq!(binary_data("[[ binary data 12 KiB png 1920x1080 ]]"), Some(("png".into(), "1920".into(), "1080".into())));
-        assert_eq!(entry_path(7, "[[ binary data 1 B jpeg 1x1 ]]").as_deref(), Some("/tmp/ags/cliphist/7.jpeg"));
+        assert_eq!(entry_path(7, "[[ binary data 1 B jpeg 1x1 ]]").as_deref(), Some("/tmp/flurry/cliphist/7.jpeg"));
         assert_eq!(entry_path(1, "file:///home/a/x%20y.mp4").as_deref(), Some("/home/a/x y.mp4"));
         assert_eq!(entry_path(1, "/tmp/a b"), None);
         assert_eq!(entry_path(1, "hello"), None);

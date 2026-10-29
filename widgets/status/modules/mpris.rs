@@ -1,4 +1,4 @@
-// MPRIS player presence (AstalMpris players.length > 0).
+// MPRIS player presence (any player running).
 
 use std::cell::RefCell;
 use std::collections::HashSet;

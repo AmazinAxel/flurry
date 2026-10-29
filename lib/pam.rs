@@ -1,4 +1,4 @@
-// PAM on a worker thread (AstalAuth.Pam): pam_start + pam_authenticate, conversation messages
+// PAM on a worker thread: pam_start + pam_authenticate, conversation messages
 // reported back to the poll loop through a pipe.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};

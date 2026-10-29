@@ -1,5 +1,5 @@
 // Flash windows (osd, workspaces): shown instantly, hidden after `ms` with a slide-out
-// (GTK revealer, eased quintic-out per request) stepped on frame callbacks while animating.
+// (GTK revealer, eased by cubic-bezier(0, 0.6, 0.3, 1)) stepped on frame callbacks while animating.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -7,6 +7,25 @@ use std::time::Instant;
 
 use crate::ui::runtime;
 use crate::ui::window::Win;
+
+/// CSS cubic-bezier(0, 0.6, 0.3, 1): fast start, long gentle end.
+fn ease(x: f32) -> f32 {
+    const X1: f32 = 0.0;
+    const Y1: f32 = 0.6;
+    const X2: f32 = 0.3;
+    const Y2: f32 = 1.0;
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let bez = |t: f32, a: f32, b: f32| 3.0 * (1.0 - t) * (1.0 - t) * t * a + 3.0 * (1.0 - t) * t * t * b + t * t * t;
+    // x(t) is monotonic: bisect for the t that gives x
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..20 {
+        let mid = (lo + hi) / 2.0;
+        if bez(mid, X1, X2) < x { lo = mid } else { hi = mid }
+    }
+    bez((lo + hi) / 2.0, Y1, Y2)
+}
 
 pub struct Flash {
     ms: u64,
@@ -26,7 +45,7 @@ impl Flash {
             None => 1.0,
             Some(t) => {
                 let x = (t.elapsed().as_secs_f32() * 1000.0 / self.duration).min(1.0);
-                (1.0 - x).powi(5) // quintic ease-out: fast start, gentle end
+                1.0 - ease(x)
             }
         }
     }

@@ -23,7 +23,7 @@ thread_local! {
 }
 
 fn order_path() -> String {
-    format!("{}/ags/bluetooth-order.json", crate::lib::xdg::state_dir())
+    format!("{}/flurry/bluetooth-order.json", crate::lib::xdg::state_dir())
 }
 
 fn load_order() -> Vec<String> {
@@ -135,10 +135,12 @@ pub fn start() {
             sticky().set(vec![]);
         }
     });
-    // connected/connecting changes move focus back onto the focused device
+    // power and connected/connecting changes move focus back onto the focused device
     let last = RefCell::new(String::new());
     bt_state().subscribe(move || {
-        let sig: String = bt_state().with(|b| b.devices.iter().map(|d| format!("{}{}{}", d.path, d.connected, d.connecting)).collect());
+        let sig: String = bt_state().with(|b| {
+            std::iter::once(b.powered().to_string()).chain(b.devices.iter().map(|d| format!("{}{}{}", d.path, d.connected, d.connecting))).collect()
+        });
         if *last.borrow() != sig {
             *last.borrow_mut() = sig;
             if current().peek() == Some("bluetooth") {

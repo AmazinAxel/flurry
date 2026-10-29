@@ -19,7 +19,7 @@ fn socket_path() -> String {
     format!("{}/flurry.sock", xdg::runtime_dir())
 }
 
-/// Requests from sway keybinds (`flurry <cmd> [arg]`), what `ags request` used to carry.
+/// Requests from sway keybinds (`flurry <cmd> [arg]`).
 fn request(cmd: &str, arg: Option<&str>) {
     match cmd {
         "toggle" => {
@@ -85,7 +85,7 @@ fn serve() {
                 }
             }
             let line = String::from_utf8_lossy(&buf).trim().to_string();
-            // `ags request 'sideview plan'` style: the first two words
+            // `sideview plan` style: the first two words
             let mut words = line.split(' ');
             if let Some(cmd) = words.next() {
                 request(cmd, words.next());

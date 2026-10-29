@@ -22,6 +22,7 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "fonts/KaTeX_SansSerif-Italic.woff2", "fonts/KaTeX_SansSerif-Regular.woff2", "fonts/KaTeX_Script-Regular.woff2",
     "fonts/KaTeX_Size1-Regular.woff2", "fonts/KaTeX_Size2-Regular.woff2", "fonts/KaTeX_Size3-Regular.woff2",
     "fonts/KaTeX_Size4-Regular.woff2", "fonts/KaTeX_Typewriter-Regular.woff2",
+    "fonts/Libron-Regular.woff2", "fonts/Libron-Italic.woff2", "fonts/Libron-Bold.woff2", "fonts/Libron-BoldItalic.woff2",
 ];
 
 fn dir() -> std::path::PathBuf {
@@ -59,11 +60,13 @@ impl Chat {
         let cwd = dir();
         bins.iter().find_map(|bin| {
             let mut child = Command::new(bin)
-                .args(["-p", "--safe-mode", "--model", "opus", "--effort", "medium", "--tools", "", "--no-session-persistence"])
+                // the user's own settings (output style, hooks, model, effort) apply as in the terminal;
+                // sessions are saved under this cwd, so `claude -c` / `-r` there continues them
+                .args(["-p", "--tools", ""])
                 // summarized thinking for the status line (billed as thinking already is: no extra tokens)
                 .args(["--settings", r#"{"showThinkingSummaries":true}"#])
                 .args(["--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
-                .args(["--system-prompt", SYSTEM])
+                .args(["--append-system-prompt", SYSTEM])
                 .current_dir(&cwd)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

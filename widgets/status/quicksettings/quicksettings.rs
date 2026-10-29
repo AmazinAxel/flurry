@@ -82,8 +82,11 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             .focusable(id)
         })
         .collect();
-    let selector = Node::vbox(Style { padding: Sides::vh(5.0, 0.0), ..base.inherit() }, 0.0, sinks);
-    Node::vbox(base.inherit(), 0.0, vec![Node::vbox(base.inherit(), 0.0, rows), separator(base), selector]).expand(true, false)
+    let selector = Node::vbox(Style { padding: Sides::trbl(0.0, 0.0, 5.0, 0.0), ..base.inherit() }, 0.0, sinks);
+    // the knob overhangs the slider box by ~11px, leaving ~6px of visible padding: 8 more matches the 14 below
+    let mut sep = separator(base);
+    sep.style.margin.top = 8.0;
+    Node::vbox(base.inherit(), 0.0, vec![Node::vbox(base.inherit(), 0.0, rows), sep, selector]).expand(true, false)
 }
 
 /// Enter selects only this sink, Shift+Enter toggles it into a combined output.

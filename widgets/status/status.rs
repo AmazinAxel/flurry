@@ -85,6 +85,11 @@ pub fn status_window() -> Rc<Win> {
 pub fn toggle_info_area() {
     let Some(w) = window::get("status") else { return };
     w.set_visible(!w.visible());
-    let width = if w.visible() { build().measure_w().1 + build().style.margin_h() } else { 0.0 };
+    let width = if w.visible() {
+        let n = build();
+        n.measure_w().1 + n.style.margin.h()
+    } else {
+        0.0
+    };
     status_margin().set(width);
 }

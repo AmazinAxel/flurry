@@ -1,4 +1,4 @@
-// org.freedesktop.Notifications server, mirroring AstalNotifd's daemon (ids, replace, actions,
+// org.freedesktop.Notifications server (ids, replace, actions,
 // resident, expire timeouts, close reasons).
 
 use std::cell::{Cell, RefCell};
@@ -179,6 +179,6 @@ pub fn start() {
         let caps: Vec<&str> = vec!["action-icons", "actions", "body", "body-hyperlinks", "body-images", "body-markup", "icon-static", "persistence", "sound"];
         Some(m.method_return().append1(caps))
     });
-    bus.export(IFACE, "GetServerInformation", |m| Some(m.method_return().append2("notifd", "astal").append2("0.1", "1.2")));
+    bus.export(IFACE, "GetServerInformation", |m| Some(m.method_return().append2("notifd", "flurry").append2("0.1", "1.2")));
     bus.request_name(IFACE);
 }

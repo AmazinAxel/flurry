@@ -2,6 +2,7 @@
 // halign/valign/expand, boxes with spacing, overlays. Windows rebuild their tree from state on change,
 // then lay it out and paint it.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Rect, Transform};
@@ -28,10 +29,10 @@ impl Sides {
     pub const fn trbl(top: f32, right: f32, bottom: f32, left: f32) -> Self {
         Self { top, right, bottom, left }
     }
-    fn h(&self) -> f32 {
+    pub fn h(&self) -> f32 {
         self.left + self.right
     }
-    fn v(&self) -> f32 {
+    pub fn v(&self) -> f32 {
         self.top + self.bottom
     }
 }
@@ -76,6 +77,8 @@ pub struct Style {
     pub color: Color,
     pub font: Font,
     pub min_width: f32,
+    /// caps the content width (not CSS; GTK has no max-width)
+    pub max_width: Option<f32>,
     pub min_height: f32,
     pub opacity: f32,
     pub box_shadow: Vec<Shadow>,
@@ -100,6 +103,7 @@ impl Default for Style {
             color: Color::WHITE,
             font: Font { family: "Sora", weight: 400, size: 16.0, letter_spacing: 0.0 },
             min_width: 0.0,
+            max_width: None,
             min_height: 0.0,
             opacity: 1.0,
             box_shadow: vec![],
@@ -174,6 +178,10 @@ pub struct Node {
     pub homogeneous: bool,
     // filled in by layout
     pub rect: Rect,
+    /// measure_w, and the last measure_h by width: a tree is immutable once built, and every level of
+    /// layout re-measures its subtree
+    measured_w: Cell<Option<(f32, f32)>>,
+    measured_h: Cell<Option<(u32, (f32, f32))>>,
 }
 
 impl Node {
@@ -193,6 +201,8 @@ impl Node {
             focusable: false,
             homogeneous: false,
             rect: Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap(),
+            measured_w: Cell::new(None),
+            measured_h: Cell::new(None),
         }
     }
     pub fn vbox(style: Style, spacing: f32, children: Vec<Node>) -> Self {
@@ -200,6 +210,9 @@ impl Node {
     }
     pub fn hbox(style: Style, spacing: f32, children: Vec<Node>) -> Self {
         Self { children, ..Self::new(Kind::Box { vertical: false, spacing }, style) }
+    }
+    pub fn scroll(style: Style, max_height: f32, offset: f32, child: Node) -> Self {
+        Self { children: vec![child], ..Self::new(Kind::Scroll { max_height, offset }, style) }
     }
     pub fn overlay(style: Style, children: Vec<Node>) -> Self {
         Self { children, ..Self::new(Kind::Overlay, style) }
@@ -261,6 +274,19 @@ impl Node {
         }
         self
     }
+    /// Ellipsize END without max-width-chars: natural width is the full text.
+    pub fn ellipsize_natural(mut self) -> Self {
+        if let Kind::Label(l) = &mut self.kind {
+            l.ellipsize = true;
+        }
+        self
+    }
+    /// Makes this node a focus target named `id`.
+    pub fn focusable(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self.focusable = true;
+        self
+    }
 
     fn compute_hexpand(&self) -> bool {
         self.hexpand || self.children.iter().any(|c| c.visible && c.compute_hexpand())
@@ -278,6 +304,15 @@ impl Node {
 
     /// (minimum, natural) border-box width.
     pub fn measure_w(&self) -> (f32, f32) {
+        if let Some(m) = self.measured_w.get() {
+            return m;
+        }
+        let m = self.measure_w_uncached();
+        self.measured_w.set(Some(m));
+        m
+    }
+
+    fn measure_w_uncached(&self) -> (f32, f32) {
         let (min, nat) = match &self.kind {
             Kind::Box { vertical, spacing } => {
                 let kids = self.children.iter().filter(|c| c.visible).map(|c| c.outer_w());
@@ -331,6 +366,8 @@ impl Node {
             Kind::Scroll { .. } => self.children.first().map(|c| c.outer_w()).unwrap_or_default(),
         };
         let (min, nat) = (min.max(self.style.min_width), nat.max(self.style.min_width));
+        let cap = self.style.max_width.unwrap_or(f32::INFINITY);
+        let (min, nat) = (min.min(cap), nat.min(cap));
         // GTK4 size requests cover the CSS margin box
         let req = (self.width_request - self.style.margin.h()).max(0.0);
         ((min + self.frame_h()).max(req), (nat + self.frame_h()).max(req))
@@ -338,6 +375,17 @@ impl Node {
 
     /// (minimum, natural) border-box height for a border-box `width`.
     pub fn measure_h(&self, width: f32) -> (f32, f32) {
+        if let Some((w, m)) = self.measured_h.get()
+            && w == width.to_bits()
+        {
+            return m;
+        }
+        let m = self.measure_h_uncached(width);
+        self.measured_h.set(Some((width.to_bits(), m)));
+        m
+    }
+
+    fn measure_h_uncached(&self, width: f32) -> (f32, f32) {
         let inner_w = (width - self.frame_h()).max(0.0);
         let (min, nat) = match &self.kind {
             Kind::Box { vertical, spacing } => {
@@ -386,7 +434,10 @@ impl Node {
         let w = (outer_width - self.style.margin.h()).max(0.0);
         let w = match self.halign {
             Align::Fill => w,
-            _ => self.measure_w().1.min(w).max(self.measure_w().0),
+            _ => {
+                let (min, nat) = self.measure_w();
+                nat.min(w).max(min)
+            }
         };
         let (a, b) = self.measure_h(w);
         let m = self.style.margin.v();
@@ -459,7 +510,7 @@ impl Node {
         out
     }
 
-    fn label_layout(&self, width: f32) -> Layout {
+    fn label_layout(&self, width: f32) -> Rc<Layout> {
         let Kind::Label(l) = &self.kind else { unreachable!() };
         let font = &self.style.font;
         let mut layout = if l.wrap {
@@ -470,11 +521,13 @@ impl Node {
             text::layout(&l.text, font, None, Wrap::None, false)
         };
         if let Some(px) = self.style.line_height {
+            let layout = Rc::make_mut(&mut layout);
             layout.ascent += (px - layout.line_height) / 2.0;
             layout.line_height = px;
         }
         if let Some(lh) = l.line_height {
             // Pango line-height factor: every line shrinks/grows, the difference split above/below
+            let layout = Rc::make_mut(&mut layout);
             let h = layout.line_height * lh;
             layout.ascent += (h - layout.line_height) / 2.0;
             layout.line_height = h;
@@ -786,8 +839,24 @@ fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
     let dev = sr.transform(ts).unwrap_or(sr);
     let (ox, oy) = ((dev.left() - pad).floor(), (dev.top() - pad).floor());
     let (w, h) = ((dev.width() + pad * 2.0).ceil() as u32 + 2, (dev.height() + pad * 2.0).ceil() as u32 + 2);
-    let Some(mut layer) = Pixmap::new(w, h) else { return };
     let lts = ts.post_translate(-ox, -oy);
+    // the finished shadow only depends on its shape in the layer: buttons and rows repeat it
+    thread_local! {
+        static SHADOWS: std::cell::RefCell<std::collections::HashMap<u64, Rc<Pixmap>>> = Default::default();
+    }
+    let hole = r.transform(lts).unwrap_or(r);
+    let c = s.color.to_color_u8();
+    let key = hash(&(
+        w,
+        h,
+        [(dev.left() - ox), (dev.top() - oy), dev.width(), dev.height(), hole.left(), hole.top(), hole.width(), hole.height(), s.blur, scale].map(f32::to_bits),
+        [c.red(), c.green(), c.blue(), c.alpha()],
+    ));
+    if let Some(l) = SHADOWS.with(|m| m.borrow().get(&key).cloned()) {
+        pm.draw_pixmap(ox as i32, oy as i32, Pixmap::as_ref(&l), &PixmapPaint::default(), Transform::identity(), None);
+        return;
+    }
+    let Some(mut layer) = Pixmap::new(w, h) else { return };
     if s.blur <= 0.0 {
         fill_rect(&mut layer.as_mut(), sr, s.color, lts);
     } else {
@@ -796,6 +865,13 @@ fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
     let clear = Paint { blend_mode: tiny_skia::BlendMode::Clear, anti_alias: false, ..Default::default() };
     layer.fill_rect(r, &clear, lts, None);
     pm.draw_pixmap(ox as i32, oy as i32, layer.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    SHADOWS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 64 {
+            m.clear();
+        }
+        m.insert(key, Rc::new(layer));
+    });
 }
 
 fn paint_inset_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
@@ -898,34 +974,6 @@ pub fn alpha(c: Color, a: f32) -> Color {
     match Color::from_rgba(c.red(), c.green(), c.blue(), c.alpha() * a) {
         Some(c) => c,
         None => Color::TRANSPARENT,
-    }
-}
-
-impl Style {
-    pub fn margin_h(&self) -> f32 {
-        self.margin.h()
-    }
-    pub fn margin_v(&self) -> f32 {
-        self.margin.v()
-    }
-}
-
-impl Node {
-    /// Makes this node a focus target named `id`.
-    pub fn focusable(mut self, id: impl Into<String>) -> Self {
-        self.id = Some(id.into());
-        self.focusable = true;
-        self
-    }
-}
-
-impl Node {
-    /// Ellipsize END without max-width-chars: natural width is the full text.
-    pub fn ellipsize_natural(mut self) -> Self {
-        if let Kind::Label(l) = &mut self.kind {
-            l.ellipsize = true;
-        }
-        self
     }
 }
 

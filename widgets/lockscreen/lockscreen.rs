@@ -69,7 +69,7 @@ fn check_login() {
     }
     let password = entry().borrow().text.clone();
     entry().borrow_mut().set_text("");
-    pam::authenticate("astal-auth", Some(password), |ev| {
+    pam::authenticate("flurry-auth", Some(password), |ev| {
         let pam::Event::Done(ok) = ev else { return };
         if ok {
             unlock_screen();
@@ -271,7 +271,7 @@ impl Fprint {
         }
         self.running.set(true);
         let me = self.clone();
-        pam::authenticate("astal-fprint", None, move |ev| match ev {
+        pam::authenticate("flurry-fprint", None, move |ev| match ev {
             pam::Event::Info => {}
             pam::Event::Error(msg) => {
                 if msg.contains("Failed to match") {
@@ -308,7 +308,7 @@ impl Fprint {
 }
 
 pub fn start() {
-    if std::path::Path::new("/etc/pam.d/astal-fprint").exists() {
+    if std::path::Path::new("/etc/pam.d/flurry-fprint").exists() {
         FPRINT.with(|f| *f.borrow_mut() = Some(Rc::new(Fprint { mismatches: Cell::new(0), running: Cell::new(false), flash: RefCell::default() })));
     }
     auth_failed().subscribe(redraw);

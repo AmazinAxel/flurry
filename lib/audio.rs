@@ -1,4 +1,4 @@
-// PipeWire sinks (the AstalWp subset flurry uses): sink list, default sink, cubic volume + mute
+// PipeWire sinks (the subset flurry uses): sink list, default sink, cubic volume + mute
 // with WirePlumber mixer semantics (device Route when the node has one, else node Props), links.
 
 use std::cell::RefCell;
@@ -21,7 +21,7 @@ pub struct Sink {
     pub name: String,
     pub description: String,
     pub serial: u64,
-    /// cubic, max over channels (AstalWp)
+    /// cubic, max over channels
     pub volume: f64,
     pub mute: bool,
     channels: Vec<f32>,
@@ -173,7 +173,7 @@ pub fn start() {
             }
         })
         .error(move |id, _, res, _| {
-            // core connection lost (pipewire restarted): drop everything and reconnect, like AstalWp
+            // core connection lost (pipewire restarted): drop everything and reconnect
             if id == 0 && res == -libc::EPIPE {
                 runtime::idle(|| {
                     let fd = PW.with(|p| p.borrow_mut().take().map(|p| p._main.loop_().fd().as_raw_fd()));

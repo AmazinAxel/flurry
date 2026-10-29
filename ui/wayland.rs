@@ -354,7 +354,7 @@ pub struct LayerSpec {
     pub layer: Layer,
     pub anchor: Anchor,
     pub keymode: Keymode,
-    /// -1 ignores other zones (Astal IGNORE), 0 respects them (NORMAL), >0 reserves (EXCLUSIVE, set from size)
+    /// -1 ignores other zones (IGNORE), 0 respects them (NORMAL), >0 reserves (EXCLUSIVE, set from size)
     pub exclusive: i32,
     pub output: Option<wl_output::WlOutput>,
     /// fullscreen dim color (r, g, b, a in 0-1); content then lives in a subsurface sized to what it paints
@@ -640,11 +640,11 @@ impl Inner {
             }
         };
         let (_, nw) = node.measure_w();
-        let nw = nw + node.style.margin_h();
+        let nw = nw + node.style.margin.h();
         let w = if stretch_w { 0 } else if self.fixed.0 > 0 { self.fixed.0 } else { nw.ceil().max(1.0) as u32 };
         let width_for_h = if stretch_w { cw as f32 } else { w as f32 };
-        let (_, nh) = node.measure_h(width_for_h - node.style.margin_h());
-        let nh = nh + node.style.margin_v();
+        let (_, nh) = node.measure_h(width_for_h - node.style.margin.h());
+        let nh = nh + node.style.margin.v();
         let h = if stretch_h { 0 } else if self.fixed.1 > 0 { self.fixed.1 } else { nh.ceil().max(1.0) as u32 };
         layer.set_size(w, h);
         if self.exclusive > 0 {

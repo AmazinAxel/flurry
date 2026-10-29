@@ -37,7 +37,7 @@ pub fn inhibit_sleep(why: &str) {
         return;
     }
     let Some(bus) = dbus::system() else { return };
-    let msg = method(NAME, PATH, MANAGER, "Inhibit").append3("sleep", "ags", why).append1("delay");
+    let msg = method(NAME, PATH, MANAGER, "Inhibit").append3("sleep", "flurry", why).append1("delay");
     bus.call_cb(msg, |r| match r.ok().and_then(|m| m.read1::<::dbus::arg::OwnedFd>().ok()) {
         Some(fd) => {
             let fd: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd.into_fd()) };

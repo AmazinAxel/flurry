@@ -239,6 +239,12 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         let x = r.x() - e.scroll;
         let y = r.y() + ((r.height() - layout.height()) / 2.0).floor();
         let clip = r;
+        // paint into a layer bounded horizontally to the text area (vertical slack for shadows)
+        let bound = Rect::from_ltrb(r.left(), r.top() - r.height(), r.right(), r.bottom() + r.height()).unwrap_or(r);
+        let Some((mut area, (lx, ly))) = super::node::clip_layer(bound, ts) else { return };
+        let outer = pm;
+        let pm = &mut area.as_mut();
+        let ts = ts.post_translate(-lx, -ly);
         let (a, b) = e.selection();
         if a != b && !shown.is_empty() {
             let (sa, sb) = (x_at(e.display_index(a)), x_at(e.display_index(b)));
@@ -253,7 +259,7 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         if a != b && !shown.is_empty() {
             // selected glyphs in the selection color, clipped to the selection
             let (sa, sb) = (x_at(e.display_index(a)), x_at(e.display_index(b)));
-            if let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height())
+            if let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height()).and_then(|s| s.intersect(&clip))
                 && let Some((mut layer, (ox, oy))) = super::node::clip_layer(sel, ts)
             {
                 text::draw(&mut layer.as_mut(), &layout, x, y, look.selection_fg, ts.post_translate(-ox, -oy));
@@ -267,6 +273,7 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
                 fill_rect(pm, c, look.color, ts);
             }
         }
+        outer.draw_pixmap(lx as i32, ly as i32, area.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
     });
     let mut n = Node::new(Kind::Custom { width: 0.0, height, paint }, style);
     n.hexpand = true;

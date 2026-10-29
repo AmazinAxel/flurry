@@ -1,4 +1,4 @@
-// Desktop entries + AstalApps' fuzzy query (lib/apps/src/{apps,application,fuzzy}.vala).
+// Desktop entries + fuzzy query.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -12,7 +12,6 @@ pub struct App {
     pub description: String,
     pub keywords: Vec<String>,
     pub categories: Vec<String>,
-    pub frequency: i64,
 }
 
 thread_local! {
@@ -92,25 +91,20 @@ fn parse(id: &str, text: &str, desktops: &[String]) -> Option<App> {
         description: kv.get("Comment").unwrap_or(&"").to_string(),
         keywords: list("Keywords"),
         categories: list("Categories"),
-        frequency: 0,
     })
 }
 
-fn frequents() -> HashMap<String, i64> {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .map(|c| c.join("astal/apps-frequents.json"));
-    let Some(text) = cache.and_then(|c| std::fs::read_to_string(c).ok()) else { return HashMap::new() };
-    match crate::lib::json::parse(&text) {
-        Some(crate::lib::json::Json::Obj(m)) => m.into_iter().filter_map(|(k, v)| Some((k, v.int()?))).collect(),
-        _ => HashMap::new(),
-    }
+/// Rescans the desktop entries on a worker thread (hundreds of file reads).
+pub fn reload() {
+    crate::ui::runtime::spawn(async {
+        if let Some(apps) = crate::ui::runtime::blocking(scan).await {
+            APPS.with(|a| *a.borrow_mut() = apps);
+        }
+    });
 }
 
-pub fn reload() {
+fn scan() -> Vec<App> {
     let desktops: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').map(String::from).collect();
-    let freq = frequents();
     let mut seen = HashSet::new();
     let mut apps = vec![];
     for dir in app_dirs() {
@@ -120,13 +114,12 @@ pub fn reload() {
             if !seen.insert(id.clone()) {
                 continue; // earlier dirs shadow later ones
             }
-            if let Some(mut a) = std::fs::read_to_string(&path).ok().and_then(|t| parse(&id, &t, &desktops)) {
-                a.frequency = *freq.get(&id).unwrap_or(&0);
+            if let Some(a) = std::fs::read_to_string(&path).ok().and_then(|t| parse(&id, &t, &desktops)) {
                 apps.push(a);
             }
         }
     }
-    APPS.with(|a| *a.borrow_mut() = apps);
+    apps
 }
 
 fn fuzzy_match_string(pattern: &[u8], s: &[u8]) -> i32 {
@@ -197,19 +190,14 @@ fn score(term: &str, a: &App) -> f64 {
 pub fn fuzzy_query(term: &str) -> Vec<App> {
     let mut arr = APPS.with(|a| a.borrow().clone());
     if term.is_empty() {
-        arr.sort_by_key(|a| std::cmp::Reverse(a.frequency));
         return arr;
     }
     if term.chars().count() == 1 {
         arr.retain(|a| score(term, a) != 0.0);
-        arr.sort_by_key(|a| std::cmp::Reverse(a.frequency));
         return arr;
     }
     arr.retain(|a| score(term, a) >= 0.5);
-    arr.sort_by(|a, b| {
-        let (s1, s2) = (score(term, a), score(term, b));
-        if s1 == s2 { b.frequency.cmp(&a.frequency) } else { s2.total_cmp(&s1) }
-    });
+    arr.sort_by(|a, b| score(term, b).total_cmp(&score(term, a)));
     arr
 }
 

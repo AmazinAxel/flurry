@@ -1,4 +1,4 @@
-// Child processes on the poll loop (ags/process + AstalIO.Process): async exec, stdin piping,
+// Child processes on the poll loop: async exec, stdin piping,
 // line-streamed stdout/stderr, signals. std spawns through posix_spawn (vfork), the cheapest path.
 
 use std::cell::RefCell;
@@ -124,7 +124,7 @@ pub async fn run_input(argv: &[&str], input: &[u8]) -> bool {
 }
 
 
-/// A running process with line-streamed output (AstalIO.Process).
+/// A running process with line-streamed output.
 pub struct Proc {
     pub pid: u32,
 }

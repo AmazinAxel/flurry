@@ -16,7 +16,7 @@ use dpi::PhysicalSize;
 use euclid::Scale;
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle};
 use servo::{
-    Code, ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, Location, Modifiers, MouseButton,
+    Code, ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, Opts, Preferences, RenderingContext, ServoBuilder, Theme,
     UserContentManager, UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
@@ -208,6 +208,7 @@ fn main() {
     prefs.dom_fontface_enabled = true;
     prefs.layout_variable_fonts_enabled = true;
     prefs.user_agent = SAFARI_UA.into();
+    prefs.editing_caret_blink_time = 0; // steady caret
     prefs.shell_background_color_rgba = [0x2e as f64 / 255.0, 0x34 as f64 / 255.0, 0x40 as f64 / 255.0, 1.0];
     let servo = ServoBuilder::default().opts(opts).preferences(prefs).event_loop_waker(Box::new(Waker(wake_fd))).build();
     let scripts = Rc::new(UserContentManager::new(&servo));
@@ -223,6 +224,10 @@ fn main() {
     // configured since the last map: presenting before that blocks in eglSwapBuffers on a frame
     // callback the unmapped surface never gets (re-shows hung until the helper was killed)
     let mut mapped = false;
+    // deadline for a page just shown to produce its first frame (painting before it renders the
+    // previous scene)
+    let mut awaiting: Option<Instant> = None;
+    let mut skip_blank = false;
     let mut rendering: Option<Rc<WindowRenderingContext>> = None;
     let mut chat = claude::Chat::default();
     let mut claude_page: Option<String> = None;
@@ -287,8 +292,11 @@ fn main() {
             let mut w = line.splitn(3, ' ');
             match (w.next(), w.next(), w.next()) {
                 (Some("show"), Some(name), Some(url)) => {
+                    // a visible page swapped for another: its hide builds a frame of neither page
+                    let swap = visible && current.as_deref().is_some_and(|c| c != name && pages.contains_key(c));
                     if !visible {
                         visible = true;
+                        // the last presented frame maps instantly and stays until the new page paints
                         map(&mut s, width, focused, &zone);
                     }
                     let Some(rc) = &rendering else {
@@ -320,17 +328,29 @@ fn main() {
                     if claude_page.as_deref() == Some(name) {
                         chat.prewarm(); // first reply without waiting for Claude Code to start
                     }
+                    // hide before show: the shared scene never holds two pages at once
                     for (n, wv) in &pages {
-                        if n == name {
-                            wv.show();
-                            wv.set_focused(true);
-                        } else {
+                        if n != name {
                             wv.hide();
+                            wv.set_focused(false);
                         }
                     }
-                    frame.dirty.set(true);
+                    if let Some(wv) = pages.get(name) {
+                        wv.show();
+                        wv.set_focused(true);
+                    }
+                    // paint on the frame the show produces, not the stale scene still built
+                    frame.dirty.set(false);
+                    skip_blank = swap;
+                    let loading = pages.get(name).is_some_and(|wv| wv.load_status() != LoadStatus::Complete);
+                    awaiting = Some(Instant::now() + Duration::from_millis(if loading { 1000 } else { 150 }));
                 }
                 (Some("hide"), _, _) => {
+                    // hidden web views drop out of the scene and stop animating: nothing renders
+                    for wv in pages.values() {
+                        wv.hide();
+                    }
+                    awaiting = None;
                     visible = false;
                     mapped = false;
                     if let Some(l) = s.layer.take() {
@@ -398,7 +418,9 @@ fn main() {
             }
             mapped = true;
             paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });
-            frame.dirty.set(true);
+            if awaiting.is_none() {
+                frame.dirty.set(true);
+            }
             continue; // run the deferred show now
         }
 
@@ -494,12 +516,28 @@ fn main() {
             for ev in state.events.drain(..) {
                 wv.notify_input_event(ev);
             }
+            if awaiting.is_some() && frame.dirty.get() {
+                if wv.load_status() != LoadStatus::Complete {
+                    frame.dirty.set(false); // still loading: its frames are blank, the old one stays up
+                } else if skip_blank {
+                    // the first frame after a swap is the empty in-between scene; the shown page's
+                    // follows, unless both arrived together (then the renderer already holds it)
+                    frame.dirty.set(false);
+                    skip_blank = false;
+                    awaiting = Some(Instant::now() + Duration::from_millis(16));
+                }
+            }
+            if awaiting.is_some_and(|at| Instant::now() >= at) {
+                frame.dirty.set(true); // no frame came (nothing changed): paint what there is
+                skip_blank = false;
+            }
             if visible && mapped
                 && frame.dirty.replace(false)
                 && let Some(rc) = &rendering
             {
                 wv.paint();
                 rc.present();
+                awaiting = None;
             }
         } else {
             state.events.clear();
@@ -515,7 +553,11 @@ fn main() {
             // -1 (no chat process) is ignored by poll
             libc::pollfd { fd: chat.fd(), events: libc::POLLIN, revents: 0 },
         ];
-        let timeout = repeat_key.map(|(_, at)| at.saturating_duration_since(Instant::now()).as_millis() as i32).unwrap_or(-1);
+        let wake_at = match (repeat_key.map(|r| r.1), awaiting.filter(|_| visible && mapped)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let timeout = wake_at.map(|at| at.saturating_duration_since(Instant::now()).as_millis() as i32).unwrap_or(-1);
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if fds[0].revents & libc::POLLIN != 0 {
             let _ = guard.read();

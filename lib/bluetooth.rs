@@ -1,4 +1,4 @@
-// BlueZ object model (the AstalBluetooth subset flurry uses), kept live from ObjectManager signals.
+// BlueZ object model (the subset flurry uses), kept live from ObjectManager signals.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +33,7 @@ pub struct Adapter {
 pub struct Bt {
     pub available: bool,
     pub adapters: BTreeMap<String, Adapter>,
-    /// insertion order, like AstalBluetooth's device list
+    /// insertion order
     pub devices: Vec<Device>,
 }
 

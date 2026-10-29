@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Captures golden screenshots of the AGS flurry build inside an isolated headless sway.
+# Captures golden screenshots of flurry inside an isolated headless sway.
 # Isolation: fake HOME, own runtime dir, own session bus, mocked system bus (iwd/bluez/upower/logind),
 # fake backlight, no pipewire, no PAM configs, fake gpu-screen-recorder. Never touches the live session.
 # usage: tests/capture/run.sh [flurry-binary] [out-dir]
@@ -39,7 +39,6 @@ echo 600 > "$B/brightness"
 export HOME=$H XDG_RUNTIME_DIR=$tmp/run TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8
 # Safety: everything below must talk to the private session bus from dbus-run-session, never the live one
 [[ ${DBUS_SESSION_BUS_ADDRESS:-} == *"/run/user/"* || -z ${DBUS_SESSION_BUS_ADDRESS:-} ]] && { echo "refusing: not on a private session bus" >&2; exit 1; }
-[[ -n $(ags list 2>/dev/null) ]] && { echo "refusing: an ags instance is visible on this bus" >&2; exit 1; }
 unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME WAYLAND_DISPLAY SWAYSOCK DISPLAY I3SOCK
 mkdir -p "$H/.cache/cliphist"
 printf 'hello from the clipboard' | cliphist store

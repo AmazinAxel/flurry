@@ -1,4 +1,4 @@
-// UPower DisplayDevice (AstalBattery subset): percentage, state, icon, presence.
+// UPower DisplayDevice: percentage, state, icon, presence.
 
 use crate::lib::dbus::{self, PropMap, SignalFilter, get_all, prop_bool, prop_f64, prop_i64, prop_str};
 use crate::lib::state::State;

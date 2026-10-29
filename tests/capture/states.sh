@@ -1,12 +1,6 @@
 # Sourced by run.sh: drives flurry through every window/state and grabs a screenshot of each.
-inst=$(ags list 2>/dev/null | head -1 || true)
-if [[ -n $inst ]]; then # the AGS build
-  req() { ags request -i "$inst" "$@"; sleep 0.3; }
-  toggle() { ags toggle -i "$inst" "$1"; sleep 0.3; }
-else # the Rust build: same binary is its own client
-  req() { "$flurry" "$@"; sleep 0.3; }
-  toggle() { "$flurry" toggle "$1"; sleep 0.3; }
-fi
+req() { "$flurry" "$@"; sleep 0.3; }
+toggle() { "$flurry" toggle "$1"; sleep 0.3; }
 key() { wtype -s 150 "$@"; sleep 0.2; }
 shot() { sleep "${2:-0.4}"; date '+%F %H:%M' > "$out/$1.time"; grim -o HEADLESS-1 "$out/$1.png"; echo "  $1"; }
 

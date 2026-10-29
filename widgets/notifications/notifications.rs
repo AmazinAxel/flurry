@@ -39,6 +39,7 @@ fn item(base: &Style, n: &Notification) -> Node {
     let mut card = status_element(base);
     card.margin = Sides::trbl(5.0, 5.0, 0.0, 0.0);
     card.min_width = 240.0;
+    card.max_width = Some(240.0);
     let mut header = base.inherit();
     header.background = Background::Color(dark2());
     header.padding = Sides::all(8.0);
@@ -62,7 +63,7 @@ fn item(base: &Style, n: &Notification) -> Node {
             .iter()
             .map(|(_, label)| {
                 let b = button(base);
-                Node::hbox(b.clone(), 0.0, vec![Node::label(b.inherit(), label.replace("Activate", "Open")).expand(true, false)]).expand(true, false)
+                Node::hbox(b.clone(), 0.0, vec![Node::label(b.inherit(), label.replace("Activate", "Open")).ellipsize_natural().expand(true, false)]).expand(true, false)
             })
             .collect();
         kids.push(Node::hbox(s, 5.0, buttons));
