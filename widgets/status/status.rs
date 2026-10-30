@@ -1,7 +1,12 @@
 // Quickstatus menu: clock, status icons and date, the media block, then the quicksettings sliders and outputs.
 
 use crate::lib::audio;
-use crate::lib::menuWindow::{GAP, INNER_WIDTH};
+use crate::lib::menuWindow::GAP;
+
+/// Ink height of the clock and date; the group is centered in the wallpaper's width.
+const TOP_HEIGHT: f32 = 220.0;
+/// Text size of the controls under the wallpaper.
+const CONTROL_FONT: f32 = 19.0;
 use crate::lib::mediaPlayer::{PLAYLISTS, is_playing, playlist_index, song};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Background, Node, Sides, Style};
@@ -35,35 +40,33 @@ fn media(base: &Style) -> Node {
     let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
     let Some((title, artist)) = text else {
         btn.background = Background::Color(playlist);
-        return Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 26.0)]).expand(true, false).align(Align::Center, Align::Fill).id("mediaBtn")])
+        return Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0)]).expand(true, false).align(Align::Center, Align::Fill).id("mediaBtn")])
             .id("media");
     };
     let mut t = base.inherit();
-    t.font.size = 19.0;
+    t.font.size = 22.0;
     t.font.weight = 700;
-    let a = Style { font: font(SORA, 16.0), ..base.inherit() };
+    let a = Style { font: font(SORA, 18.0), ..base.inherit() };
     let info = Node::vbox(Style { padding: Sides::vh(8.0, 14.0), ..base.inherit() }, 2.0, vec![
         Node::label(t, title).xalign(0.0).ellipsize(),
         Node::label(a, artist.clone()).xalign(0.0).ellipsize().show(!artist.is_empty()),
     ])
     .expand(true, false)
     .align(Align::Fill, Align::Center);
-    Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 26.0).align(Align::Center, Align::Center)]).id("mediaBtn"), info]).id("media")
+    Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).id("mediaBtn"), info]).id("media")
 }
 
 /// Wallpaper part (clock | icons | date on one GAP grid, as tall as each other) and the controls under it.
 pub fn quickstatus(base: &Style, focus: Option<&str>) -> (Node, Option<Node>) {
     let icons = status(base);
-    // two digits of ink: 2 advances less the outer bearings
-    let ink = 1.0 - 2.0 * DIGIT_BEARING;
-    // weekday ink as wide as the date digits; clock as tall as the date: c = k * d + GAP / (2 * 0.75)
-    let day = ink / DAY_INK;
-    let k = (2.0 * 0.75 + 0.75 * day) / (2.0 * 0.75);
-    let off = GAP / 1.5;
-    let text = INNER_WIDTH - icons.measure_w().1 - 2.0 * GAP;
-    let d = (text / ink - off) / (k + 1.0);
-    let c = k * d + off;
+    // weekday ink as wide as the date digits (two digits: 2 advances less the outer bearings)
+    let day = (1.0 - 2.0 * DIGIT_BEARING) / DAY_INK;
+    // both columns TOP_HEIGHT tall: 2 rows + gap for the clock, 3 rows + 2 gaps for the date
+    let c = (TOP_HEIGHT - GAP) / 1.5;
+    let d = (TOP_HEIGHT - 2.0 * GAP) / (1.5 + 0.75 * day);
     debug_assert!((time::clock_height(c, GAP) - time::date_height(d, day * d, GAP)).abs() < 0.5);
-    let top = Node::hbox(base.inherit(), GAP, vec![time::clock(base, c, GAP), icons, time::date(base, d, day * d, GAP)]).align(Align::Center, Align::Center);
-    (top, Some(Node::vbox(base.inherit(), 0.0, vec![media(base), quick_settings(base, focus)]).expand(true, false)))
+    let top = Node::hbox(base.inherit(), GAP, vec![time::clock(base, c, GAP), icons, time::date(base, d, day * d, GAP)]).expand(true, false).align(Align::Center, Align::Center);
+    let mut big = base.clone();
+    big.font.size = CONTROL_FONT;
+    (top, Some(Node::vbox(big.inherit(), 0.0, vec![media(&big), quick_settings(&big, focus)]).expand(true, false)))
 }

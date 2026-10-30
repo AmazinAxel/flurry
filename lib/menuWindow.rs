@@ -9,7 +9,7 @@ use crate::lib::menuState::{close_menu, current};
 use crate::lib::inputControl::{modal, wrap_focus};
 use crate::lib::backgroundSection::background_section;
 use crate::lib::style::*;
-use crate::ui::node::{Node, Sides, Style};
+use crate::ui::node::{Background, Node, Sides, Style, alpha};
 use crate::ui::wayland::{Anchor, Keymode, PointerEvent};
 use crate::ui::window::{Spec, Win};
 use crate::lib::{audio, mediaPlayer};
@@ -22,8 +22,6 @@ use crate::widgets::status::{bluetooth, calendar, network};
 pub const MENU_WIDTH: f32 = 500.0;
 /// Spacing unit inside the cards; also the wallpaper's inner padding.
 pub const GAP: f32 = 20.0;
-/// Width inside the wallpaper: minus background_section's margin, border and padding, and GAP padding.
-pub const INNER_WIDTH: f32 = MENU_WIDTH - 2.0 * (16.0 + 3.0 + 16.0 + GAP);
 
 thread_local! {
     static DRAG: Cell<Option<&'static str>> = const { Cell::new(None) };
@@ -52,7 +50,9 @@ pub fn menu_window() -> Rc<Win> {
         let base = window();
         let Some(name) = current().peek() else { return Node::hbox(base, 0.0, vec![]) };
         let (top, rest) = content(&base, name, v.focus.as_deref());
-        let top = Node::hbox(Style { padding: Sides::all(GAP), ..base.inherit() }, 0.0, vec![top]).expand(true, false).id("card");
+        // the lockscreen's dark tint over the wallpaper keeps text and icons readable on any image
+        let tint = Style { padding: Sides::all(GAP), background: Background::Color(alpha(dark1(), 0.45)), ..base.inherit() };
+        let top = Node::hbox(tint, 0.0, vec![top]).expand(true, false).id("card");
         // same box as the launcher/clipboard/pass cards, so the same top edge
         background_section(&base, top, rest.map(|r| r.id("cardRest")), 700.0, MENU_WIDTH)
     });

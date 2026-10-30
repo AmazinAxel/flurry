@@ -1,6 +1,6 @@
 use crate::lib::style::*;
 use crate::lib::time::format_now;
-use crate::ui::node::{Align, Node, Sides, Style};
+use crate::ui::node::{Align, Node, Sides, Style, alpha, shadow};
 
 // Iosevka metrics (em): 0.5 advance, ~0.05 side bearings on digits, ink 0.75 tall sitting 0.028
 // above the middle of its 1.25 line box. Rows get a 0.75em line box shifted onto the ink and the
@@ -19,8 +19,9 @@ fn row(base: &Style, s: String, size: f32, weight: u16, bearing: (f32, f32)) -> 
     t.font.weight = weight;
     t.line_height = Some(INK * size);
     t.margin = Sides::trbl(RAISE * size, -bearing.1 * size, -RAISE * size, -bearing.0 * size);
-    t.color = blue2();
-    t.text_shadow = vec![shadow_(), glow(8.0, blue3())];
+    // lockscreen clock look: pale fill, dark drop shadow, wide blue glow
+    t.color = alpha(blue1(), 0.9);
+    t.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(size / 6.0, alpha(blue2(), 0.8))];
     Node::label(t, s).align(Align::Center, Align::Start)
 }
 

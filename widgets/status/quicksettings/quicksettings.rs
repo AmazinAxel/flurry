@@ -58,10 +58,10 @@ pub fn slider_value(r: Rect, x: f32) -> f64 {
 
 pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
     let vol = audio::default_speaker().map(|s| s.volume).unwrap_or(0.0);
-    let mut rows = vec![Node::hbox(base.inherit(), 0.0, vec![Node::icon(base.inherit(), volume_icon(), 16.0).align(Align::Fill, Align::Center), slider(base, "volume", vol)])];
+    let mut rows = vec![Node::hbox(base.inherit(), 0.0, vec![Node::icon(base.inherit(), volume_icon(), 22.0).align(Align::Fill, Align::Center), slider(base, "volume", vol)])];
     if brightness::available() {
         rows.push(Node::hbox(base.inherit(), 0.0, vec![
-            Node::icon(base.inherit(), "display-brightness-symbolic", 16.0).align(Align::Fill, Align::Center),
+            Node::icon(base.inherit(), "display-brightness-symbolic", 22.0).align(Align::Fill, Align::Center),
             slider(base, "brightness", brightness().peek()),
         ]));
     }
@@ -76,7 +76,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             let mut check = s.inherit();
             check.margin = Sides::trbl(0.0, 7.0, 0.0, 0.0);
             Node::hbox(s.clone(), 0.0, vec![
-                Node::icon(check, "emblem-default-symbolic", 16.0).show(is_sel),
+                Node::icon(check, "emblem-default-symbolic", 22.0).show(is_sel),
                 Node::label(s.inherit(), name_substitute(&sp.description)).xalign(0.0).expand(true, false).ellipsize(),
             ])
             .focusable(id)
