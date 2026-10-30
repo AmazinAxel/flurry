@@ -305,6 +305,10 @@ impl Node {
     }
 
     /// (minimum, natural) border-box width.
+    fn overlay_sized(&self) -> impl Iterator<Item = &Node> {
+        self.children.iter().enumerate().filter(|(i, c)| c.visible && (*i == 0 || !matches!(c.kind, Kind::Picture { .. }))).map(|(_, c)| c)
+    }
+
     pub fn measure_w(&self) -> (f32, f32) {
         if let Some(m) = self.measured_w.get() {
             return m;
@@ -327,7 +331,8 @@ impl Node {
                     (a + gaps, b + gaps)
                 }
             }
-            Kind::Overlay => self.children.first().filter(|c| c.visible).map(|c| c.outer_w()).unwrap_or_default(),
+            // sized by the first child, grown to fit the overlaid ones (pictures only cover)
+            Kind::Overlay => self.overlay_sized().map(|c| c.outer_w()).fold((0.0f32, 0.0f32), |a, b| (a.0.max(b.0), a.1.max(b.1))),
             Kind::Label(l) => {
                 let font = &self.style.font;
                 let full = text::layout(&l.text, font, None, Wrap::None, false).width();
@@ -398,7 +403,7 @@ impl Node {
                     visible.iter().zip(widths).map(|(c, w)| c.outer_h(w)).fold((0.0f32, 0.0f32), |a, b| (a.0.max(b.0), a.1.max(b.1)))
                 }
             }
-            Kind::Overlay => self.children.first().filter(|c| c.visible).map(|c| c.outer_h(inner_w)).unwrap_or_default(),
+            Kind::Overlay => self.overlay_sized().map(|c| c.outer_h(inner_w)).fold((0.0f32, 0.0f32), |a, b| (a.0.max(b.0), a.1.max(b.1))),
             Kind::Label(_) => {
                 let l = self.label_layout(inner_w);
                 (l.height(), l.height())
