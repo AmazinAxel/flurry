@@ -5,9 +5,9 @@ use xkbcommon::xkb::Keysym;
 use crate::lib::backgroundSection::{background_section, header_style};
 use crate::lib::inputControl::{Opts, input_control};
 use crate::lib::style::*;
-use crate::ui::node::{Align, Node, Sides, Style};
+use crate::ui::node::{Align, Node};
 use crate::ui::window;
-use crate::widgets::record::service::{is_rec, rec_mic, rec_quality, save_clip, start_rec};
+use crate::widgets::record::service::{rec_mic, rec_quality, save_clip, start_rec};
 
 fn hide() {
     window::set_visible("recordMenu", false);
@@ -47,12 +47,4 @@ pub fn record_menu() {
     );
     w.watch(&rec_mic());
     w.watch(&rec_quality());
-}
-
-pub fn recording_indicator(base: &Style) -> Node {
-    let mut s = base.inherit();
-    s.color = red();
-    s.padding = Sides::vh(8.0, 0.0);
-    s.icon_shadow = vec![shadow_(), glow(10.0, red())];
-    Node::icon(s, "media-record-symbolic", 23.0).align(Align::Center, Align::Fill).show(is_rec().peek())
 }

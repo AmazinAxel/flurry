@@ -48,7 +48,7 @@ pub fn status(base: &Style) -> Node {
         let mut s = base.inherit();
         s.color = light3();
         s.icon_shadow = vec![shadow_(), glow(12.0, light3())];
-        Node::icon(s, name, 26.0)
+        Node::icon(s, name, 40.0)
     };
     let b = battery().peek();
     // visible={Boolean(battery.percentage)}: decided once, as soon as UPower has answered
@@ -67,12 +67,18 @@ pub fn status(base: &Style) -> Node {
         bat_icon.style.opacity = 0.4;
     }
     let mut pct_style = base.inherit();
-    pct_style.font.size = 20.0;
+    pct_style.font.size = 28.0;
     pct_style.font.weight = 700;
     pct_style.color = if b.charging() { green() } else { blue2() };
     let battery_node = Node::overlay(base.inherit(), vec![bat_icon, Node::label(pct_style, pct.to_string()).show(low)]).show(has);
 
-    Node::vbox(base.inherit(), 14.0, vec![
+    let mut rec = base.inherit();
+    rec.color = red();
+    rec.icon_shadow = vec![shadow_(), glow(10.0, red())];
+
+    // one evenly spaced column, centered on the row whatever is shown
+    Node::vbox(base.inherit(), 20.0, vec![
+        Node::icon(rec, "media-record-symbolic", 40.0).show(crate::widgets::record::service::is_rec().peek()),
         battery_node,
         img(network_icon().peek()),
         img("bluetooth-active-symbolic").show(bt().with(|b| b.powered())),

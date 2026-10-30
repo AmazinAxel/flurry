@@ -1,11 +1,11 @@
 // Quickstatus menu: clock, status icons and date, the media block, then the quicksettings sliders and outputs.
 
 use crate::lib::audio;
+use crate::lib::menuWindow::{GAP, INNER_WIDTH};
 use crate::lib::mediaPlayer::{PLAYLISTS, is_playing, playlist_index, song};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Background, Node, Sides, Style};
-use crate::widgets::record::record::recording_indicator;
-use crate::widgets::status::modules::{mpris::track, statusIcons::status, time};
+use crate::widgets::status::modules::{mpris::track, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
 use crate::widgets::status::quicksettings::quicksettings::quick_settings;
 
 pub fn volume_icon() -> &'static str {
@@ -28,7 +28,7 @@ fn playlist_color() -> tiny_skia::Color {
 fn media(base: &Style) -> Node {
     let playlist = playlist_color();
     let playing = is_playing().peek();
-    let mut bar = Style { background: Background::Color(playlist), margin: Sides::trbl(18.0, 0.0, 6.0, 0.0), ..base.inherit() };
+    let mut bar = Style { background: Background::Color(playlist), margin: Sides::trbl(6.0, 0.0, 6.0, 0.0), ..base.inherit() };
     bar = bar.border(Sides::all(3.0), shade(playlist, 1.1));
     let mut btn = Style { padding: Sides::vh(12.0, 18.0), background: Background::Color(shade(playlist, 0.9)), ..base.inherit() };
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
@@ -51,9 +51,19 @@ fn media(base: &Style) -> Node {
     Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 26.0).align(Align::Center, Align::Center)]).id("mediaBtn"), info]).id("media")
 }
 
-pub fn quickstatus(base: &Style, focus: Option<&str>) -> Node {
-    let mut icons = Node::vbox(base.inherit(), 0.0, vec![recording_indicator(base), status(base)]).expand(true, false);
-    icons = icons.align(Align::Center, Align::Center);
-    let top = Node::hbox(base.inherit(), 0.0, vec![time::clock(base), icons, time::date(base)]);
-    Node::vbox(base.inherit(), 0.0, vec![top, media(base), quick_settings(base, focus)]).expand(true, false)
+/// Wallpaper part (clock | icons | date on one GAP grid, as tall as each other) and the controls under it.
+pub fn quickstatus(base: &Style, focus: Option<&str>) -> (Node, Option<Node>) {
+    let icons = status(base);
+    // two digits of ink: 2 advances less the outer bearings
+    let ink = 1.0 - 2.0 * DIGIT_BEARING;
+    // weekday ink as wide as the date digits; clock as tall as the date: c = k * d + GAP / (2 * 0.75)
+    let day = ink / DAY_INK;
+    let k = (2.0 * 0.75 + 0.75 * day) / (2.0 * 0.75);
+    let off = GAP / 1.5;
+    let text = INNER_WIDTH - icons.measure_w().1 - 2.0 * GAP;
+    let d = (text / ink - off) / (k + 1.0);
+    let c = k * d + off;
+    debug_assert!((time::clock_height(c, GAP) - time::date_height(d, day * d, GAP)).abs() < 0.5);
+    let top = Node::hbox(base.inherit(), GAP, vec![time::clock(base, c, GAP), icons, time::date(base, d, day * d, GAP)]).align(Align::Center, Align::Center);
+    (top, Some(Node::vbox(base.inherit(), 0.0, vec![media(base), quick_settings(base, focus)]).expand(true, false)))
 }

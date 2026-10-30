@@ -346,6 +346,8 @@ fn main() {
                     awaiting = Some(Instant::now() + Duration::from_millis(if loading { 1000 } else { 150 }));
                 }
                 (Some("hide"), _, _) => {
+                    // a show still waiting for the first configure is cancelled, not replayed after
+                    deferred.clear();
                     // hidden web views drop out of the scene and stop animating: nothing renders
                     for wv in pages.values() {
                         wv.hide();
@@ -356,6 +358,8 @@ fn main() {
                     if let Some(l) = s.layer.take() {
                         l.destroy();
                     }
+                    // an unhandled configure of that layer surface must not count for the next one
+                    state.configured = false;
                     s.border.attach(None, 0, 0);
                     s.border.commit();
                 }
@@ -543,7 +547,10 @@ fn main() {
             state.events.clear();
         }
 
-        let _ = queue.dispatch_pending(&mut state);
+        // a protocol error kills the connection: exit so flurry respawns us on the next command
+        if queue.dispatch_pending(&mut state).is_err() {
+            return;
+        }
         let _ = conn.flush();
         let Some(guard) = conn.prepare_read() else { continue };
         let mut fds = [
@@ -560,7 +567,9 @@ fn main() {
         let timeout = wake_at.map(|at| at.saturating_duration_since(Instant::now()).as_millis() as i32).unwrap_or(-1);
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if fds[0].revents & libc::POLLIN != 0 {
-            let _ = guard.read();
+            if guard.read().is_err() {
+                return;
+            }
         } else {
             drop(guard);
         }
@@ -569,7 +578,9 @@ fn main() {
             unsafe { libc::read(wake_fd, (&raw mut b).cast(), 8) };
         }
         let had_keyboard = state.has_keyboard;
-        let _ = queue.dispatch_pending(&mut state);
+        if queue.dispatch_pending(&mut state).is_err() {
+            return;
+        }
         if state.has_keyboard != had_keyboard && visible {
             // #sideview:focus-within
             paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });

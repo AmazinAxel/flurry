@@ -7,8 +7,9 @@ use xkbcommon::xkb::Keysym;
 
 use crate::lib::menuState::{close_menu, current};
 use crate::lib::inputControl::{modal, wrap_focus};
+use crate::lib::backgroundSection::background_section;
 use crate::lib::style::*;
-use crate::ui::node::{Align, Background, Node, Sides, Style};
+use crate::ui::node::{Node, Sides, Style};
 use crate::ui::wayland::{Anchor, Keymode, PointerEvent};
 use crate::ui::window::{Spec, Win};
 use crate::lib::{audio, mediaPlayer};
@@ -17,13 +18,21 @@ use crate::widgets::status::quicksettings::quicksettings::{self as qs, set_slide
 use crate::widgets::status::status::quickstatus;
 use crate::widgets::status::{bluetooth, calendar, network};
 
+/// Card width, the same as the launcher/clipboard cards.
+pub const MENU_WIDTH: f32 = 500.0;
+/// Spacing unit inside the cards; also the wallpaper's inner padding.
+pub const GAP: f32 = 20.0;
+/// Width inside the wallpaper: minus background_section's margin, border and padding, and GAP padding.
+pub const INNER_WIDTH: f32 = MENU_WIDTH - 2.0 * (16.0 + 3.0 + 16.0 + GAP);
+
 thread_local! {
     static DRAG: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
-fn content(base: &Style, name: &str, focus: Option<&str>) -> Node {
-    match name {
-        "status" => quickstatus(base, focus),
+/// Wallpaper-backed part, and what goes under it.
+fn content(base: &Style, name: &str, focus: Option<&str>) -> (Node, Option<Node>) {
+    let menu = match name {
+        "status" => return quickstatus(base, focus),
         "bluetooth" => {
             if crate::lib::bluetooth::bt().with(|b| b.available) {
                 bluetooth::menu(base, focus, 0.0)
@@ -33,7 +42,8 @@ fn content(base: &Style, name: &str, focus: Option<&str>) -> Node {
         }
         "wifi" => network::menu(base, focus, 0.0),
         _ => calendar::calendar(base),
-    }
+    };
+    (menu, None)
 }
 
 pub fn menu_window() -> Rc<Win> {
@@ -41,13 +51,10 @@ pub fn menu_window() -> Rc<Win> {
     let w = Win::new(spec, |v| {
         let base = window();
         let Some(name) = current().peek() else { return Node::hbox(base, 0.0, vec![]) };
-        let mut s = base.inherit();
-        s = s.border(Sides::all(3.0), blue3());
-        s.background = Background::Color(dark2());
-        s.padding = Sides::all(22.0);
-        let menu = Node::hbox(base.inherit(), 0.0, vec![content(&base, name, v.focus.as_deref())]).size(420.0, 0.0);
-        let card = Node::hbox(s, 0.0, vec![menu]).align(Align::Center, Align::Center).id("card");
-        Node::hbox(base.inherit(), 0.0, vec![card])
+        let (top, rest) = content(&base, name, v.focus.as_deref());
+        let top = Node::hbox(Style { padding: Sides::all(GAP), ..base.inherit() }, 0.0, vec![top]).expand(true, false).id("card");
+        // same box as the launcher/clipboard/pass cards, so the same top edge
+        background_section(&base, top, rest.map(|r| r.id("cardRest")), 700.0, MENU_WIDTH)
     });
 
     modal(&w);
@@ -169,7 +176,7 @@ pub fn menu_window() -> Rc<Win> {
             PointerEvent::Scroll { x, y, dy, wheel } if current().peek() == Some("status") => {
                 if inside("media", x, y) {
                     mediaPlayer::media_scroll(dy, wheel);
-                } else if inside("card", x, y)
+                } else if (inside("card", x, y) || inside("cardRest", x, y))
                     && let Some(s) = audio::default_speaker()
                 {
                     audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.006));

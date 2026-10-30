@@ -37,6 +37,7 @@ echo 1000 > "$B/max_brightness"
 echo 600 > "$B/brightness"
 
 export HOME=$H XDG_RUNTIME_DIR=$tmp/run TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8
+export MPD_HOST=127.0.0.1 MPD_PORT=1 # refused: never the live mpd
 # Safety: everything below must talk to the private session bus from dbus-run-session, never the live one
 [[ ${DBUS_SESSION_BUS_ADDRESS:-} == *"/run/user/"* || -z ${DBUS_SESSION_BUS_ADDRESS:-} ]] && { echo "refusing: not on a private session bus" >&2; exit 1; }
 unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME WAYLAND_DISPLAY SWAYSOCK DISPLAY I3SOCK
