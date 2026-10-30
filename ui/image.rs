@@ -96,8 +96,8 @@ pub fn blur(p: &mut Pixmap, radius: f32) {
     let mut a: Vec<f32> = p.data().iter().map(|&v| v as f32).collect();
     let mut b = vec![0f32; a.len()];
     for r in boxes {
-        box_pass(&a, &mut b, w, h, r, 4, w * 4); // horizontal
-        box_pass(&b, &mut a, h, w, r, w * 4, 4); // vertical
+        box_pass(&a, &mut b, w, h, r, 4, w * 4, 4); // horizontal
+        box_pass(&b, &mut a, h, w, r, w * 4, 4, 4); // vertical
     }
     let data = p.data_mut();
     for (i, px) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -106,6 +106,25 @@ pub fn blur(p: &mut Pixmap, radius: f32) {
             px[c] = (a[i * 4 + c].round().clamp(0.0, 255.0) as u8).min(alpha);
         }
         px[3] = alpha;
+    }
+}
+
+/// `blur` of the alpha channel only (a quarter of the work), color left black: for shadows,
+/// which are tinted from alpha afterwards.
+pub fn blur_alpha(p: &mut Pixmap, radius: f32) {
+    let sigma = radius / 2.0;
+    if sigma < 0.3 {
+        return;
+    }
+    let (w, h) = (p.width() as usize, p.height() as usize);
+    let mut a: Vec<f32> = p.data().iter().skip(3).step_by(4).map(|&v| v as f32).collect();
+    let mut b = vec![0f32; a.len()];
+    for r in box_sizes(sigma) {
+        box_pass(&a, &mut b, w, h, r, 1, w, 1);
+        box_pass(&b, &mut a, h, w, r, w, 1, 1);
+    }
+    for (px, v) in p.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(a) {
+        *px = [0, 0, 0, v.round().clamp(0.0, 255.0) as u8];
     }
 }
 
@@ -126,10 +145,11 @@ fn box_sizes(sigma: f32) -> [usize; 3] {
 }
 
 /// One running-sum box pass along lines of `len` samples; `step` between samples, `line` between lines.
-fn box_pass(src: &[f32], dst: &mut [f32], len: usize, lines: usize, r: usize, step: usize, line: usize) {
+#[allow(clippy::too_many_arguments)]
+fn box_pass(src: &[f32], dst: &mut [f32], len: usize, lines: usize, r: usize, step: usize, line: usize, channels: usize) {
     let norm = 1.0 / (2 * r + 1) as f32;
     for l in 0..lines {
-        for c in 0..4 {
+        for c in 0..channels {
             let base = l * line + c;
             let at = |i: isize| -> f32 { if i < 0 || i >= len as isize { 0.0 } else { src[base + i as usize * step] } };
             let mut acc: f32 = (-(r as isize)..=r as isize).map(at).sum();

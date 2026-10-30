@@ -17,6 +17,11 @@ fn ease(x: f32) -> f32 {
     if x >= 1.0 {
         return 1.0;
     }
+    // exact at the start too: bisection lands near t=0 but not on it, so the hide never reached 0
+    // and the window kept animating (and stayed mapped) forever
+    if x <= 0.0 {
+        return 0.0;
+    }
     let bez = |t: f32, a: f32, b: f32| 3.0 * (1.0 - t) * (1.0 - t) * t * a + 3.0 * (1.0 - t) * t * t * b + t * t * t;
     // x(t) is monotonic: bisect for the t that gives x
     let (mut lo, mut hi) = (0.0f32, 1.0f32);

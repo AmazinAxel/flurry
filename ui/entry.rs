@@ -219,6 +219,11 @@ pub struct Look {
 
 /// The text area as a node (GTK's `text` node inside `entry`), filling its allocation.
 pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
+    let key = {
+        let e = this.borrow();
+        let colors = [look.color, look.placeholder, look.selection_bg, look.selection_fg].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits));
+        Some(super::node::hash(&(&e.text, e.cursor, e.anchor, e.password, e.invisible_char, &e.placeholder, e.scroll.to_bits(), look.caret, colors)))
+    };
     let this = this.clone();
     let font = style.font.clone();
     let shadows = style.text_shadow.clone();
@@ -275,7 +280,7 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         }
         outer.draw_pixmap(lx as i32, ly as i32, area.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
     });
-    let mut n = Node::new(Kind::Custom { width: 0.0, height, paint }, style);
+    let mut n = Node::new(Kind::Custom { width: 0.0, height, key, paint }, style);
     n.hexpand = true;
     n
 }

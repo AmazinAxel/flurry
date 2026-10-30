@@ -46,7 +46,7 @@ pub fn slider(base: &Style, id: &str, value: f64) -> Node {
         }
     });
     let s = Style { padding: Sides::vh(17.0, 12.0), min_height: 5.0, ..base.inherit() };
-    Node::new(Kind::Custom { width: 0.0, height: 5.0, paint }, s).expand(true, false).id(id)
+    Node::new(Kind::Custom { width: 0.0, height: 5.0, key: None, paint }, s).expand(true, false).id(id)
 }
 
 /// Value for a pointer x inside the slider's border box.

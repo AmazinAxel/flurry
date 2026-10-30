@@ -81,7 +81,7 @@ sysmock org.bluez / org.bluez.Mock.PairDevice string:hci0 string:AA:BB:CC:DD:EE:
 sysmock org.bluez / org.bluez.Mock.ConnectDevice string:hci0 string:11:22:33:44:55:66
 
 # Sway + flurry, with sysfs/PAM faked (libfaketime crashes gjs, so shot() records the real clock instead)
-bwrap --dev-bind / / --bind "$tmp/backlight" /sys/class/backlight --tmpfs /etc/pam.d \
+bwrap --die-with-parent --dev-bind / / --bind "$tmp/backlight" /sys/class/backlight --tmpfs /etc/pam.d \
   env PIPEWIRE_RUNTIME_DIR="$tmp/pw" PULSE_RUNTIME_PATH="$tmp/pw" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
   PATH="$tmp/bin:$PATH" sway -c "$tmp/sway.conf" > "$tmp/sway.log" 2>&1 &
 for _ in $(seq 50); do ls "$tmp/run"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.1; done

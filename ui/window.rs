@@ -87,6 +87,14 @@ pub fn toggle(name: &str) {
     }
 }
 
+/// Redraws every shown window (state they all read, like the wallpaper, changed).
+pub fn redraw_all() {
+    let all: Vec<Rc<Win>> = WINDOWS.with(|w| w.borrow().values().filter(|w| w.visible()).cloned().collect());
+    for w in all {
+        w.redraw();
+    }
+}
+
 pub fn set_visible(name: &str, v: bool) {
     if let Some(w) = get(name) {
         w.set_visible(v);

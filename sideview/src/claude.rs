@@ -10,35 +10,17 @@ pub const URL: &str = "flurry:claude";
 
 const SYSTEM: &str = "Write math in LaTeX: $...$ inline, $$...$$ for display.";
 
-macro_rules! assets {
-    ($($name:literal),* $(,)?) => { &[$(($name, include_bytes!(concat!("../claude/", $name)))),*] };
-}
-const ASSETS: &[(&str, &[u8])] = assets![
-    "index.html", "katex.min.js", "katex.min.css", "marked.min.js",
-    "fonts/KaTeX_AMS-Regular.woff2", "fonts/KaTeX_Caligraphic-Bold.woff2", "fonts/KaTeX_Caligraphic-Regular.woff2",
-    "fonts/KaTeX_Fraktur-Bold.woff2", "fonts/KaTeX_Fraktur-Regular.woff2", "fonts/KaTeX_Main-Bold.woff2",
-    "fonts/KaTeX_Main-BoldItalic.woff2", "fonts/KaTeX_Main-Italic.woff2", "fonts/KaTeX_Main-Regular.woff2",
-    "fonts/KaTeX_Math-BoldItalic.woff2", "fonts/KaTeX_Math-Italic.woff2", "fonts/KaTeX_SansSerif-Bold.woff2",
-    "fonts/KaTeX_SansSerif-Italic.woff2", "fonts/KaTeX_SansSerif-Regular.woff2", "fonts/KaTeX_Script-Regular.woff2",
-    "fonts/KaTeX_Size1-Regular.woff2", "fonts/KaTeX_Size2-Regular.woff2", "fonts/KaTeX_Size3-Regular.woff2",
-    "fonts/KaTeX_Size4-Regular.woff2", "fonts/KaTeX_Typewriter-Regular.woff2",
-    "fonts/Libron-Regular.woff2", "fonts/Libron-Italic.woff2", "fonts/Libron-Bold.woff2", "fonts/Libron-BoldItalic.woff2",
-];
-
 fn dir() -> std::path::PathBuf {
     let run = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
     run.join("flurry-claude")
 }
 
-/// Writes the bundled page to the runtime dir (tmpfs) and returns its file URL.
+/// The page is read from FLURRY_CLAUDE_PAGE (set by the package wrapper; kept out of the binary so
+/// page edits don't rebuild Servo), else from the source tree.
 pub fn page_url() -> Option<url::Url> {
-    let d = dir();
-    for (name, bytes) in ASSETS {
-        let p = d.join(name);
-        std::fs::create_dir_all(p.parent()?).ok()?;
-        std::fs::write(&p, bytes).ok()?;
-    }
-    url::Url::from_file_path(d.join("index.html")).ok()
+    let page = std::env::var_os("FLURRY_CLAUDE_PAGE").map(std::path::PathBuf::from);
+    let page = page.unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/claude").into());
+    url::Url::from_file_path(page.join("index.html")).ok()
 }
 
 #[derive(Default)]
@@ -58,6 +40,7 @@ impl Chat {
         // the service PATH may lack the user profile
         let bins = ["claude".to_string(), format!("/etc/profiles/per-user/{user}/bin/claude"), format!("{home}/.nix-profile/bin/claude"), format!("{home}/.local/bin/claude")];
         let cwd = dir();
+        let _ = std::fs::create_dir_all(&cwd);
         bins.iter().find_map(|bin| {
             let mut child = Command::new(bin)
                 // the user's own settings (output style, hooks, model, effort) apply as in the terminal;

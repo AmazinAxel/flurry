@@ -1,14 +1,14 @@
 # flurry-sideview: Servo embedded in a layer surface. Builds against nixpkgs' servo toolchain and
 # inputs (SpiderMonkey needs its python/clang/yasm setup), so it only rebuilds when its own
 # sources or the pinned nixpkgs change.
-{ lib, rustPlatform, servo, makeWrapper, libxkbcommon, wayland, libGL, vulkan-loader }:
+{ lib, rustPlatform, runCommand, servo, makeWrapper, libxkbcommon, wayland, libGL, vulkan-loader }:
 
-rustPlatform.buildRustPackage {
+let unwrapped = rustPlatform.buildRustPackage {
   pname = "flurry-sideview";
   version = "0.1.0";
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./claude ];
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ];
   };
   # fetchCargoVendor (not cargoLock) so the mozjs workaround below finds $cargoDepsCopy
   cargoHash = "sha256-LTwjPZjFCxQHQHVatUHouxkobxnOcVDWkJsi8kc8b40=";
@@ -40,4 +40,9 @@ rustPlatform.buildRustPackage {
   '';
 
   meta.mainProgram = "flurry-sideview";
-}
+};
+# the flurry:claude page lives outside the Servo build, so editing it only rewraps the binary
+page = lib.fileset.toSource { root = ./claude; fileset = ./claude; };
+in runCommand "flurry-sideview" { nativeBuildInputs = [ makeWrapper ]; meta.mainProgram = "flurry-sideview"; passthru = { inherit unwrapped; }; } ''
+  makeWrapper ${unwrapped}/bin/flurry-sideview $out/bin/flurry-sideview --set FLURRY_CLAUDE_PAGE ${page}
+''

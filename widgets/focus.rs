@@ -119,7 +119,8 @@ pub fn levelbar(base: &Style, value: f64, filled: tiny_skia::Color, empty: tiny_
             fill_rect(pm, f, filled, ts);
         }
     });
-    Node::new(Kind::Custom { width: 0.0, height, paint }, base.inherit())
+    let key = Some(crate::ui::node::hash(&(value.to_bits(), [filled, empty].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits)))));
+    Node::new(Kind::Custom { width: 0.0, height, key, paint }, base.inherit())
 }
 
 pub fn focus_task() -> Rc<Win> {

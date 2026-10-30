@@ -87,8 +87,8 @@ pub fn random_wallpaper() {
 /// The wallpaper as a cover-fit picture node (BackgroundSection header, lockscreen).
 pub fn picture(style: Style, blur: f32) -> Node {
     match current().peek() {
-        Some(w) => Node::new(Kind::Picture { pixmap: Img::Shm(w.shm), cover: true, blur }, style),
-        None => Node::new(Kind::Custom { width: 0.0, height: 0.0, paint: Rc::new(|_, _, _| {}) }, style),
+        Some(w) => Node::new(Kind::Picture { pixmap: Img::Shm(w.shm), cover: true, blur, density: 1.0 }, style),
+        None => Node::new(Kind::Custom { width: 0.0, height: 0.0, key: Some(0), paint: Rc::new(|_, _, _| {}) }, style),
     }
 }
 
@@ -114,6 +114,7 @@ pub fn wallpaper_window() -> Rc<Win> {
         if let Some(w) = win.upgrade() {
             apply(&w);
         }
+        crate::ui::window::redraw_all(); // headers draw from it
     });
     apply(&w);
     w

@@ -571,6 +571,10 @@ pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, 
                 pixmap.draw_pixmap(0, 0, png.as_ref(), &pp, t, None);
             } else if let Some(path) = face.outline(g.id) {
                 let t = ts.pre_translate(x + g.x, baseline + g.y).pre_scale(s, s);
+                if t.kx == 0.0 && t.ky == 0.0 && t.sx == t.sy && t.sx > 0.0 {
+                    blit_glyph(pixmap, face, g.id, &path, fam.embolden[g.face], t, color);
+                    continue;
+                }
                 pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, t, None);
                 if fam.embolden[g.face] {
                     // cairo/FreeType synthetic bold: outline grown by em/24
@@ -580,6 +584,89 @@ pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, 
             }
         }
     }
+}
+
+/// A rasterized glyph's coverage and where its top-left sits relative to the pen's whole pixel.
+struct Mask {
+    alpha: Vec<u8>,
+    w: usize,
+    h: usize,
+    x: i32,
+    y: i32,
+}
+
+thread_local! {
+    /// (face, glyph, device scale, embolden, quarter-pixel phase x/y) -> coverage
+    static GLYPHS: RefCell<HashMap<(usize, u32, u32, bool, u8, u8), Option<Rc<Mask>>>> = RefCell::default();
+}
+
+/// Draws an outline glyph from its cached coverage mask: rasterizing every glyph every frame was
+/// most of a text-heavy window's paint time. Positions snap to quarter pixels.
+fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, path: &Path, embolden: bool, t: tiny_skia::Transform, color: tiny_skia::Color) {
+    let (px, py) = (t.tx.floor(), t.ty.floor());
+    let (fx, fy) = (((t.tx - px) * 4.0).round() as u8, ((t.ty - py) * 4.0).round() as u8);
+    let key = (Rc::as_ptr(face) as usize, glyph, t.sx.to_bits(), embolden, fx, fy);
+    let mask = GLYPHS.with(|c| c.borrow().get(&key).cloned()).unwrap_or_else(|| {
+        let m = rasterize(face, path, embolden, t.sx, fx as f32 / 4.0, fy as f32 / 4.0).map(Rc::new);
+        GLYPHS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= 8192 {
+                c.clear();
+            }
+            c.insert(key, m.clone());
+        });
+        m
+    });
+    let Some(m) = mask else { return };
+    let c = color.premultiply().to_color_u8();
+    let (cr, cg, cb, ca) = (c.red() as u32, c.green() as u32, c.blue() as u32, c.alpha() as u32);
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let (ox, oy) = (px as i32 + m.x, py as i32 + m.y);
+    let (x0, x1) = (ox.max(0), (ox + m.w as i32).min(pw));
+    let (y0, y1) = (oy.max(0), (oy + m.h as i32).min(ph));
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let data = pm.data_mut();
+    for y in y0..y1 {
+        let src = &m.alpha[(y - oy) as usize * m.w..];
+        let row = &mut data[(y * pw) as usize * 4..];
+        for x in x0..x1 {
+            let a = src[(x - ox) as usize] as u32;
+            if a == 0 {
+                continue;
+            }
+            // source-over of premultiplied color * coverage
+            let d = &mut row[x as usize * 4..x as usize * 4 + 4];
+            let sa = ca * a / 255;
+            let inv = 255 - sa;
+            d[0] = ((cr * a / 255) + (d[0] as u32 * inv + 127) / 255) as u8;
+            d[1] = ((cg * a / 255) + (d[1] as u32 * inv + 127) / 255) as u8;
+            d[2] = ((cb * a / 255) + (d[2] as u32 * inv + 127) / 255) as u8;
+            d[3] = (sa + (d[3] as u32 * inv + 127) / 255) as u8;
+        }
+    }
+}
+
+fn rasterize(face: &Face, path: &Path, embolden: bool, scale: f32, fx: f32, fy: f32) -> Option<Mask> {
+    let pad = if embolden { face.upem / 48.0 } else { 0.0 };
+    let b = path.bounds();
+    let s = scale; // font units -> device px already folded into `scale` by the caller's transform
+    let left = ((b.left() - pad) * s + fx).floor() - 1.0;
+    let top = ((b.top() - pad) * s + fy).floor() - 1.0;
+    let w = ((b.right() + pad) * s + fx).ceil() + 1.0 - left;
+    let h = ((b.bottom() + pad) * s + fy).ceil() + 1.0 - top;
+    let mut p = tiny_skia::Pixmap::new(w.max(1.0) as u32, h.max(1.0) as u32)?;
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color(tiny_skia::Color::BLACK);
+    paint.anti_alias = true;
+    let t = tiny_skia::Transform::from_translate(fx - left, fy - top).pre_scale(s, s);
+    p.fill_path(path, &paint, tiny_skia::FillRule::Winding, t, None);
+    if embolden {
+        let stroke = tiny_skia::Stroke { width: face.upem / 24.0, ..Default::default() };
+        p.stroke_path(path, &paint, &stroke, t, None);
+    }
+    Some(Mask { alpha: p.data().iter().skip(3).step_by(4).copied().collect(), w: p.width() as usize, h: p.height() as usize, x: left as i32, y: top as i32 })
 }
 
 /// Average char width, used for GTK's max-width-chars (pango approximate_char_width).

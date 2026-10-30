@@ -25,7 +25,7 @@ fn osd_bar(value: f64) -> Node {
         }
     });
     let s = Style { box_shadow: vec![shadow(0.0, 0.0, 10.0, blue3())], ..Default::default() };
-    Node::new(Kind::Custom { width: 400.0, height: 12.0, paint }, s).size(400.0, 0.0)
+    Node::new(Kind::Custom { width: 400.0, height: 12.0, key: Some(value.to_bits()), paint }, s).size(400.0, 0.0)
 }
 
 pub fn osd() {
@@ -67,7 +67,8 @@ pub fn osd() {
         if !audio::ready().peek() {
             return;
         }
-        let Some(s) = audio::default_speaker() else { return };
+        // not before its volume arrived: 0 -> actual would flash the OSD at startup
+        let Some(s) = audio::default_speaker().filter(audio::Sink::known) else { return };
         let cur = (s.id, format!("{}{}", s.volume, s.mute));
         if l.replace(Some(cur.clone())).is_some_and(|prev| prev != cur) {
             s2(s.volume_icon(), s.volume);

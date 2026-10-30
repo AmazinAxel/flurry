@@ -189,10 +189,11 @@ pub fn connect() -> bool {
 fn read_events() {
     let guard = ctx(|c| c.conn.prepare_read());
     if let Some(g) = guard
-        && let Err(wayland_client::backend::WaylandError::Io(e)) = g.read()
-        && e.kind() != std::io::ErrorKind::WouldBlock
+        && let Err(e) = g.read()
+        && !matches!(&e, wayland_client::backend::WaylandError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
     {
-        // compositor gone: exit so the session (systemd) can restart us with the next one
+        // compositor gone or a protocol error (the connection is dead either way; staying would spin
+        // on the hung-up fd): exit so the session (systemd) can restart us
         eprintln!("flurry: lost the Wayland connection: {e}");
         // _exit: skip thread-local destructors (surfaces would try to talk to the dead connection)
         unsafe { libc::_exit(1) };
@@ -229,9 +230,14 @@ fn handle(ev: Ev) {
     match ev {
         Ev::Configure(id, w, h) => {
             if let Some(s) = surface(&id) {
-                s.configured.set(true);
+                // sway re-sends unchanged configures to every layer when one maps: nothing to redraw
+                let shown = s.configured.replace(true) && !s.buffers.borrow().is_empty();
+                let unchanged = w == 0 || h == 0 || s.size.get() == (w, h);
                 if w > 0 && h > 0 {
                     s.size.set((w, h));
+                }
+                if shown && unchanged {
+                    return;
                 }
                 s.render();
             }
@@ -396,6 +402,8 @@ struct Buffer {
     len: usize,
     size: (u32, u32),
     busy: Arc<AtomicBool>,
+    /// number of the frame it holds (0: undefined contents)
+    frame: Cell<u64>,
 }
 
 impl Drop for Buffer {
@@ -432,6 +440,107 @@ pub struct Inner {
     /// what the main surface shows under the content: (image ptr or 0 for dim, w, h)
     backdrop_key: Cell<Option<(usize, u32, u32)>>,
     gradient: Option<Gradient>,
+    damage: RefCell<Damage>,
+}
+
+/// Buffer pixel rect: x, y, w, h.
+type PxRect = (u32, u32, u32, u32);
+
+/// What the last frames painted and where they differed, so a frame repaints only what changed.
+#[derive(Default)]
+struct Damage {
+    items: Vec<(tiny_skia::Rect, u64)>,
+    size: (u32, u32),
+    frame: u64,
+    /// recent frames' damage (None: everything), newest last
+    history: std::collections::VecDeque<(u64, Option<Vec<PxRect>>)>,
+}
+
+impl Damage {
+    /// Where `items` paints differently from the last frame (None: everything).
+    fn changed(&self, items: &[(tiny_skia::Rect, u64)], size: (u32, u32), scale: i32) -> Option<Vec<PxRect>> {
+        if self.frame == 0 || self.size != size {
+            return None;
+        }
+        let key = |(r, h): &(tiny_skia::Rect, u64)| (r.left().to_bits(), r.top().to_bits(), r.right().to_bits(), r.bottom().to_bits(), *h);
+        let old: std::collections::HashSet<_> = self.items.iter().map(key).collect();
+        let new: std::collections::HashSet<_> = items.iter().map(key).collect();
+        // antialiasing and glyph overhang reach slightly past the boxes
+        let pad = 2.0 * scale as f32;
+        let mut rects: Vec<PxRect> = vec![];
+        let moved = items.iter().filter(|i| !old.contains(&key(i))).chain(self.items.iter().filter(|i| !new.contains(&key(i))));
+        for (r, _) in moved {
+            let x0 = (r.left() - pad).floor().max(0.0) as u32;
+            let y0 = (r.top() - pad).floor().max(0.0) as u32;
+            let x1 = ((r.right() + pad).ceil().max(0.0) as u32).min(size.0);
+            let y1 = ((r.bottom() + pad).ceil().max(0.0) as u32).min(size.1);
+            if x1 > x0 && y1 > y0 {
+                rects.push((x0, y0, x1 - x0, y1 - y0));
+            }
+        }
+        Some(merge(rects, size))
+    }
+
+    /// Damage of every frame after `held` (None: unknown, repaint everything).
+    fn since(&self, held: u64) -> Option<Vec<PxRect>> {
+        if held == 0 {
+            return None;
+        }
+        let mut out = vec![];
+        let mut next = held + 1;
+        for (n, d) in &self.history {
+            if *n < next {
+                continue;
+            }
+            if *n != next {
+                return None;
+            }
+            out.extend(d.as_ref()?);
+            next += 1;
+        }
+        (next == self.frame + 1).then_some(out)
+    }
+
+    fn commit(&mut self, number: u64, items: Vec<(tiny_skia::Rect, u64)>, size: (u32, u32), changed: Option<Vec<PxRect>>) {
+        self.frame = number;
+        self.items = items;
+        self.size = size;
+        self.history.push_back((number, changed));
+        while self.history.len() > 4 {
+            self.history.pop_front();
+        }
+    }
+}
+
+/// Overlapping rects merged; past a handful, one bounding rect (each is a full tree walk).
+fn merge(mut rects: Vec<PxRect>, size: (u32, u32)) -> Vec<PxRect> {
+    let union = |a: PxRect, b: PxRect| {
+        let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+        let (x1, y1) = ((a.0 + a.2).max(b.0 + b.2), (a.1 + a.3).max(b.1 + b.3));
+        (x0, y0, x1 - x0, y1 - y0)
+    };
+    let overlap = |a: PxRect, b: PxRect| a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
+    let mut i = 0;
+    while i < rects.len() {
+        let mut j = i + 1;
+        let mut grew = false;
+        while j < rects.len() {
+            if overlap(rects[i], rects[j]) {
+                rects[i] = union(rects[i], rects.swap_remove(j));
+                grew = true;
+            } else {
+                j += 1;
+            }
+        }
+        if !grew {
+            i += 1;
+        }
+    }
+    if rects.len() > 4 {
+        let all = rects.iter().copied().reduce(union).unwrap_or((0, 0, size.0, size.1));
+        return vec![all];
+    }
+    rects
 }
 
 /// A full-size vertical gradient as a 1px-wide buffer stretched by the viewport (lockscreen cover).
@@ -531,6 +640,7 @@ impl Surface {
                 dim_buffer: RefCell::default(),
                 backdrop_key: Cell::new(None),
                 gradient: None,
+                damage: RefCell::default(),
             }
         });
         let s = Rc::new(s);
@@ -679,7 +789,8 @@ impl Inner {
         let mut node = build(before.0 as f32, before.1 as f32);
         self.apply_content_size(Some(&node));
         if self.size.get() != before && matches!(*self.role.borrow(), Role::Layer(_)) {
-            // wait for the configure with the new size
+            // wait for the configure with the new size (which then always renders)
+            self.configured.set(false);
             self.wl.commit();
             return;
         }
@@ -705,19 +816,55 @@ impl Inner {
         };
 
         let (pw, ph) = (bw * scale as u32, bh * scale as u32);
-        let Some(buf) = self.take_buffer(pw, ph) else { return };
-        // ABGR8888 is tiny-skia's premultiplied RGBA byte order: paint straight into the shm buffer
-        let dst = unsafe { std::slice::from_raw_parts_mut(buf.0, buf.1) };
-        let Some(mut pm) = PixmapMut::from_bytes(dst, pw, ph) else { return };
-        pm.fill(Color::TRANSPARENT);
         let ts = Transform::from_scale(scale as f32, scale as f32).pre_translate(-ox, -oy);
-        node.paint(&mut pm, ts);
+        let mut items = vec![];
+        node.paint_items(ts, 0, None, &mut items);
+        let changed = self.damage.borrow().changed(&items, (pw, ph), scale);
         if let Some(cb) = self.after_render.borrow().clone() {
             cb(&node);
         }
+        let changed = match changed {
+            Some(r) if r.is_empty() && self.animation.borrow().is_none() => return, // nothing to show
+            // an animation step that moved nothing: a 1px commit keeps its frame callbacks coming
+            Some(r) if r.is_empty() => Some(vec![(0, 0, 1, 1)]),
+            c => c,
+        };
+        let mut damage = self.damage.borrow_mut();
+        let number = damage.frame + 1;
+        let Some(buf) = self.take_buffer(pw, ph, number) else { return };
+        // ABGR8888 is tiny-skia's premultiplied RGBA byte order: paint straight into the shm buffer
+        let dst = unsafe { std::slice::from_raw_parts_mut(buf.0, buf.1) };
+        // the buffer holds frame buf.3: bring it up to date with everything damaged since
+        let repaint = changed.as_ref().and_then(|c| damage.since(buf.3).map(|mut old| {
+            old.extend(c);
+            old
+        }));
+        match &repaint {
+            None => {
+                let Some(mut pm) = PixmapMut::from_bytes(dst, pw, ph) else { return };
+                pm.fill(Color::TRANSPARENT);
+                node.paint(&mut pm, ts);
+            }
+            Some(rects) => {
+                for &(x, y, w, h) in rects {
+                    let Some(mut layer) = tiny_skia::Pixmap::new(w, h) else { continue };
+                    node.paint(&mut layer.as_mut(), ts.post_translate(-(x as f32), -(y as f32)));
+                    let row = (w * 4) as usize;
+                    for (i, src) in layer.data().chunks_exact(row).enumerate() {
+                        let at = ((y as usize + i) * pw as usize + x as usize) * 4;
+                        dst[at..at + row].copy_from_slice(src);
+                    }
+                }
+            }
+        }
+        damage.commit(number, items, (pw, ph), changed.clone());
+        drop(damage);
         target.set_buffer_scale(scale);
         target.attach(Some(&buf.2), 0, 0);
-        target.damage_buffer(0, 0, pw as i32, ph as i32);
+        match &changed {
+            Some(rects) => rects.iter().for_each(|&(x, y, w, h)| target.damage_buffer(x as i32, y as i32, w as i32, h as i32)),
+            None => target.damage_buffer(0, 0, pw as i32, ph as i32),
+        }
         self.request_frame(&target);
         target.commit();
         if target != self.wl {
@@ -761,16 +908,18 @@ impl Inner {
         ctx(|c| target.frame(&c.qh, self.wl.id()));
     }
 
-    fn take_buffer(&self, w: u32, h: u32) -> Option<(*mut u8, usize, wl_buffer::WlBuffer)> {
+    /// A free buffer for frame `number`, and the frame it held (0: none). The newest is reused first.
+    fn take_buffer(&self, w: u32, h: u32, number: u64) -> Option<(*mut u8, usize, wl_buffer::WlBuffer, u64)> {
         let mut bufs = self.buffers.borrow_mut();
         bufs.retain(|b| b.size == (w, h) || b.busy.load(Relaxed));
-        if let Some(b) = bufs.iter().find(|b| !b.busy.load(Relaxed) && b.size == (w, h)) {
+        if let Some(b) = bufs.iter().filter(|b| !b.busy.load(Relaxed) && b.size == (w, h)).max_by_key(|b| b.frame.get()) {
             b.busy.store(true, Relaxed);
-            return Some((b.ptr, b.len, b.wl.clone()));
+            return Some((b.ptr, b.len, b.wl.clone(), b.frame.replace(number)));
         }
         let b = new_buffer(w, h)?;
         b.busy.store(true, Relaxed);
-        let out = (b.ptr, b.len, b.wl.clone());
+        b.frame.set(number);
+        let out = (b.ptr, b.len, b.wl.clone(), 0);
         bufs.push(b);
         Some(out)
     }
@@ -812,7 +961,7 @@ fn new_buffer(w: u32, h: u32) -> Option<Buffer> {
         pool.destroy();
         b
     });
-    Some(Buffer { wl, ptr: ptr.cast(), len, size: (w, h), busy })
+    Some(Buffer { wl, ptr: ptr.cast(), len, size: (w, h), busy, frame: Cell::new(0) })
 }
 
 /// An immutable full-size image living in one shm buffer (ABGR8888 = tiny-skia's RGBA byte order),
@@ -956,6 +1105,7 @@ pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn, image: Option<
             dim_buffer: RefCell::default(),
             backdrop_key: Cell::new(None),
             gradient: Some(gradient),
+            damage: RefCell::default(),
         })
     })?;
     let s = Rc::new(inner);
@@ -1329,3 +1479,74 @@ delegate_noop!(Wl: ignore wp_viewport::WpViewport);
 delegate_noop!(Wl: ignore wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1);
 delegate_noop!(Wl: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
 delegate_noop!(Wl: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::node::{Background, Node, Sides, Style, shadow};
+
+    fn tree(sel: usize, scroll: f32, text: &str) -> Node {
+        let rows = (0..12)
+            .map(|i| {
+                let mut s = Style { padding: Sides::all(8.0), margin: Sides::trbl(0.0, 0.0, 8.0, 0.0), ..Default::default() };
+                s.background = Background::Color(Color::from_rgba8(40, 40, 60, 255));
+                s.box_shadow = vec![shadow(0.0, 2.0, 6.0, Color::from_rgba8(0, 0, 0, 120))];
+                if i == sel {
+                    s.translate_y = -2.0;
+                    s.outline = Some((2.0, 1.0, Color::from_rgba8(100, 150, 255, 255)));
+                }
+                Node::vbox(s, 0.0, vec![Node::label(Style::default(), format!("row {i} {text}"))])
+            })
+            .collect();
+        let list = Node::vbox(Style::default(), 0.0, rows);
+        let sc = Node::scroll(Style::default(), 300.0, scroll, list);
+        Node::vbox(Style { padding: Sides::all(16.0), background: Background::Color(Color::from_rgba8(20, 20, 30, 230)), ..Default::default() }, 0.0, vec![
+            Node::label(Style::default(), "header"),
+            sc,
+        ])
+    }
+
+    fn full(n: &mut Node, ts: Transform, w: u32, h: u32) -> tiny_skia::Pixmap {
+        n.allocate(0.0, 0.0, w as f32 / 2.0, h as f32 / 2.0);
+        let mut p = tiny_skia::Pixmap::new(w, h).unwrap();
+        n.paint(&mut p.as_mut(), ts);
+        p
+    }
+
+    #[test]
+    fn partial_repaint_matches_full() {
+        let (w, h) = (500, 800);
+        let ts = Transform::from_scale(2.0, 2.0);
+        let frames = [(0, 0.0, "a"), (1, 0.0, "a"), (1, 0.0, "b"), (5, 37.0, "b"), (5, 37.0, "b"), (2, 37.0, "c")];
+        let mut damage = Damage::default();
+        let mut buf: Option<tiny_skia::Pixmap> = None;
+        for (n, &(sel, scroll, text)) in frames.iter().enumerate() {
+            let mut node = tree(sel, scroll, text);
+            let want = full(&mut node, ts, w, h);
+            let mut items = vec![];
+            node.paint_items(ts, 0, None, &mut items);
+            let changed = damage.changed(&items, (w, h), 2);
+            let mut got = buf.take().unwrap_or_else(|| tiny_skia::Pixmap::new(w, h).unwrap());
+            match &changed {
+                None => got = want.clone(),
+                Some(rects) => {
+                    for &(x, y, rw, rh) in rects {
+                        let mut layer = tiny_skia::Pixmap::new(rw, rh).unwrap();
+                        node.paint(&mut layer.as_mut(), ts.post_translate(-(x as f32), -(y as f32)));
+                        let row = (rw * 4) as usize;
+                        for (i, src) in layer.data().chunks_exact(row).enumerate() {
+                            let at = ((y as usize + i) * w as usize + x as usize) * 4;
+                            got.data_mut()[at..at + row].copy_from_slice(src);
+                        }
+                    }
+                }
+            }
+            if n == 4 {
+                assert_eq!(changed.as_deref(), Some(&[][..]), "unchanged frame has no damage");
+            }
+            assert!(got.data() == want.data(), "frame {n} differs (damage {changed:?})");
+            damage.commit(n as u64 + 1, items, (w, h), changed);
+            buf = Some(got);
+        }
+    }
+}

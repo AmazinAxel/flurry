@@ -29,7 +29,7 @@ pub fn cache_dir() -> String {
 #[derive(Clone)]
 enum Thumb {
     Loading,
-    Ready(Rc<Pixmap>),
+    Ready(Rc<Pixmap>, f32), // device pixels per logical pixel
     Failed,
 }
 
@@ -114,9 +114,14 @@ async fn decode_bytes(id: u64, path: &str) -> bool {
     crate::lib::process::to_file(&["cliphist", "decode", &id.to_string()], path).await
 }
 
-fn load_scaled(file: &str) -> Option<Pixmap> {
+/// Thumbnails are rendered at the largest output scale so they map 1:1 onto device pixels.
+fn device_scale() -> f32 {
+    crate::ui::wayland::outputs().iter().map(|o| o.scale).max().unwrap_or(1).max(1) as f32
+}
+
+fn load_scaled(file: &str, k: f32) -> Option<Pixmap> {
     let src = image::decode(&std::fs::read(file).ok()?)?;
-    let s = (MAX_W / src.width() as f32).min(MAX_H / src.height() as f32).min(1.0);
+    let s = (MAX_W * k / src.width() as f32).min(MAX_H * k / src.height() as f32).min(k);
     let (w, h) = ((src.width() as f32 * s).round().max(1.0) as u32, (src.height() as f32 * s).round().max(1.0) as u32);
     let mut out = Pixmap::new(w, h)?;
     let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
@@ -134,18 +139,19 @@ fn request_thumb(item: &Item) {
     runtime::spawn(async move {
         let produce = PRODUCE.with(Clone::clone);
         let _turn = produce.lock().await;
-        let file = if item.video { format!("{}/{}.jpg", cache_dir(), item.id) } else { item.path.clone().unwrap_or_default() };
+        let k = device_scale();
+        let file = if item.video { format!("{}/{}.{k}x.jpg", cache_dir(), item.id) } else { item.path.clone().unwrap_or_default() };
         let ready = std::path::Path::new(&file).exists()
             || if item.video {
-                let scale = format!("scale=w={MAX_W}:h={MAX_H}:force_original_aspect_ratio=decrease");
+                let scale = format!("scale=w={}:h={}:force_original_aspect_ratio=decrease", MAX_W * k, MAX_H * k);
                 let src = item.path.clone().unwrap_or_default();
                 exec(&["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-y", &file]).await.is_ok()
             } else {
                 decode_bytes(item.id, &file).await
             };
         // decoding a screenshot takes tens of ms: off the loop
-        let pix = if ready { runtime::blocking(move || load_scaled(&file)).await.flatten() } else { None };
-        let thumb = pix.map(|p| Thumb::Ready(Rc::new(p))).unwrap_or(Thumb::Failed);
+        let pix = if ready { runtime::blocking(move || load_scaled(&file, k)).await.flatten() } else { None };
+        let thumb = pix.map(|p| Thumb::Ready(Rc::new(p), k)).unwrap_or(Thumb::Failed);
         THUMBS.with(|t| t.borrow_mut().insert(item.id, thumb));
         if let Some(w) = window::get("clipboard") {
             w.redraw();
@@ -181,11 +187,11 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
     }
     if item.image.is_some() || item.video {
         return match THUMBS.with(|t| t.borrow().get(&item.id).cloned()) {
-            Some(Thumb::Ready(p)) => {
-                let (w, h) = (p.width() as f32, p.height() as f32);
+            Some(Thumb::Ready(p, k)) => {
+                let (w, h) = (p.width() as f32 / k, p.height() as f32 / k);
                 let mut s = base.inherit();
                 s.box_shadow = vec![shadow_()];
-                let pic = Node::new(Kind::Picture { pixmap: crate::ui::node::Img::Pix(p), cover: false, blur: 0.0 }, base.inherit());
+                let pic = Node::new(Kind::Picture { pixmap: crate::ui::node::Img::Pix(p), cover: false, blur: 0.0, density: k }, base.inherit());
                 let mut kids = vec![pic];
                 if item.video {
                     let ps = Style { background: Background::Color(rgba(0, 0, 0, 0.5)), padding: Sides::all(8.0), color: tiny_skia::Color::WHITE, ..base.inherit() };

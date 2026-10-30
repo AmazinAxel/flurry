@@ -153,9 +153,11 @@ pub enum Kind {
     Label(LabelSpec),
     Icon { name: &'static str, size: f32 },
     /// Pre-rendered pixmap (wallpaper crop, thumbnails), drawn scaled into the content box
-    Picture { pixmap: Img, cover: bool, blur: f32 },
+    /// `density`: pixmap pixels per logical pixel of its natural size (pre-scaled thumbnails)
+    Picture { pixmap: Img, cover: bool, blur: f32, density: f32 },
     /// Arbitrary paint into the content box, with a fixed natural size
-    Custom { width: f32, height: f32, paint: Rc<dyn Fn(&mut PixmapMut, Rect, Transform)> },
+    /// `key` identifies what `paint` draws (None: repainted every frame)
+    Custom { width: f32, height: f32, key: Option<u64>, paint: Rc<dyn Fn(&mut PixmapMut, Rect, Transform)> },
     /// Clips its child to `max_height` and scrolls by `offset`
     Scroll { max_height: f32, offset: f32 },
 }
@@ -352,11 +354,11 @@ impl Node {
                 }
             }
             Kind::Icon { size, .. } => (*size, *size),
-            Kind::Picture { pixmap, cover, .. } => {
+            Kind::Picture { pixmap, cover, density, .. } => {
                 if *cover {
-                    (0.0, pixmap.width() as f32)
+                    (0.0, pixmap.width() as f32 / density)
                 } else {
-                    (pixmap.width() as f32, pixmap.width() as f32)
+                    (pixmap.width() as f32 / density, pixmap.width() as f32 / density)
                 }
             }
             Kind::Custom { width, .. } => (*width, *width),
@@ -402,11 +404,11 @@ impl Node {
                 (l.height(), l.height())
             }
             Kind::Icon { size, .. } => (*size, *size),
-            Kind::Picture { pixmap, cover, .. } => {
+            Kind::Picture { pixmap, cover, density, .. } => {
                 if *cover {
-                    (0.0, pixmap.height() as f32)
+                    (0.0, pixmap.height() as f32 / density)
                 } else {
-                    let h = pixmap.height() as f32;
+                    let h = pixmap.height() as f32 / density;
                     (h, h)
                 }
             }
@@ -616,29 +618,8 @@ impl Node {
             return None;
         }
         let s = &self.style;
-        let paints_self = !matches!(s.background, Background::None)
-            || s.border.top + s.border.right + s.border.bottom + s.border.left > 0.0
-            || !s.box_shadow.is_empty()
-            || s.outline.is_some()
-            || !matches!(self.kind, Kind::Box { .. } | Kind::Overlay | Kind::Scroll { .. });
-        let grow = |r: Rect, d: f32, dx: f32, dy: f32| {
-            Rect::from_ltrb(r.left() - d + dx.min(0.0), r.top() - d + dy.min(0.0), r.right() + d + dx.max(0.0), r.bottom() + d + dy.max(0.0)).unwrap_or(r)
-        };
-        let mut out: Option<Rect> = None;
+        let mut out: Option<Rect> = self.self_bounds();
         let mut add = |b: Rect| out = Some(out.map_or(b, |o| union(o, b)));
-        if paints_self {
-            let r = self.rect.transform(Transform::from_translate(0.0, s.translate_y)).unwrap_or(self.rect);
-            add(r);
-            for sh in s.box_shadow.iter().filter(|s| !s.inset) {
-                add(grow(r, sh.spread + sh.blur * 1.5, sh.x, sh.y));
-            }
-            if let Some((w, off, _)) = s.outline {
-                add(grow(r, w + off, 0.0, 0.0));
-            }
-            for sh in s.text_shadow.iter().chain(&s.icon_shadow) {
-                add(grow(r, sh.blur * 1.5, sh.x, sh.y));
-            }
-        }
         for c in &self.children {
             if let Some(b) = c.painted_bounds() {
                 let b = b.transform(Transform::from_translate(0.0, s.translate_y)).unwrap_or(b);
@@ -651,12 +632,131 @@ impl Node {
         out
     }
 
+    /// What the node itself paints (children excluded), translate_y applied.
+    fn self_bounds(&self) -> Option<Rect> {
+        let s = &self.style;
+        let paints_self = !matches!(s.background, Background::None)
+            || s.border.top + s.border.right + s.border.bottom + s.border.left > 0.0
+            || !s.box_shadow.is_empty()
+            || s.outline.is_some()
+            || !matches!(self.kind, Kind::Box { .. } | Kind::Overlay | Kind::Scroll { .. });
+        if !paints_self {
+            return None;
+        }
+        let grow = |r: Rect, d: f32, dx: f32, dy: f32| {
+            Rect::from_ltrb(r.left() - d + dx.min(0.0), r.top() - d + dy.min(0.0), r.right() + d + dx.max(0.0), r.bottom() + d + dy.max(0.0)).unwrap_or(r)
+        };
+        let r = self.rect.transform(Transform::from_translate(0.0, s.translate_y)).unwrap_or(self.rect);
+        let mut out = r;
+        for sh in s.box_shadow.iter().filter(|s| !s.inset) {
+            out = union(out, grow(r, sh.spread + sh.blur * 1.5, sh.x, sh.y));
+        }
+        if let Some((w, off, _)) = s.outline {
+            out = union(out, grow(r, w + off, 0.0, 0.0));
+        }
+        for sh in s.text_shadow.iter().chain(&s.icon_shadow) {
+            out = union(out, grow(r, sh.blur * 1.5, sh.x, sh.y));
+        }
+        Some(out)
+    }
+
+    /// Everything the tree paints as (device rect, hash of how), node by node. Two frames' lists
+    /// differ exactly where their pixels can, so the difference is the damage.
+    pub fn paint_items(&self, ts: Transform, salt: u64, clip: Option<Rect>, out: &mut Vec<(Rect, u64)>) {
+        if !self.visible {
+            return;
+        }
+        let s = &self.style;
+        let salt = if s.opacity < 1.0 { hash(&(salt, s.opacity.to_bits())) } else { salt };
+        if let Some(b) = self.self_bounds().and_then(|b| b.transform(ts))
+            && let Some(b) = clip.map_or(Some(b), |c| vclip(b, c))
+        {
+            out.push((b, self.paint_hash(ts, salt)));
+        }
+        let ts = ts.pre_translate(0.0, s.translate_y);
+        let clip = match self.kind {
+            Kind::Scroll { .. } => self.content_rect().transform(ts).and_then(|c| clip.map_or(Some(c), |o| vclip(c, o))),
+            _ => clip,
+        };
+        if matches!(self.kind, Kind::Scroll { .. }) && clip.is_none() {
+            return;
+        }
+        for c in &self.children {
+            c.paint_items(ts, salt, clip, out);
+        }
+    }
+
+    fn paint_hash(&self, ts: Transform, salt: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        thread_local! {
+            static CUSTOM: Cell<u64> = const { Cell::new(0) };
+        }
+        let s = &self.style;
+        let mut h = std::hash::DefaultHasher::new();
+        let f = |h: &mut std::hash::DefaultHasher, v: &[f32]| v.iter().for_each(|x| x.to_bits().hash(h));
+        let col = |h: &mut std::hash::DefaultHasher, c: Color| f(h, &[c.red(), c.green(), c.blue(), c.alpha()]);
+        let shadows = |h: &mut std::hash::DefaultHasher, v: &[Shadow]| {
+            for sh in v {
+                f(h, &[sh.x, sh.y, sh.blur, sh.spread]);
+                col(h, sh.color);
+                sh.inset.hash(h);
+            }
+            0xff.hash(h);
+        };
+        salt.hash(&mut h);
+        f(&mut h, &[ts.sx, ts.sy, ts.kx, ts.ky, ts.tx, ts.ty, s.translate_y]);
+        f(&mut h, &[self.rect.left(), self.rect.top(), self.rect.width(), self.rect.height()]);
+        for b in [s.border, s.padding] {
+            f(&mut h, &[b.top, b.right, b.bottom, b.left]);
+        }
+        s.border_color.iter().for_each(|c| col(&mut h, *c));
+        match s.background {
+            Background::None => 0u8.hash(&mut h),
+            Background::Color(c) => col(&mut h, c),
+        }
+        col(&mut h, s.color);
+        shadows(&mut h, &s.box_shadow);
+        if let Some((w, off, c)) = s.outline {
+            f(&mut h, &[w, off]);
+            col(&mut h, c);
+        }
+        match &self.kind {
+            Kind::Label(l) => {
+                shadows(&mut h, &s.text_shadow);
+                (&l.text, l.wrap, l.ellipsize, s.font.family, s.font.weight).hash(&mut h);
+                f(&mut h, &[l.xalign, l.max_width_chars.unwrap_or(-1.0), l.line_height.unwrap_or(-1.0), s.line_height.unwrap_or(-1.0)]);
+                f(&mut h, &[s.font.size, s.font.letter_spacing]);
+            }
+            Kind::Icon { name, size } => {
+                shadows(&mut h, &s.icon_shadow);
+                name.hash(&mut h);
+                f(&mut h, &[*size]);
+            }
+            Kind::Picture { pixmap, cover, blur, .. } => {
+                (pixmap.key(), cover).hash(&mut h);
+                f(&mut h, &[*blur]);
+            }
+            // arbitrary drawing: always repainted
+            Kind::Custom { key: Some(k), .. } => k.hash(&mut h),
+            Kind::Custom { key: None, .. } => CUSTOM.with(|c| c.replace(c.get() + 1)).hash(&mut h),
+            Kind::Box { .. } | Kind::Overlay | Kind::Scroll { .. } => {}
+        }
+        h.finish()
+    }
+
     pub fn paint_bounds(&self) -> Rect {
         self.painted_bounds().unwrap_or_else(|| Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap())
     }
 
     pub fn paint(&self, pm: &mut PixmapMut, ts: Transform) {
         if !self.visible {
+            return;
+        }
+        // leaves scrolled out of the target (long lists) cost nothing
+        if self.children.is_empty()
+            && let Some(b) = self.painted_bounds().and_then(|b| b.transform(ts))
+            && (b.right() < 0.0 || b.bottom() < 0.0 || b.left() > pm.width() as f32 || b.top() > pm.height() as f32)
+        {
             return;
         }
         if self.style.opacity < 1.0 {
@@ -706,7 +806,7 @@ impl Node {
                 }
                 icons::draw(pm, name, *size, x, y, self.style.color, ts);
             }
-            Kind::Picture { pixmap, cover, blur: radius } => paint_picture(pm, pixmap, c, *cover, *radius, ts),
+            Kind::Picture { pixmap, cover, blur: radius, .. } => paint_picture(pm, pixmap, c, *cover, *radius, ts),
             Kind::Custom { paint, .. } => paint(pm, c, ts),
             _ => {}
         }
@@ -715,7 +815,15 @@ impl Node {
         if clip {
             // clipped vertically only (the scrolling axis): rows' focus outlines may overhang the sides
             let kids = self.children.iter().filter_map(Node::painted_bounds).reduce(union);
-            if let Some((mut layer, (ox, oy))) = kids.and_then(|k| vclip(k, c)).and_then(|r| clip_layer(r, ts)) {
+            // only the part inside the target (partial repaints)
+            let target = Rect::from_xywh(0.0, 0.0, pm.width() as f32, pm.height() as f32);
+            let visible = kids.and_then(|k| vclip(k, c)).and_then(|r| r.transform(ts)).map(|d| {
+                Rect::from_ltrb(d.left().round(), d.top().round(), d.right().round(), d.bottom().round()).and_then(|d| target.and_then(|t| d.intersect(&t)))
+            });
+            if let Some(Some(d)) = visible
+                && let Some(mut layer) = Pixmap::new(d.width() as u32, d.height() as u32)
+            {
+                let (ox, oy) = (d.left(), d.top());
                 for ch in &self.children {
                     ch.paint(&mut layer.as_mut(), ts.post_translate(-ox, -oy));
                 }
@@ -805,7 +913,7 @@ pub(crate) fn blurred(pm: &mut PixmapMut, bounds: Rect, radius: f32, color: Colo
     }
     let Some(mut layer) = Pixmap::new(w, h) else { return };
     draw(&mut layer.as_mut(), ts.post_translate(-ox, -oy));
-    blur(&mut layer, radius * scale);
+    super::image::blur_alpha(&mut layer, radius * scale);
     // tint: keep alpha, replace color
     let (r, g, b, a) = (color.red(), color.green(), color.blue(), color.alpha());
     for px in layer.data_mut().as_chunks_mut::<4>().0 {
@@ -918,7 +1026,10 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
     };
     let (dx, dy) = (c.x() + (c.width() - dw) / 2.0, c.y() + (c.height() - dh) / 2.0);
     let t = ts.pre_translate(dx, dy).pre_scale(dw / sw, dh / sh).pre_translate(-sx, -sy);
-    let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+    // pre-scaled to device pixels (thumbnails): a plain copy, bicubic would cost ~10x per frame
+    let exact = ts.kx == 0.0 && ts.ky == 0.0 && (ts.sx * dw / sw - 1.0).abs() < 1e-3 && (ts.sy * dh / sh - 1.0).abs() < 1e-3;
+    let quality = if exact { tiny_skia::FilterQuality::Nearest } else { tiny_skia::FilterQuality::Bicubic };
+    let paint = PixmapPaint { quality, ..Default::default() };
     if radius <= 0.0 {
         // pattern fill over the visible part of the image, no clip mask
         let Some(area) = Rect::from_xywh(dx, dy, dw, dh).and_then(|d| d.intersect(&c)) else { return };
@@ -933,10 +1044,11 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
     let pad = (radius * ts.sx * 1.5).ceil();
     let (ox, oy) = (dev.left().floor() - pad, dev.top().floor() - pad);
     let key = (img.key(), dev.width().to_bits(), dev.height().to_bits(), (dev.left() - dev.left().floor()).to_bits(), radius.to_bits());
+    // one entry per window header: a single slot made every window switch re-blur the wallpaper (~60ms)
     thread_local! {
-        static BLURRED: std::cell::RefCell<Option<((usize, u32, u32, u32, u32), Rc<Pixmap>)>> = const { std::cell::RefCell::new(None) };
+        static BLURRED: std::cell::RefCell<Vec<((usize, u32, u32, u32, u32), Rc<Pixmap>)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let cached = BLURRED.with(|b| b.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, p)| p.clone()));
+    let cached = BLURRED.with(|b| b.borrow().iter().find(|(k, _)| *k == key).map(|(_, p)| p.clone()));
     let layer = match cached {
         Some(l) => l,
         None => {
@@ -948,7 +1060,14 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
             layer.draw_pixmap(0, 0, pix, &paint, t.post_translate(-ox, -oy), Some(&clip));
             blur(&mut layer, radius * ts.sx);
             let l = Rc::new(layer);
-            BLURRED.with(|b| *b.borrow_mut() = Some((key, l.clone())));
+            BLURRED.with(|b| {
+                let mut b = b.borrow_mut();
+                b.retain(|(k, _)| k.0 == key.0); // a new wallpaper drops the old one's blurs
+                if b.len() >= 16 {
+                    b.remove(0);
+                }
+                b.push((key, l.clone()));
+            });
             l
         }
     };

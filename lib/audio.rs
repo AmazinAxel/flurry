@@ -29,10 +29,17 @@ pub struct Sink {
     profile_device: Option<i32>,
     /// volume/mute come from the device Route (what wpctl reads), not node Props
     routed: bool,
+    /// volume/mute received at least once
+    known: bool,
 }
 
 impl Sink {
+    pub fn known(&self) -> bool {
+        self.known
+    }
+
     fn set_props(&mut self, channels: Option<Vec<f32>>, mute: Option<bool>) {
+        self.known |= channels.is_some() || mute.is_some();
         if let Some(c) = channels {
             self.volume = c.iter().fold(0.0f32, |a, b| a.max(b.cbrt())) as f64;
             self.channels = c;
@@ -271,6 +278,16 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
                         s.set_props(channels, mute);
                     }
                 });
+                // a routed sink's volume lives on its device, whose Route param isn't re-sent when
+                // it changes (only at subscribe): the node's Props change is the cue to re-read it
+                let device = speakers().with(|l| l.iter().find(|s| s.id == id && s.routed).and_then(|s| s.device));
+                if let Some(dev) = device {
+                    with(|p| {
+                        if let Some((d, _, _)) = p.devices.get(&dev) {
+                            d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
+                        }
+                    });
+                }
             }
         })
         .register();
