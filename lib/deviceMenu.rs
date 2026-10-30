@@ -56,6 +56,8 @@ pub fn device_menu(m: DeviceMenu) -> Node {
     let scan_btn = Node::hbox(scan.clone(), 0.0, vec![Node::icon(scan.inherit(), "view-refresh-symbolic", 16.0)]).show(m.powered).focusable("scan");
     // no top padding: the separator's 10px + the row's 4px margin mirror the header above it
     let list = Node::vbox(Style { padding: Sides::trbl(0.0, 0.0, 5.0, 0.0), ..base.inherit() }, 0.0, m.rows);
-    let scroll = Node::scroll(base.inherit(), 500.0, m.scroll, list).expand(true, true).show(show_list);
+    // the 5px keeps the last row's focus outline inside the clip; it overlaps the card padding
+    // so the bottom gap matches the top
+    let scroll = Node::scroll(Style { margin: Sides::trbl(0.0, 0.0, -5.0, 0.0), ..base.inherit() }, 500.0, m.scroll, list).expand(true, true).show(show_list);
     Node::vbox(base.inherit(), 0.0, vec![Node::hbox(base.inherit(), 0.0, vec![power_btn, scan_btn]), separator(base).show(show_list), scroll])
 }

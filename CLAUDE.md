@@ -8,7 +8,7 @@ Rust Wayland shell (no GTK, no async runtime), consumed by borealis. Public repo
 - `ui/`: the toolkit: `runtime.rs` (single poll loop, timers, idle, tiny executor), `wayland.rs` (layer/lock surfaces, shm, input), `node.rs` (GTK-like box model + painting), `text.rs` (fontconfig + HarfBuzz), `icons.rs` (baked by `build.rs`), `entry.rs`, `window.rs`.
 - `lib/`: services (dbus, logind, iwd, bluetooth, battery, audio=pipewire, notifd, apps, sway, mpd, pam, wallpaper) and shared widgets (searchDialog, inputControl, backgroundSection, deviceMenu); `style.rs` holds the resolved CSS values.
 - `widgets/`: one file per window, same layout as the old TS.
-- `sideview/`: separate crate `flurry-sideview` (Servo), spawned by `widgets/sideview.rs`, commands over stdin. `flurry:claude` pages are `sideview/claude/` (vendored marked + KaTeX + Libron font) talking to `claude -p` stream-json via `src/claude.rs`.
+- `sideview/`: separate crate `flurry-sideview` (Servo), spawned by `widgets/sideview.rs`, commands over stdin. `flurry:claude` pages are `sideview/claude/` (vendored marked + KaTeX + Sora variable font) talking to `claude -p` stream-json via `src/claude.rs`.
 - Dev: `nix-shell` (or `nix develop`), `cargo test`, `cargo clippy`, `cargo build --release`.
 - Visual check: `tests/capture/run.sh <flurry-binary> <out-dir>` captures every window in an isolated headless sway (never the live session); compare with `tests/capture/sbs.sh`.
 - Build: `nix build .#default`.

@@ -428,10 +428,16 @@ pub struct Inner {
     buffers: RefCell<Vec<Buffer>>,
     frame_pending: Cell<bool>,
     redraw_queued: Cell<bool>,
+    /// mapped again after `unmap`: the next frame must attach a buffer even if nothing changed
+    remapped: Cell<bool>,
+    /// unmaps whose sync hasn't come back: configures before then are for the old mapping
+    stale: Cell<u32>,
     build: RefCell<Option<BuildFn>>,
     on_key: RefCell<Option<Rc<dyn Fn(&KeyEvent)>>>,
     on_pointer: RefCell<Option<Rc<dyn Fn(PointerEvent)>>>,
     after_render: RefCell<Option<Rc<dyn Fn(&Node)>>>,
+    /// run once the next frame is committed and flushed
+    committed: RefCell<Vec<Box<dyn FnOnce()>>>,
     /// called each frame; the surface re-renders while it returns true
     animation: RefCell<Option<Rc<dyn Fn() -> bool>>>,
     image: RefCell<Option<Rc<ShmImage>>>,
@@ -630,10 +636,13 @@ impl Surface {
                 buffers: RefCell::default(),
                 frame_pending: Cell::new(false),
                 redraw_queued: Cell::new(false),
+                remapped: Cell::new(false),
+                stale: Cell::new(0),
                 build: RefCell::new(Some(build)),
                 on_key: RefCell::default(),
                 on_pointer: RefCell::default(),
                 after_render: RefCell::default(),
+                committed: RefCell::default(),
                 animation: RefCell::default(),
                 image: RefCell::default(),
                 img_viewport: RefCell::default(),
@@ -665,6 +674,42 @@ impl Surface {
     /// Called with the laid-out tree after every render (focus/scroll bookkeeping).
     pub fn after_render(&self, f: impl Fn(&Node) + 'static) {
         *self.0.after_render.borrow_mut() = Some(Rc::new(f));
+    }
+    /// Hides the surface but keeps it, its newest buffer and that frame's damage state, so showing
+    /// it again repaints only what changed meanwhile (usually nothing).
+    pub fn unmap(&self) {
+        let s = &self.0;
+        if !matches!(*s.role.borrow(), Role::Layer(_)) {
+            return;
+        }
+        s.wl.attach(None, 0, 0);
+        s.wl.commit();
+        s.stale.set(s.stale.get() + 1);
+        ctx(|c| c.conn.display().sync(&c.qh, Unmapped(s.wl.id())));
+        s.configured.set(false);
+        s.frame_pending.set(false);
+        s.redraw_queued.set(false);
+        s.animation.borrow_mut().take();
+        s.backdrop_key.set(None);
+        let newest = s.damage.borrow().frame;
+        s.buffers.borrow_mut().retain(|b| b.frame.get() == newest || b.busy.load(Relaxed));
+    }
+
+    /// Maps an `unmap`ped surface again: initial commit, then the configure renders.
+    pub fn remap(&self) {
+        let s = &self.0;
+        s.remapped.set(true);
+        s.apply_content_size(None);
+        s.wl.commit();
+    }
+
+    pub fn alive(&self) -> bool {
+        self.0.alive()
+    }
+
+    /// Runs `f` once this surface's next frame has been committed and sent.
+    pub fn after_commit(&self, f: impl FnOnce() + 'static) {
+        self.0.committed.borrow_mut().push(Box::new(f));
     }
     /// Rebuilds and repaints on the next idle pass (coalesced).
     pub fn redraw(&self) {
@@ -699,6 +744,10 @@ impl Drop for Surface {
 
 impl Inner {
     fn destroy_role(&self) {
+        // never strand work waiting on a frame this surface won't commit now
+        for f in self.committed.take() {
+            runtime::idle(f);
+        }
         let role = std::mem::replace(&mut *self.role.borrow_mut(), Role::None);
         match role {
             Role::Layer(l) => l.destroy(),
@@ -823,7 +872,10 @@ impl Inner {
         if let Some(cb) = self.after_render.borrow().clone() {
             cb(&node);
         }
+        let remapped = self.remapped.replace(false);
         let changed = match changed {
+            // shown again unchanged: the kept frame goes straight back up, nothing repainted
+            Some(r) if r.is_empty() && remapped => Some(r),
             Some(r) if r.is_empty() && self.animation.borrow().is_none() => return, // nothing to show
             // an animation step that moved nothing: a 1px commit keeps its frame callbacks coming
             Some(r) if r.is_empty() => Some(vec![(0, 0, 1, 1)]),
@@ -862,13 +914,16 @@ impl Inner {
         target.set_buffer_scale(scale);
         target.attach(Some(&buf.2), 0, 0);
         match &changed {
-            Some(rects) => rects.iter().for_each(|&(x, y, w, h)| target.damage_buffer(x as i32, y as i32, w as i32, h as i32)),
-            None => target.damage_buffer(0, 0, pw as i32, ph as i32),
+            Some(rects) if !remapped => rects.iter().for_each(|&(x, y, w, h)| target.damage_buffer(x as i32, y as i32, w as i32, h as i32)),
+            _ => target.damage_buffer(0, 0, pw as i32, ph as i32),
         }
         self.request_frame(&target);
         target.commit();
         if target != self.wl {
             self.wl.commit();
+        }
+        for f in self.committed.take() {
+            runtime::after_flush(f);
         }
     }
 
@@ -1095,10 +1150,13 @@ pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn, image: Option<
             buffers: RefCell::default(),
             frame_pending: Cell::new(false),
             redraw_queued: Cell::new(false),
+            remapped: Cell::new(false),
+            stale: Cell::new(0),
             build: RefCell::new(Some(build)),
             on_key: RefCell::default(),
             on_pointer: RefCell::default(),
             after_render: RefCell::default(),
+            committed: RefCell::default(),
             animation: RefCell::default(),
             image: RefCell::new(image),
             img_viewport: RefCell::default(),
@@ -1341,12 +1399,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Wl {
 
 impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Wl {
     fn event(_: &mut Self, l: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ev: zwlr_layer_surface_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        let id = SURFACES.with(|m| {
-            m.borrow().iter().find_map(|(id, s)| s.upgrade().filter(|s| matches!(&*s.role.borrow(), Role::Layer(x) if x == l)).map(|_| id.clone()))
+        let found = SURFACES.with(|m| {
+            m.borrow().iter().find_map(|(id, s)| s.upgrade().filter(|s| matches!(&*s.role.borrow(), Role::Layer(x) if x == l)).map(|s| (id.clone(), s)))
         });
-        let Some(id) = id else { return };
+        let Some((id, s)) = found else { return };
         match ev {
             zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                if s.stale.get() > 0 {
+                    return; // sent before an unmap: its serial is void now, acking it is a protocol error
+                }
                 l.ack_configure(serial);
                 push(Ev::Configure(id, width, height));
             }
@@ -1387,6 +1448,17 @@ impl Dispatch<wl_surface::WlSurface, ()> for Wl {
     fn event(_: &mut Self, s: &wl_surface::WlSurface, ev: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         if let wl_surface::Event::PreferredBufferScale { factor } = ev {
             push(Ev::PreferredScale(s.id(), factor));
+        }
+    }
+}
+
+/// The surface an unmap's sync belongs to.
+pub struct Unmapped(ObjectId);
+
+impl Dispatch<wl_callback::WlCallback, Unmapped> for Wl {
+    fn event(_: &mut Self, _: &wl_callback::WlCallback, ev: wl_callback::Event, u: &Unmapped, _: &Connection, _: &QueueHandle<Self>) {
+        if let (wl_callback::Event::Done { .. }, Some(s)) = (ev, surface(&u.0)) {
+            s.stale.set(s.stale.get().saturating_sub(1));
         }
     }
 }
@@ -1544,7 +1616,9 @@ mod tests {
             if n == 4 {
                 assert_eq!(changed.as_deref(), Some(&[][..]), "unchanged frame has no damage");
             }
-            assert!(got.data() == want.data(), "frame {n} differs (damage {changed:?})");
+            if let Some(i) = got.data().iter().zip(want.data()).position(|(a, b)| a != b) {
+                panic!("frame {n} differs at px {} ({}, {}) got {:?} want {:?} (damage {changed:?})", i / 4, (i / 4) % w as usize, (i / 4) / w as usize, &got.data()[i / 4 * 4..i / 4 * 4 + 4], &want.data()[i / 4 * 4..i / 4 * 4 + 4]);
+            }
             damage.commit(n as u64 + 1, items, (w, h), changed);
             buf = Some(got);
         }

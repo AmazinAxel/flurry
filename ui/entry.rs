@@ -268,7 +268,7 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
                 && let Some((mut layer, (ox, oy))) = super::node::clip_layer(sel, ts)
             {
                 text::draw(&mut layer.as_mut(), &layout, x, y, look.selection_fg, ts.post_translate(-ox, -oy));
-                pm.draw_pixmap(ox as i32, oy as i32, layer.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
+                super::node::blit(pm, layer.as_ref(), ox as i32, oy as i32, 1.0);
             }
         }
         if look.caret && a == b {
@@ -278,7 +278,7 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
                 fill_rect(pm, c, look.color, ts);
             }
         }
-        outer.draw_pixmap(lx as i32, ly as i32, area.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
+        super::node::blit(outer, area.as_ref(), lx as i32, ly as i32, 1.0);
     });
     let mut n = Node::new(Kind::Custom { width: 0.0, height, key, paint }, style);
     n.hexpand = true;

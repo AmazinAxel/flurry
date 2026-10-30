@@ -74,7 +74,6 @@ pub struct Win {
 
 thread_local! {
     static WINDOWS: RefCell<HashMap<&'static str, Rc<Win>>> = RefCell::default();
-    static TRIM: RefCell<Option<super::runtime::Timer>> = const { RefCell::new(None) };
 }
 
 pub fn get(name: &str) -> Option<Rc<Win>> {
@@ -144,15 +143,15 @@ impl Win {
             for f in self.on_show.borrow().clone() {
                 f();
             }
+            // kept from the last show: back up with their last frame, repainting only what changed
+            self.surfaces.borrow_mut().retain(|(_, s)| s.alive());
+            for (_, s) in self.surfaces.borrow().iter() {
+                s.remap();
+            }
             self.sync_outputs();
         } else {
-            self.surfaces.borrow_mut().clear();
-            // hand freed buffers back to the kernel once things settle, never in the hide path
-            let t = super::runtime::timeout(1000, || unsafe {
-                libc::malloc_trim(0);
-            });
-            if let Some(old) = TRIM.with(|x| x.borrow_mut().replace(t)) {
-                old.cancel();
+            for (_, s) in self.surfaces.borrow().iter() {
+                s.unmap();
             }
         }
         self.visibility.set(v);
@@ -191,7 +190,7 @@ impl Win {
         } else {
             vec![(String::new(), None)]
         };
-        self.surfaces.borrow_mut().retain(|(n, _)| wanted.iter().any(|(w, _)| w == n));
+        self.surfaces.borrow_mut().retain(|(n, s)| s.alive() && wanted.iter().any(|(w, _)| w == n));
         for (name, output) in wanted {
             if self.surfaces.borrow().iter().any(|(n, _)| *n == name) {
                 continue;
@@ -255,6 +254,14 @@ impl Win {
             }
         });
         s
+    }
+
+    /// Runs `f` once the first surface's next frame has gone out (right away when not shown).
+    pub fn after_commit(&self, f: impl FnOnce() + 'static) {
+        match self.surfaces.borrow().first() {
+            Some((_, s)) => s.after_commit(f),
+            None => super::runtime::idle(f),
+        }
     }
 
     /// Steps `f` on every frame of each surface, re-rendering while it returns true.

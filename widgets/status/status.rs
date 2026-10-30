@@ -41,10 +41,10 @@ fn build() -> Node {
     let btn = Style { padding: Sides::all(8.0), background: Background::Color(playlist), ..base.inherit() };
     let play = if is_playing().peek() { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
     let media = Node::vbox(media_style, 0.0, vec![
-        Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), play, 21.0)]),
+        Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), play, 21.0).expand(true, false)]),
         mpris(&base),
     ])
-    .align(Align::Center, Align::Fill)
+    .align(Align::Fill, Align::Fill)
     .id("media");
 
     let info = Node::vbox(status_element(&base), 0.0, vec![recording_indicator(&base), time(&base), status(&base)]).id("info");
@@ -75,7 +75,7 @@ pub fn status_window() -> Rc<Win> {
         } else if inside("info")
             && let Some(s) = audio::default_speaker()
         {
-            audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.003));
+            audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.006));
         }
     });
     w

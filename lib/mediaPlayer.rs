@@ -152,7 +152,7 @@ pub fn chng_playlist(next: bool) {
 
 /// Status bar media block scroll: accumulate and send whole volume steps.
 pub fn media_scroll(dy: f64, wheel: bool) {
-    let step = crate::lib::scrollStep::scroll_step(dy, wheel, 5.0, 0.3);
+    let step = crate::lib::scrollStep::scroll_step(dy, wheel, 5.0, 0.6);
     let n = SCROLL.with(|a| {
         let v = a.get() - step;
         let n = v.trunc();

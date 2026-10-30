@@ -4,12 +4,9 @@
 <script src="katex.min.js"></script>
 <script src="marked.min.js"></script>
 <style>
-  @font-face { font-family: Libron; src: url(fonts/Libron-Regular.woff2); font-weight: 400; font-style: normal; }
-  @font-face { font-family: Libron; src: url(fonts/Libron-Italic.woff2); font-weight: 400; font-style: italic; }
-  @font-face { font-family: Libron; src: url(fonts/Libron-Bold.woff2); font-weight: 700; font-style: normal; }
-  @font-face { font-family: Libron; src: url(fonts/Libron-BoldItalic.woff2); font-weight: 700; font-style: italic; }
+  @font-face { font-family: Sora; src: url(fonts/Sora.woff2) format("woff2"); font-weight: 300 600; font-style: normal; }
   :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #2e3440; color: #eceff4; font: 15px/1.45 Libron, serif; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #2e3440; color: #eceff4; font: 300 16.5px/1.5 Sora, sans-serif; }
   body { display: flex; flex-direction: column; }
   #log { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 8px 0; }
   .msg { padding: 8px 14px; margin: 0 0 10px; overflow-wrap: anywhere; }
@@ -24,7 +21,8 @@
   li { position: relative; }
   li > .marker { position: absolute; right: 100%; margin-right: 6px; white-space: nowrap; }
   .think { opacity: 0.5; font-style: italic; white-space: pre-wrap; }
-  h1, h2, h3, h4 { margin: 10px 0 6px; font-size: 1.05em; }
+  h1, h2, h3, h4 { margin: 10px 0 6px; font-size: 1.05em; font-weight: 600; }
+  b, strong { font-weight: 600; }
   h1 { font-size: 1.2em; }
   a { color: #88c0d0; }
   code { font-family: "Iosevka Nerd Font Mono", monospace; font-size: 0.9em; background: #2e3440; padding: 1px 4px; }
@@ -62,14 +60,23 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   function svgToImg(html) {
     return html.replace(/<svg([^>]*)>([\s\S]*?)<\/svg>/g, function (_, attrs, body) {
       // a standalone SVG document needs its namespace
-      var svg = '<svg xmlns="http://www.w3.org/2000/svg"' + attrs.replace(/style="[^"]*"/, '') + ' fill="#eceff4">' + body + '</svg>';
-      // the box is katex.css's `.katex svg`; object-fit/position reproduce preserveAspectRatio,
-      // which an image box would otherwise ignore (stretching the radical sign to nothing)
-      var h = /height="([^"]*)"/.exec(attrs), par = (/preserveAspectRatio="([^"]*)"/.exec(attrs) || ['', 'xMidYMid'])[1];
-      var fit = par === 'none' ? 'fill' : /slice/.test(par) ? 'cover' : 'contain';
-      var x = /xMin/.test(par) ? 'left' : /xMax/.test(par) ? 'right' : 'center', y = /YMin/.test(par) ? 'top' : /YMax/.test(par) ? 'bottom' : 'center';
-      var style = 'display:block;position:absolute;width:100%;height:' + (h ? h[1] : 'inherit') + ';object-fit:' + fit + ';object-position:' + x + ' ' + y + ';' + (/style="([^"]*)"/.exec(attrs) || ['', ''])[1];
-      return '<img alt="" style="' + style + '" src="data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg) + '">';
+      // its size is set once laid out (sharpen): a standalone SVG of em units rasterizes at 16px/em, 1x
+      var svg = '<svg xmlns="http://www.w3.org/2000/svg"' + attrs.replace(/style="[^"]*"/, '').replace(/ (width|height)="[^"]*"/g, '') + ' fill="#eceff4">' + body + '</svg>';
+      // the box is katex.css's `.katex svg`; the SVG gets exactly that size in device pixels once
+      // laid out, so its own preserveAspectRatio applies and it rasterizes sharp
+      var h = /height="([^"]*)"/.exec(attrs);
+      var style = 'display:block;position:absolute;width:100%;height:' + (h ? h[1] : 'inherit') + ';' + (/style="([^"]*)"/.exec(attrs) || ['', ''])[1];
+      return '<img alt="" class="tex-svg" style="' + style + '" data-svg="' + encodeURIComponent(svg) + '">';
+    });
+  }
+  // KaTeX images sized to their laid-out boxes in device pixels
+  function sharpen(el) {
+    var d = window.devicePixelRatio || 1;
+    el.querySelectorAll('img.tex-svg').forEach(function (img) {
+      var r = img.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      var size = ' width="' + Math.ceil(r.width * d) + '" height="' + Math.ceil(r.height * d) + '"';
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(decodeURIComponent(img.dataset.svg).replace('<svg', '<svg' + size));
     });
   }
   function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
@@ -126,7 +133,7 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
     var s = text ? '' : status();
     if (!text && !s) return; // no empty bubble before there is something to show
     if (!reply) reply = add('claude');
-    if (text) { reply.innerHTML = marked.parse(text); markers(reply); }
+    if (text) { reply.innerHTML = marked.parse(text); markers(reply); sharpen(reply); }
     else { reply.innerHTML = ''; var t = document.createElement('div'); t.className = 'think'; t.textContent = s; reply.appendChild(t); }
     if (follow) bottom();
   }
@@ -189,7 +196,7 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   box.addEventListener('input', grow);
   // the panel opens before its final size: keep the box fully shown and the log pinned
   window.addEventListener('resize', function () { grow(); if (follow) bottom(); });
-  // Libron arrives after the first layout and an empty box keeps the fallback font's metrics (shorter
+  // Sora arrives after the first layout and an empty box keeps the fallback font's metrics (shorter
   // box, smaller caret) until its text changes: touch the text once the font is in
   if (document.fonts) document.fonts.ready.then(function () { var v = box.value; box.value = v + ' '; box.value = v; grow(); });
   box.addEventListener('keydown', function (e) {

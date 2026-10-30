@@ -90,6 +90,16 @@ pub fn hide_sideview() {
     set_focused(false);
 }
 
+/// Hides the sideview, or brings back the last shown page.
+pub fn toggle_sideview() {
+    if VISIBLE.with(Cell::get) {
+        return hide_sideview();
+    }
+    if let Some(name) = CURRENT.with(|c| c.borrow().clone()) {
+        show_page(&name);
+    }
+}
+
 /// Destroys all web views (the whole helper process).
 pub fn close_sideview() {
     hide_sideview();

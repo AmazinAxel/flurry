@@ -25,6 +25,7 @@ struct Runtime {
     task_seq: Cell<u64>,
     quit: Cell<bool>,
     before_poll: RefCell<Vec<Callback>>,
+    after_flush: RefCell<Vec<Box<dyn FnOnce()>>>,
 }
 
 thread_local! {
@@ -90,6 +91,11 @@ pub fn spawn(fut: impl Future<Output = ()> + 'static) {
 }
 
 /// Runs `f` right before every blocking poll (e.g. flushing the Wayland connection).
+/// Runs `f` once everything queued so far has been flushed (before_poll hooks), ahead of waiting.
+pub fn after_flush(f: impl FnOnce() + 'static) {
+    RT.with(|rt| rt.after_flush.borrow_mut().push(Box::new(f)));
+}
+
 pub fn before_poll(f: impl Fn() + 'static) {
     RT.with(|rt| rt.before_poll.borrow_mut().push(Rc::new(f)));
 }
@@ -160,6 +166,15 @@ pub fn iterate(block: bool) {
     let hooks: Vec<Callback> = RT.with(|rt| rt.before_poll.borrow().clone());
     for h in hooks {
         h();
+    }
+    // work deferred until what's queued (a first frame) has gone out; then straight round again,
+    // since it may have queued more
+    let deferred = RT.with(|rt| std::mem::take(&mut *rt.after_flush.borrow_mut()));
+    if !deferred.is_empty() {
+        for f in deferred {
+            guard(f);
+        }
+        return;
     }
     let mut fds: Vec<libc::pollfd> = RT.with(|rt| {
         rt.fds.borrow().keys().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect()
@@ -354,3 +369,4 @@ pub fn guard(f: impl FnOnce()) {
         eprintln!("flurry: handler panicked: {msg}");
     }
 }
+

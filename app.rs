@@ -35,6 +35,7 @@ fn request(cmd: &str, arg: Option<&str>) {
         "sideview" => sideview::show_page(arg.unwrap_or("")),
         "closeSideview" => sideview::close_sideview(),
         "hideSideview" => sideview::hide_sideview(),
+        "toggleSideview" => sideview::toggle_sideview(),
         "toggleSideviewFocus" => sideview::toggle_sideview_focus(),
         "record" => {
             if service::is_rec().peek() {
@@ -134,6 +135,11 @@ fn dir_size(p: &std::path::Path) -> u64 {
 }
 
 fn main() {
+    // big temporaries (paint layers, decodes) straight from/back to the kernel: glibc's adaptive
+    // threshold otherwise moves them onto the heap after the first free, where they stay resident
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 4 << 20);
+    }
     if !ui::wayland::connect() {
         eprintln!("flurry: cannot connect to the Wayland display");
         std::process::exit(1);
@@ -162,8 +168,8 @@ fn main() {
     window::set_visible("focusMenu", true);
     serve();
 
-    // services after the first frame is queued
-    runtime::idle(|| {
+    // services once the first frame has gone out: it never waits on them
+    let start = || {
         lib::logind::start();
         lockscreen::start();
         lib::notifd::start();
@@ -182,6 +188,10 @@ fn main() {
         service::start_clipping_service();
         ui::text::release_fontconfig();
         unsafe { libc::malloc_trim(0) };
-    });
+    };
+    match window::get("focusMenu") {
+        Some(w) => w.after_commit(start),
+        None => runtime::idle(start),
+    }
     runtime::run();
 }
