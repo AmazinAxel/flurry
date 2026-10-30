@@ -76,7 +76,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             let mut check = s.inherit();
             check.margin = Sides::trbl(0.0, 7.0, 0.0, 0.0);
             Node::hbox(s.clone(), 0.0, vec![
-                Node::icon(check, "emblem-default-symbolic", 22.0).show(is_sel),
+                Node::icon(check, "emblem-default-symbolic", 19.0).show(is_sel),
                 Node::label(s.inherit(), name_substitute(&sp.description)).xalign(0.0).expand(true, false).ellipsize(),
             ])
             .focusable(id)

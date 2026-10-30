@@ -86,9 +86,9 @@ pub fn frosted(mut s: Style) -> Style {
 
 /// `button.active, .button.selected, list row:selected, ...`
 pub fn button_active(mut s: Style) -> Style {
-    s.background = Background::Color(blue2());
-    s.box_shadow = vec![Shadow { spread: 3.0, ..glow(5.0, blue3()) }];
-    s.border_color = [blue1(); 4];
+    s.background = Background::Color(blue3());
+    s.box_shadow = vec![];
+    s.border_color = [blue3(); 4];
     s
 }
 

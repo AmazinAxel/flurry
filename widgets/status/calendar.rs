@@ -6,7 +6,7 @@ use xkbcommon::xkb::Keysym;
 
 use crate::lib::style::*;
 use crate::lib::time::format;
-use crate::ui::node::{Align, Background, Node, Shadow, Sides, Style, alpha};
+use crate::ui::node::{Align, Background, Node, Sides, Style, rgba};
 use crate::ui::wayland::KeyEvent;
 
 thread_local! {
@@ -86,6 +86,7 @@ pub fn calendar(base: &Style) -> Node {
     let today = today();
     let mut cal = frosted(base.inherit());
     cal.min_width = 0.0;
+    cal.background = Background::None;
     let cell = Style { padding: Sides::trbl(9.0, 7.0, 9.0, 7.0), ..cal.inherit() };
 
     // "October 2026", left-aligned
@@ -108,11 +109,10 @@ pub fn calendar(base: &Style) -> Node {
                 let (_, dm, dd) = civil_from_days(day);
                 let mut s = cell.clone();
                 if dm != m {
-                    s.color = alpha(s.color, 0.3); // adjacent months greyed
+                    s.color = rgba(255, 255, 255, 0.5); // adjacent months greyed
                 }
                 if day == today {
-                    s.background = Background::Color(blue2());
-                    s.box_shadow = vec![Shadow { inset: true, spread: 1.0, ..glow(0.0, blue1()) }, Shadow { spread: 3.0, ..glow(5.0, blue3()) }];
+                    s.background = Background::Color(blue3());
                     s.color = light1();
                 }
                 Node::label(s, dd.to_string()).expand(true, false)

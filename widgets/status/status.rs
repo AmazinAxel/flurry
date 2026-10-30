@@ -9,7 +9,7 @@ const TOP_HEIGHT: f32 = 220.0;
 const CONTROL_FONT: f32 = 19.0;
 use crate::lib::mediaPlayer::{PLAYLISTS, is_playing, playlist_index, song};
 use crate::lib::style::*;
-use crate::ui::node::{Align, Background, Node, Sides, Style};
+use crate::ui::node::{Align, Background, Node, Shadow, Sides, Style, alpha};
 use crate::widgets::status::modules::{mpris::track, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
 use crate::widgets::status::quicksettings::quicksettings::quick_settings;
 
@@ -33,7 +33,12 @@ fn playlist_color() -> tiny_skia::Color {
 fn media(base: &Style) -> Node {
     let playlist = playlist_color();
     let playing = is_playing().peek();
-    let bar = Style { background: Background::Color(playlist), margin: Sides::trbl(6.0, 0.0, 6.0, 0.0), ..base.inherit() };
+    let bar = Style {
+        background: Background::Color(playlist),
+        box_shadow: vec![Shadow { spread: 2.0, ..glow(10.0, alpha(playlist, 0.7)) }],
+        margin: Sides::trbl(6.0, 0.0, 6.0, 0.0),
+        ..base.inherit()
+    };
     let btn = Style { padding: Sides::vh(12.0, 18.0), ..base.inherit() };
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
     let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
@@ -63,7 +68,12 @@ pub fn quickstatus(base: &Style, focus: Option<&str>) -> (Node, Option<Node>) {
     let c = (TOP_HEIGHT - GAP) / 1.5;
     let d = (TOP_HEIGHT - 2.0 * GAP) / (1.5 + 0.75 * day);
     debug_assert!((time::clock_height(c, GAP) - time::date_height(d, day * d, GAP)).abs() < 0.5);
-    let top = Node::hbox(base.inherit(), GAP, vec![time::clock(base, c, GAP), icons, time::date(base, d, day * d, GAP)]).expand(true, false).align(Align::Center, Align::Center);
+    // clock and date padded to the same width so the icons sit on the center line
+    let (mut clock, mut date) = (time::clock(base, c, GAP), time::date(base, d, day * d, GAP));
+    let (cw, dw) = (clock.measure_w().1, date.measure_w().1);
+    clock.style.margin.left += (dw - cw).max(0.0);
+    date.style.margin.right += (cw - dw).max(0.0);
+    let top = Node::hbox(base.inherit(), GAP, vec![clock, icons, date]).expand(true, false).align(Align::Center, Align::Center);
     let mut big = base.clone();
     big.font.size = CONTROL_FONT;
     (top, Some(Node::vbox(big.inherit(), 0.0, vec![media(&big), quick_settings(&big, focus)]).expand(true, false)))
