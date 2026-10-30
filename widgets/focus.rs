@@ -20,6 +20,7 @@ thread_local! {
     static BREAK_WAIT: State<f64> = State::new(-1.0);
     static BREAK_TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
     static BREAK_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static CLOSING_NOTIF: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 pub fn focus_text() -> State<String> {
@@ -62,9 +63,14 @@ pub fn start_break(cmd: &str) {
         runtime::spawn(async move {
             let _ = exec(&["systemd-run", "--user", "--scope", "--collect", "-p", "RuntimeMaxSec=120", "sh", "-c", &cmd]).await;
             end_break();
+            let id = CLOSING_NOTIF.with(|n| n.replace(0));
+            if id != 0 {
+                crate::lib::notifd::dismiss(id);
+            }
         });
         let t = runtime::timeout(105_000, || {
-            crate::lib::notifySend::notify_send("Focus", "App closing in 15s", "", vec![]);
+            let id = crate::lib::notifySend::notify_send("Focus", "App closing in 15s", "", vec![]);
+            CLOSING_NOTIF.with(|n| n.set(id));
         });
         BREAK_TIMERS.with(|x| x.borrow_mut().push(t));
     });
