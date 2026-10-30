@@ -33,13 +33,11 @@ fn playlist_color() -> tiny_skia::Color {
 fn media(base: &Style) -> Node {
     let playlist = playlist_color();
     let playing = is_playing().peek();
-    let mut bar = Style { background: Background::Color(playlist), margin: Sides::trbl(6.0, 0.0, 6.0, 0.0), ..base.inherit() };
-    bar = bar.border(Sides::all(3.0), shade(playlist, 1.1));
-    let mut btn = Style { padding: Sides::vh(12.0, 18.0), background: Background::Color(shade(playlist, 0.9)), ..base.inherit() };
+    let bar = Style { background: Background::Color(playlist), margin: Sides::trbl(6.0, 0.0, 6.0, 0.0), ..base.inherit() };
+    let btn = Style { padding: Sides::vh(12.0, 18.0), ..base.inherit() };
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
     let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
     let Some((title, artist)) = text else {
-        btn.background = Background::Color(playlist);
         return Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0)]).expand(true, false).align(Align::Center, Align::Fill).id("mediaBtn")])
             .id("media");
     };

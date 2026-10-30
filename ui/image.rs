@@ -69,21 +69,6 @@ fn from_rgba(mut rgba: Vec<u8>, w: u32, h: u32) -> Option<Pixmap> {
     Pixmap::from_vec(rgba, IntSize::from_wh(w, h)?)
 }
 
-/// Average Rec.601 luma of a 16x9 nearest-neighbour sample (wallpaper.tsx `decode`).
-pub fn is_light(p: tiny_skia::PixmapRef) -> bool {
-    let mut sum = 0.0;
-    for y in 0..9 {
-        for x in 0..16 {
-            // GdkPixbuf NEAREST samples at the center of each destination pixel
-            let sx = ((x as f32 + 0.5) * p.width() as f32 / 16.0) as u32;
-            let sy = ((y as f32 + 0.5) * p.height() as f32 / 9.0) as u32;
-            let c = p.pixel(sx.min(p.width() - 1), sy.min(p.height() - 1)).unwrap();
-            sum += 0.299 * c.red() as f32 + 0.587 * c.green() as f32 + 0.114 * c.blue() as f32;
-        }
-    }
-    sum / 144.0 > 150.0
-}
-
 /// Gaussian blur in place (sigma = radius / 2, as GSK does), approximated by three box blurs per
 /// axis (O(1) per pixel regardless of radius), over all 4 premultiplied channels.
 pub fn blur(p: &mut Pixmap, radius: f32) {

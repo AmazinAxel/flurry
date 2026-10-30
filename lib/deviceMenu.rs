@@ -8,16 +8,15 @@ pub struct DeviceMenu<'a> {
     pub powered: bool,
     pub power_icon: &'static str,
     pub scanning: bool,
-    pub scan_sensitive: bool,
     pub empty: bool,
     pub focus: Option<&'a str>,
     pub scroll: f32,
     pub rows: Vec<Node>,
 }
 
-/// `#asideStatus button` with active / focus / disabled states.
-pub fn aside_button(base: &Style, active: bool, connecting: bool, focused: bool, sensitive: bool) -> Style {
-    let mut s = button(base);
+/// `#asideStatus button` with active / focus states; dimmed only while a connection is in progress.
+pub fn aside_button(base: &Style, active: bool, connecting: bool, focused: bool) -> Style {
+    let mut s = frosted(button(base));
     s.margin = Sides::all(4.0);
     if active {
         s = button_active(s);
@@ -29,7 +28,7 @@ pub fn aside_button(base: &Style, active: bool, connecting: bool, focused: bool,
     if focused {
         s = focus_outline(s);
     }
-    if !sensitive {
+    if connecting {
         s.opacity = 0.35;
     }
     s
@@ -43,7 +42,7 @@ pub fn separator(base: &Style) -> Node {
 pub fn device_menu(m: DeviceMenu) -> Node {
     let base = m.base;
     let show_list = m.powered && !m.empty;
-    let mut power = aside_button(base, m.powered, false, m.focus == Some("power"), true);
+    let mut power = aside_button(base, m.powered, false, m.focus == Some("power"));
     if !m.powered {
         power.padding = Sides::all(32.0);
     }
@@ -52,12 +51,13 @@ pub fn device_menu(m: DeviceMenu) -> Node {
         .expand(true, false)
         .align(if m.powered { Align::Start } else { Align::Center }, Align::Fill)
         .focusable("power");
-    let scan = aside_button(base, m.scanning, false, m.focus == Some("scan"), m.scan_sensitive);
+    let scan = aside_button(base, m.scanning, false, m.focus == Some("scan"));
     let scan_btn = Node::hbox(scan.clone(), 0.0, vec![Node::icon(scan.inherit(), "view-refresh-symbolic", 16.0)]).show(m.powered).focusable("scan");
     // no top padding: the separator's 10px + the row's 4px margin mirror the header above it
     let list = Node::vbox(Style { padding: Sides::trbl(0.0, 0.0, 5.0, 0.0), ..base.inherit() }, 0.0, m.rows);
     // the 5px keeps the last row's focus outline inside the clip; it overlaps the card padding
     // so the bottom gap matches the top
     let scroll = Node::scroll(Style { margin: Sides::trbl(0.0, 0.0, -5.0, 0.0), ..base.inherit() }, 500.0, m.scroll, list).expand(true, true).show(show_list);
-    Node::vbox(base.inherit(), 0.0, vec![Node::hbox(base.inherit(), 0.0, vec![power_btn, scan_btn]), separator(base).show(show_list), scroll])
+    // full width whatever the rows hold, so the scan button sits at the right edge in both menus
+    Node::vbox(base.inherit(), 0.0, vec![Node::hbox(base.inherit(), 0.0, vec![power_btn, scan_btn]), separator(base).show(show_list), scroll]).expand(true, false)
 }

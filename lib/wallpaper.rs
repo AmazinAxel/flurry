@@ -15,7 +15,6 @@ use crate::ui::window::{Spec, Win};
 pub struct Wallpaper {
     pub path: String,
     pub shm: Rc<ShmImage>,
-    pub light: bool,
 }
 
 impl PartialEq for Wallpaper {
@@ -30,10 +29,6 @@ thread_local! {
 
 pub fn current() -> State<Option<Wallpaper>> {
     CURRENT.with(Clone::clone)
-}
-
-pub fn light() -> bool {
-    current().with(|w| w.as_ref().is_some_and(|w| w.light))
 }
 
 fn list_files(dir: &str, out: &mut Vec<String>) {
@@ -63,13 +58,11 @@ fn pick() -> Option<String> {
 }
 
 /// Reads and decodes straight into shared memory; runs on a worker thread.
-fn decode(path: &str) -> Option<(ShmPixels, bool)> {
-    let pixels = image::decode_into(&std::fs::read(path).ok()?, |w, h, fill| {
+fn decode(path: &str) -> Option<ShmPixels> {
+    image::decode_into(&std::fs::read(path).ok()?, |w, h, fill| {
         let mut p = ShmPixels::new(w, h)?;
         fill(p.data()).then_some(p)
-    })?;
-    let light = image::is_light(pixels.pixmap());
-    Some((pixels, light))
+    })
 }
 
 /// Swaps in another random wallpaper (decoded on demand: a preloaded one would cost a second
@@ -78,8 +71,8 @@ pub fn random_wallpaper() {
     let Some(path) = pick() else { return };
     runtime::spawn(async move {
         let p = path.clone();
-        if let Some(Some((pixels, light))) = runtime::blocking(move || decode(&p)).await {
-            current().set(Some(Wallpaper { path, shm: ShmImage::from_pixels(pixels), light }));
+        if let Some(Some(pixels)) = runtime::blocking(move || decode(&p)).await {
+            current().set(Some(Wallpaper { path, shm: ShmImage::from_pixels(pixels) }));
         }
     });
 }

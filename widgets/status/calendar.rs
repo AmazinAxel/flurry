@@ -6,7 +6,7 @@ use xkbcommon::xkb::Keysym;
 
 use crate::lib::style::*;
 use crate::lib::time::format;
-use crate::ui::node::{Align, Background, Node, Shadow, Sides, Style, alpha, rgba};
+use crate::ui::node::{Align, Background, Node, Shadow, Sides, Style, alpha};
 use crate::ui::wayland::KeyEvent;
 
 thread_local! {
@@ -84,15 +84,12 @@ pub fn calendar(base: &Style) -> Node {
     let first = days_from_civil(y, m, 1);
     let start = first - weekday(first); // grid starts on the Sunday on or before the 1st
     let today = today();
-    let line = rgba(255, 255, 255, 0.12);
-
-    let mut cal = base.inherit().border(Sides::all(1.0), line);
-    cal.color = light1();
+    let mut cal = frosted(base.inherit());
     cal.min_width = 0.0;
     let cell = Style { padding: Sides::trbl(9.0, 7.0, 9.0, 7.0), ..cal.inherit() };
 
     // "October 2026", left-aligned
-    let mut header = cal.inherit().border(Sides::trbl(0.0, 0.0, 1.0, 0.0), line);
+    let mut header = cal.inherit();
     header.padding = Sides::vh(3.0, 10.0);
     header.min_height = 36.0;
     let title = Node::label(header.inherit(), day_format(first, "%B %Y")).xalign(0.0).expand(true, false).align(Align::Fill, Align::Center);
@@ -117,7 +114,6 @@ pub fn calendar(base: &Style) -> Node {
                     s.background = Background::Color(blue2());
                     s.box_shadow = vec![Shadow { inset: true, spread: 1.0, ..glow(0.0, blue1()) }, Shadow { spread: 3.0, ..glow(5.0, blue3()) }];
                     s.color = light1();
-                    s.opacity = 0.8;
                 }
                 Node::label(s, dd.to_string()).expand(true, false)
             })

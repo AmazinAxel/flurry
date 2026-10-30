@@ -284,7 +284,7 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
     for path in &list {
         let net = map.get(path).cloned().unwrap_or(WifiNet { ssid: String::new(), security: "open".into(), level: 0, known: false });
         let id = row_id(path);
-        let s = aside_button(base, *path == conn && *path != joining, *path == joining, focus == Some(id.as_str()), true);
+        let s = aside_button(base, *path == conn && *path != joining, *path == joining, focus == Some(id.as_str()));
         let icon = crate::widgets::status::modules::statusIcons::leak(&format!("network-wireless-signal-{}-symbolic", LEVELS[net.level]));
         rows.push(
             Node::hbox(s.clone(), 0.0, vec![Node::hbox(s.inherit(), 10.0, vec![
@@ -305,9 +305,7 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
     }
     let icon = if on { "network-wireless-symbolic" } else { "network-wireless-offline-symbolic" };
     let scanning = scanning().peek();
-    let mut menu = device_menu(DeviceMenu { base, powered: on, power_icon: icon, scanning, scan_sensitive: !scanning, empty: list.is_empty(), focus, scroll, rows });
-    menu.hexpand = true;
-    menu
+    device_menu(DeviceMenu { base, powered: on, power_icon: icon, scanning, empty: list.is_empty(), focus, scroll, rows })
 }
 
 pub fn on_focus(id: &str) {

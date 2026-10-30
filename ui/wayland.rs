@@ -1053,11 +1053,6 @@ impl ShmPixels {
     pub fn data(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
     }
-
-    pub fn pixmap(&self) -> tiny_skia::PixmapRef<'_> {
-        let data = unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) };
-        tiny_skia::PixmapRef::from_bytes(data, self.width, self.height).expect("sized at creation")
-    }
 }
 
 impl Drop for ShmPixels {

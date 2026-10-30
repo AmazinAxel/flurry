@@ -8,6 +8,7 @@ use xkbcommon::xkb::Keysym;
 use crate::ui::entry::{Entry, EntryRef};
 use crate::ui::node::{Node, Style};
 use crate::ui::wayland::{Anchor, KeyEvent, Keymode, Layer};
+use crate::ui::runtime;
 use crate::ui::window::{self, Dir, Spec, View, Win};
 
 pub type Action = Rc<dyn Fn()>;
@@ -51,13 +52,25 @@ pub fn modal(win: &Rc<Win>) {
     // own backdrop transparent: still fullscreen for input, content stays in its subsurface
     win.spec.borrow_mut().dim = Some([0.0; 4]);
     MODALS.with(|m| m.borrow_mut().push(name));
+    let weak = Rc::downgrade(win);
     win.on_show(move || {
-        for other in MODALS.with(|m| m.borrow().clone()) {
-            if other != name {
-                window::set_visible(other, false);
-            }
-        }
         BACKDROP.with(|b| b.show());
+        // the open one goes once this one's first frame is up, so switching never shows a gap;
+        // registered after show() has (re)mapped the surfaces, which then wait for a configure
+        let weak = weak.clone();
+        runtime::idle(move || {
+            let Some(w) = weak.upgrade() else { return };
+            w.after_commit(move || {
+                if !window::get(name).is_some_and(|w| w.visible()) {
+                    return;
+                }
+                for other in MODALS.with(|m| m.borrow().clone()) {
+                    if other != name {
+                        window::set_visible(other, false);
+                    }
+                }
+            });
+        });
     });
     win.visibility.subscribe(|| {
         if !MODALS.with(|m| m.borrow().iter().any(|n| window::get(n).is_some_and(|w| w.visible()))) {

@@ -159,7 +159,7 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
         .filter(|d| listed(d))
         .map(|d| {
             let id = row_id(d);
-            let s = aside_button(base, d.connected && !d.connecting, d.connecting, focus == Some(id.as_str()), !d.connecting);
+            let s = aside_button(base, d.connected && !d.connecting, d.connecting, focus == Some(id.as_str()));
             let battery = d.connected && d.battery >= 0.0;
             let icon = leak(&format!("{}-symbolic", d.icon));
             Node::hbox(s.clone(), 0.0, vec![
@@ -180,7 +180,6 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
         powered: b.powered(),
         power_icon: "bluetooth-active-symbolic",
         scanning: b.discovering(),
-        scan_sensitive: true,
         empty: none_listed,
         focus,
         scroll,

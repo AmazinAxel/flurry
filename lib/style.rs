@@ -73,6 +73,17 @@ pub fn button(base: &Style) -> Style {
     s
 }
 
+/// Frosted look for anything over the tinted wallpaper (menu buttons, calendar): white text on
+/// translucent black, no outline; blue marks the active/selected item.
+pub fn frosted(mut s: Style) -> Style {
+    s.background = Background::Color(alpha(dark1(), 0.6));
+    s.border = Sides::all(0.0);
+    s.color = light1();
+    s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6))];
+    s.icon_shadow = s.text_shadow.clone();
+    s
+}
+
 /// `button.active, .button.selected, list row:selected, ...`
 pub fn button_active(mut s: Style) -> Style {
     s.background = Background::Color(blue2());
@@ -87,40 +98,3 @@ pub fn focus_outline(mut s: Style) -> Style {
     s
 }
 
-/// GTK `shade(color, factor)`: lightness and saturation scaled in HLS.
-pub fn shade(c: Color, f: f32) -> Color {
-    let (r, g, b) = (c.red(), c.green(), c.blue());
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let mut l = (max + min) / 2.0;
-    let mut s = 0.0;
-    let mut h = 0.0;
-    if max != min {
-        let d = max - min;
-        s = if l <= 0.5 { d / (max + min) } else { d / (2.0 - max - min) };
-        h = if r == max { (g - b) / d } else if g == max { 2.0 + (b - r) / d } else { 4.0 + (r - g) / d } * 60.0;
-        if h < 0.0 {
-            h += 360.0;
-        }
-    }
-    l = (l * f).clamp(0.0, 1.0);
-    s = (s * f).clamp(0.0, 1.0);
-    let m2 = if l <= 0.5 { l * (1.0 + s) } else { l + s - l * s };
-    let m1 = 2.0 * l - m2;
-    let v = |mut hue: f32| {
-        hue = hue.rem_euclid(360.0);
-        if hue < 60.0 {
-            m1 + (m2 - m1) * hue / 60.0
-        } else if hue < 180.0 {
-            m2
-        } else if hue < 240.0 {
-            m1 + (m2 - m1) * (240.0 - hue) / 60.0
-        } else {
-            m1
-        }
-    };
-    if s == 0.0 {
-        return Color::from_rgba(l, l, l, c.alpha()).unwrap_or(c);
-    }
-    Color::from_rgba(v(h + 120.0), v(h), v(h - 120.0), c.alpha()).unwrap_or(c)
-}

@@ -72,7 +72,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             let name = node_name(sp);
             let is_sel = sel.contains(&name);
             let id = format!("sink:{name}");
-            let s = aside_button(base, is_sel, false, focus == Some(id.as_str()), true);
+            let s = aside_button(base, is_sel, false, focus == Some(id.as_str()));
             let mut check = s.inherit();
             check.margin = Sides::trbl(0.0, 7.0, 0.0, 0.0);
             Node::hbox(s.clone(), 0.0, vec![
