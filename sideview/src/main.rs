@@ -72,10 +72,15 @@ struct Frame {
     dirty: Cell<bool>,
     /// console messages addressed to us (\u{1} prefix): the claude page's channel out
     messages: RefCell<Vec<String>>,
+    /// the only page allowed to use that channel: any site can write to its console
+    claude_url: Option<url::Url>,
 }
 impl WebViewDelegate for Frame {
-    fn show_console_message(&self, _: WebView, _: ConsoleLogLevel, message: String) {
-        if let Some(m) = message.strip_prefix('\u{1}') {
+    fn show_console_message(&self, webview: WebView, _: ConsoleLogLevel, message: String) {
+        if let Some(m) = message.strip_prefix('\u{1}')
+            && self.claude_url.is_some()
+            && webview.url() == self.claude_url
+        {
             self.messages.borrow_mut().push(m.to_string());
         }
     }
@@ -93,13 +98,20 @@ impl WebViewDelegate for Frame {
     }
 }
 
+/// Web links only: pages must not be able to hand local files or other schemes to their handlers.
+fn open_external(url: &str) {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 struct Popup;
 impl WebViewDelegate for Popup {
     fn request_navigation(&self, _: WebView, nav: NavigationRequest) {
         let url = nav.url.to_string();
         nav.deny();
         if url != "about:blank" {
-            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+            open_external(&url);
             POPUPS.with(|p| p.borrow_mut().clear());
         }
     }
@@ -231,7 +243,7 @@ fn main() {
     let mut rendering: Option<Rc<WindowRenderingContext>> = None;
     let mut chat = claude::Chat::default();
     let mut claude_page: Option<String> = None;
-    let frame = Rc::new(Frame::default());
+    let frame = Rc::new(Frame { claude_url: claude::page_url(), ..Default::default() });
     let mut repeat_key: Option<(xkb::Keycode, Instant)> = None;
 
     let stdin_fd = 0;
@@ -504,7 +516,7 @@ fn main() {
                     }
                 }
             } else if let Some(url) = m.strip_prefix("open:") {
-                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                open_external(url);
             } else {
                 eprintln!("flurry-sideview: {m}"); // page errors (window.onerror)
             }

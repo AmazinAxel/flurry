@@ -92,7 +92,7 @@ pub fn toggle_focus() {
 }
 
 pub fn focus_menu() {
-    let e = entry::new("Task");
+    let e = entry::new("");
     e.borrow_mut().max_len = Some(60);
     let start = {
         let e = e.clone();
@@ -137,7 +137,7 @@ pub fn focus_task() -> Rc<Win> {
         l.margin = Sides::trbl(5.0, 0.0, 0.0, 0.0);
         l = l.border(Sides::trbl(0.0, 3.0, 3.0, 3.0), blue3());
         l.font.size = 32.0;
-        l.font.family = HAMMERSMITH;
+        l.font.weight = 700;
         l.padding = Sides::vh(3.0, 6.0);
         l.background = Background::Color(dark1());
         let wait = break_wait().peek();

@@ -43,13 +43,15 @@ thread_local! {
     static HAS_BATTERY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-pub fn status(base: &Style) -> Node {
-    let img = |name: &'static str| {
-        let mut s = base.inherit();
-        s.color = light1();
-        s.icon_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(12.0, alpha(blue2(), 0.8))];
-        Node::icon(s, name, 36.0)
-    };
+fn img(base: &Style, name: &'static str) -> Node {
+    let mut s = base.inherit();
+    s.color = light1();
+    s.icon_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(12.0, alpha(blue2(), 0.8))];
+    Node::icon(s, name, 36.0)
+}
+
+/// Battery icon with the percentage over it; hidden without a battery.
+pub fn battery_icon(base: &Style) -> Node {
     let b = battery().peek();
     // visible={Boolean(battery.percentage)}: decided once, as soon as UPower has answered
     let has = HAS_BATTERY.with(|h| match h.get() {
@@ -62,7 +64,7 @@ pub fn status(base: &Style) -> Node {
     });
     let pct = (b.percentage * 100.0).round() as i64;
     let low = pct < 99;
-    let mut bat_icon = img(if b.icon.is_empty() { "battery-missing-symbolic" } else { leak(&b.icon) });
+    let mut bat_icon = img(base, if b.icon.is_empty() { "battery-missing-symbolic" } else { leak(&b.icon) });
     if low {
         bat_icon.style.opacity = 0.4;
     }
@@ -70,8 +72,10 @@ pub fn status(base: &Style) -> Node {
     pct_style.font.size = 24.0;
     pct_style.font.weight = 700;
     pct_style.color = if b.charging() { green() } else { blue2() };
-    let battery_node = Node::overlay(base.inherit(), vec![bat_icon, Node::label(pct_style, pct.to_string()).show(low)]).show(has);
+    Node::overlay(base.inherit(), vec![bat_icon, Node::label(pct_style, pct.to_string()).show(low)]).show(has)
+}
 
+pub fn status(base: &Style) -> Node {
     let mut rec = base.inherit();
     rec.color = red();
     rec.icon_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(12.0, red())];
@@ -79,10 +83,10 @@ pub fn status(base: &Style) -> Node {
     // one evenly spaced column, centered on the row whatever is shown
     Node::vbox(base.inherit(), 10.0, vec![
         Node::icon(rec, "media-record-symbolic", 36.0).show(crate::widgets::record::service::is_rec().peek()),
-        battery_node,
-        img(network_icon().peek()),
-        img("bluetooth-active-symbolic").show(bt().with(|b| b.powered())),
-        img("notifications-disabled-symbolic").show(streaming_mode().peek()),
+        battery_icon(base),
+        img(base, network_icon().peek()),
+        img(base, "bluetooth-active-symbolic").show(bt().with(|b| b.powered())),
+        img(base, "notifications-disabled-symbolic").show(streaming_mode().peek()),
     ])
     .align(Align::Center, Align::Center)
 }

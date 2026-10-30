@@ -1157,15 +1157,16 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
         pm.fill_rect(area, &Paint { shader, anti_alias: false, ..Default::default() }, ts, None);
         return;
     }
-    // GTK `filter: blur()` blurs the rendered node; edges fade out over the radius.
+    // Blurred with the image continuing past the box, then cut to it: hard edges, nothing fades or bleeds out.
     // The result only depends on the image and the device rect, so it is cached.
     let dev = c.transform(ts).unwrap_or(c);
     let pad = (radius * ts.sx * 1.5).ceil();
     let (ox, oy) = (dev.left().floor() - pad, dev.top().floor() - pad);
-    let key = (img.key(), dev.width().to_bits(), dev.height().to_bits(), (dev.left() - dev.left().floor()).to_bits(), radius.to_bits());
+    let (x0, y0) = (dev.left().round(), dev.top().round());
+    let key = (img.key(), dev.width().to_bits(), dev.height().to_bits(), (dev.left() - dev.left().floor()).to_bits(), (dev.top() - dev.top().floor()).to_bits(), radius.to_bits());
     // one entry per window header: a single slot made every window switch re-blur the wallpaper (~60ms)
     thread_local! {
-        static BLURRED: std::cell::RefCell<Vec<((usize, u32, u32, u32, u32), Rc<Pixmap>)>> = const { std::cell::RefCell::new(Vec::new()) };
+        static BLURRED: std::cell::RefCell<Vec<((usize, u32, u32, u32, u32, u32), Rc<Pixmap>)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let cached = BLURRED.with(|b| b.borrow().iter().find(|(k, _)| *k == key).map(|(_, p)| p.clone()));
     let layer = match cached {
@@ -1174,13 +1175,14 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
             let Some(mut layer) = Pixmap::new((dev.width() + pad * 2.0).ceil() as u32 + 1, (dev.height() + pad * 2.0).ceil() as u32 + 1) else {
                 return;
             };
-            let mut clip = tiny_skia::Mask::new(layer.width(), layer.height()).unwrap();
-            clip.fill_path(&PathBuilder::from_rect(c), FillRule::Winding, false, ts.post_translate(-ox, -oy));
             // about to be blurred: bilinear is indistinguishable and much cheaper than bicubic
-            let smooth = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..paint };
-            layer.draw_pixmap(0, 0, pix, &smooth, t.post_translate(-ox, -oy), Some(&clip));
+            let shader = tiny_skia::Pattern::new(pix, tiny_skia::SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, 1.0, t.post_translate(-ox, -oy));
+            let whole = Rect::from_xywh(0.0, 0.0, layer.width() as f32, layer.height() as f32).unwrap();
+            layer.fill_rect(whole, &Paint { shader, anti_alias: false, ..Default::default() }, Transform::identity(), None);
             blur(&mut layer, radius * ts.sx);
-            let l = Rc::new(layer);
+            let (cw, ch) = ((dev.right().round() - x0).max(1.0) as u32, (dev.bottom().round() - y0).max(1.0) as u32);
+            let Some(cut) = tiny_skia::IntRect::from_xywh((x0 - ox) as i32, (y0 - oy) as i32, cw, ch).and_then(|i| layer.clone_rect(i)) else { return };
+            let l = Rc::new(cut);
             BLURRED.with(|b| {
                 let mut b = b.borrow_mut();
                 b.retain(|(k, _)| k.0 == key.0); // a new wallpaper drops the old one's blurs
@@ -1192,7 +1194,7 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
             l
         }
     };
-    blit(pm, Pixmap::as_ref(&layer), ox as i32, oy as i32, 1.0);
+    blit(pm, Pixmap::as_ref(&layer), x0 as i32, y0 as i32, 1.0);
 }
 
 /// rgba from 0-255 channels and 0-1 alpha.

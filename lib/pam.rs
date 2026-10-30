@@ -112,6 +112,10 @@ pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(E
             ret = unsafe { pam_authenticate(h, 0) };
             unsafe { pam_end(h, ret) };
         }
+        if let Some(p) = data.password.take().and_then(|p| p.into_string().ok()) {
+            let mut p = p;
+            crate::ui::entry::wipe(&mut p);
+        }
         let mut out = data.out;
         report(&mut out, 0, if ret == 0 { "1" } else { "0" });
     });

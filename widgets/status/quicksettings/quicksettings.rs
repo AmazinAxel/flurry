@@ -8,7 +8,7 @@ use crate::lib::audio;
 use crate::lib::brightness::{self, brightness, set_brightness};
 use crate::lib::deviceMenu::{aside_button, separator};
 use crate::lib::style::*;
-use crate::ui::node::{Align, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash};
+use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash, rgba};
 use crate::widgets::status::quicksettings::sound::{self, apply_selection, name_substitute, node_name, selected};
 use crate::widgets::status::status::volume_icon;
 
@@ -72,7 +72,10 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             let name = node_name(sp);
             let is_sel = sel.contains(&name);
             let id = format!("sink:{name}");
-            let s = aside_button(base, is_sel, false, focus == Some(id.as_str()));
+            let mut s = aside_button(base, is_sel, false, focus == Some(id.as_str()));
+            if !is_sel {
+                s.background = Background::Color(rgba(255, 255, 255, 0.08));
+            }
             let mut check = s.inherit();
             check.margin = Sides::trbl(0.0, 7.0, 0.0, 0.0);
             Node::hbox(s.clone(), 0.0, vec![

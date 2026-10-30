@@ -81,7 +81,6 @@ pub fn strip_login(line: &str) -> String {
 pub fn pass() {
     load_entries();
     search_dialog("pass", SearchSpec {
-        placeholder: "Passwords",
         search: Box::new(search),
         activate: Rc::new(|n: &String| copy_pair(n)),
         shift_activate: None,

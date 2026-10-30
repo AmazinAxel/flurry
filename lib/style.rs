@@ -34,7 +34,6 @@ pub fn font(family: &'static str, size: f32) -> Font {
 }
 
 pub const SORA: &str = "Sora";
-pub const HAMMERSMITH: &str = "Hammersmith One";
 pub const IOSEVKA: &str = "Iosevka Nerd Font Mono";
 
 /// `window`: Sora 16px, @light1, text/icon shadow.
@@ -66,6 +65,7 @@ pub fn button(base: &Style) -> Style {
         padding: Sides::vh(6.0, 10.0),
         min_height: 24.0,
         min_width: 16.0,
+        box_shadow: vec![shadow(0.0, 2.0, 5.0, rgba(0, 0, 0, 0.6))],
         ..base.inherit()
     }
     .border(Sides::all(1.0), dark4());
@@ -87,7 +87,6 @@ pub fn frosted(mut s: Style) -> Style {
 /// `button.active, .button.selected, list row:selected, ...`
 pub fn button_active(mut s: Style) -> Style {
     s.background = Background::Color(blue3());
-    s.box_shadow = vec![];
     s.border_color = [blue3(); 4];
     s
 }

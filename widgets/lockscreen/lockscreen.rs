@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
 
+use crate::lib::battery::battery;
 use crate::lib::logind::{self, inhibit_sleep, release_sleep, sleeping};
 use crate::lib::pam;
 use crate::lib::state::State;
@@ -14,10 +15,11 @@ use crate::lib::sway;
 use crate::lib::time::{format_now, now};
 use crate::lib::wallpaper;
 use crate::ui::entry::{self, Entry, EntryRef};
-use crate::ui::node::{Align, Background, Kind, LabelSpec, Node, Shadow, Sides, Style, alpha, rgba, shadow};
+use crate::ui::node::{Align, Background, Kind, LabelSpec, Node, Shadow, Sides, Style, alpha, hash, rgba, shadow};
 use crate::ui::runtime::{self, Timer};
 use crate::ui::wayland::{self, KeyEvent, Keymode, LockEvent, Surface};
 use crate::ui::window;
+use crate::widgets::status::modules::statusIcons::battery_icon;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Failed {
@@ -33,6 +35,7 @@ thread_local! {
         let e = entry::new("");
         e.borrow_mut().password = true;
         e.borrow_mut().invisible_char = None;
+        e.borrow_mut().text.reserve(256); // typing never reallocates, leaving copies behind
         e
     };
     static SURFACES: RefCell<Vec<(String, Surface)>> = const { RefCell::new(Vec::new()) };
@@ -67,7 +70,8 @@ fn check_login() {
     if BUSY.with(|b| b.replace(true)) {
         return;
     }
-    let password = entry().borrow().text.clone();
+    // moved, not copied: pam wipes it when done
+    let password = std::mem::replace(&mut entry().borrow_mut().text, String::with_capacity(256));
     entry().borrow_mut().set_text("");
     pam::authenticate("flurry-auth", Some(password), |ev| {
         let pam::Event::Done(ok) = ev else { return };
@@ -120,9 +124,9 @@ fn handle_keys(ev: &KeyEvent) {
         check_login();
         return;
     }
-    let before = entry().borrow().text.clone();
+    let before = hash(&entry().borrow().text);
     Entry::key(&entry(), ev);
-    if entry().borrow().text != before {
+    if hash(&entry().borrow().text) != before {
         auth_failed().set(Failed::None);
     }
 }
@@ -157,7 +161,9 @@ fn build(_w: f32, _h: f32) -> Node {
     if let Kind::Label(LabelSpec { line_height, .. }) = &mut clock.kind {
         *line_height = Some(0.75);
     }
-    Node::overlay(base.inherit(), vec![clock])
+    let mut bat = battery_icon(&base).align(Align::Start, Align::End);
+    bat.style.margin = Sides::all(24.0);
+    Node::overlay(base.inherit(), vec![clock, bat])
 }
 
 fn assign_lock_window(output: &wayland::Output) {
@@ -200,6 +206,9 @@ fn on_lock_event(ev: LockEvent) {
             if locked().peek() {
                 locked().set(false);
             }
+            if let Some(w) = window::get("focusMenu") {
+                w.set_keymode(Keymode::Exclusive);
+            }
             DISPLAY_OFF_ON_LOCK.with(|d| d.set(false));
             AFTER_LOCK.with(|a| a.borrow_mut().take());
             if sleeping().peek() {
@@ -239,19 +248,12 @@ fn unlock_screen() {
 }
 
 fn prepare_unlock() {
-    let win = window::get("focusMenu");
-    if let Some(w) = &win {
+    // the focus menu is what unlocking uncovers, already up and redrawn for the new wallpaper
+    if let Some(w) = window::get("focusMenu") {
         w.set_keymode(Keymode::None);
+        w.show();
     }
     wallpaper::random_wallpaper();
-    let Some(w) = win else { return };
-    if !is_locked() {
-        w.set_keymode(Keymode::Exclusive);
-    }
-    w.remap();
-    if let Some(wp) = window::get("wallpaper") {
-        wp.remap();
-    }
 }
 
 struct Fprint {
@@ -313,6 +315,11 @@ pub fn start() {
     }
     auth_failed().subscribe(redraw);
     now().subscribe(|| {
+        if locked().peek() {
+            redraw();
+        }
+    });
+    battery().subscribe(|| {
         if locked().peek() {
             redraw();
         }

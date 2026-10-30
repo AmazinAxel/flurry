@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
 
-use crate::lib::backgroundSection::{background_section, header_style};
-use crate::lib::clipboard::{copy, copy_login, pipe};
+use crate::lib::backgroundSection::background_section;
+use crate::lib::clipboard::{copy_login, copy_sensitive, pipe};
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::process::exec_str;
 use crate::lib::searchDialog::plain_entry;
@@ -57,7 +57,7 @@ pub fn pass_save() {
             let p = random_password(20);
             pass.borrow_mut().set_text(&p);
             GENERATED.with(|g| g.set(true));
-            copy(&p);
+            runtime::spawn(async move { copy_sensitive(&p).await });
         })
     };
 
@@ -100,7 +100,7 @@ pub fn pass_save() {
                     Node::icon(icon, "dialog-password-symbolic", 16.0).align(Align::Fill, Align::Center),
                 ]),
             ]);
-            let header = Node::label(header_style(&base), "Password");
+            let header = Node::hbox(base.inherit(), 0.0, vec![]);
             Node::hbox(base.inherit(), 0.0, vec![background_section(&base, header, Some(content), 300.0, 400.0)]).align(Align::Center, Align::Center)
         }
     };

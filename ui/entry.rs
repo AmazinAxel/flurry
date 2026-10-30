@@ -60,9 +60,22 @@ fn next_word(s: &str, i: usize) -> usize {
     j
 }
 
+/// Zeroes a secret before its memory is freed; empties the string.
+pub fn wipe(s: &mut String) {
+    for b in unsafe { s.as_bytes_mut() } {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    s.clear();
+}
+
 impl Entry {
     pub fn set_text(&mut self, t: &str) {
-        self.text = t.into();
+        if self.password {
+            wipe(&mut self.text); // and keep the buffer: no reallocation copies while typing
+            self.text.push_str(t);
+        } else {
+            self.text = t.into();
+        }
         self.cursor = self.text.len();
         self.anchor = self.cursor;
         self.changed();

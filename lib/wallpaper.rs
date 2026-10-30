@@ -2,6 +2,7 @@
 // buffer: every monitor's background surface shows it, and BackgroundSection headers and the
 // lockscreen draw from the same memory.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::lib::state::State;
@@ -25,6 +26,9 @@ impl PartialEq for Wallpaper {
 
 thread_local! {
     static CURRENT: State<Option<Wallpaper>> = State::new(None);
+    static NEXT: RefCell<Option<Wallpaper>> = const { RefCell::new(None) };
+    static LOADING: Cell<bool> = const { Cell::new(false) };
+    static SHOW_NEXT: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn current() -> State<Option<Wallpaper>> {
@@ -65,14 +69,43 @@ fn decode(path: &str) -> Option<ShmPixels> {
     })
 }
 
-/// Swaps in another random wallpaper (decoded on demand: a preloaded one would cost a second
-/// full-size image in memory all the time). The decode never blocks the loop (lock, unlock, startup).
+/// Swaps in another random wallpaper at once: the next one is always decoded ahead of time, which
+/// costs a second full-size image in memory. Decodes never block the loop (lock, unlock, startup).
 pub fn random_wallpaper() {
-    let Some(path) = pick() else { return };
+    match NEXT.with(|n| n.borrow_mut().take()) {
+        Some(next) => {
+            current().set(Some(next));
+            preload();
+        }
+        None => {
+            // nothing ready (startup, or switching faster than decoding): show it when it is
+            SHOW_NEXT.with(|s| s.set(true));
+            preload();
+        }
+    }
+}
+
+fn preload() {
+    if LOADING.with(|l| l.replace(true)) {
+        return;
+    }
+    let Some(path) = pick() else {
+        LOADING.with(|l| l.set(false));
+        SHOW_NEXT.with(|s| s.set(false));
+        return;
+    };
     runtime::spawn(async move {
         let p = path.clone();
-        if let Some(Some(pixels)) = runtime::blocking(move || decode(&p)).await {
-            current().set(Some(Wallpaper { path, shm: ShmImage::from_pixels(pixels) }));
+        let pixels = runtime::blocking(move || decode(&p)).await.flatten();
+        LOADING.with(|l| l.set(false));
+        let show = SHOW_NEXT.with(|s| s.replace(false));
+        let Some(pixels) = pixels else { return };
+        let w = Wallpaper { path, shm: ShmImage::from_pixels(pixels) };
+        if show {
+            current().set(Some(w));
+            preload();
+        } else {
+            NEXT.with(|n| *n.borrow_mut() = Some(w));
         }
     });
 }

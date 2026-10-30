@@ -8,6 +8,7 @@ use tiny_skia::Pixmap;
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::backgroundSection::background_section;
+use crate::lib::clipboard::{is_sensitive, keep_sensitive, set_sensitive};
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::process::exec;
 use crate::lib::searchDialog::search_entry;
@@ -18,12 +19,16 @@ use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, rgba};
 use crate::ui::{image, runtime, window};
 use crate::widgets::clipboard::compress::open_compress;
 
-pub const TMP_DIR: &str = "/tmp/flurry";
 const MAX_W: f32 = 380.0;
 const MAX_H: f32 = 150.0;
 
+/// Decoded clipboard files and compress output: the runtime dir is private to this user.
+pub fn tmp_dir() -> String {
+    format!("{}/flurry", crate::lib::xdg::runtime_dir())
+}
+
 pub fn cache_dir() -> String {
-    format!("{TMP_DIR}/cliphist")
+    format!("{}/cliphist", tmp_dir())
 }
 
 #[derive(Clone)]
@@ -61,6 +66,10 @@ pub fn binary_data(content: &str) -> Option<(String, String, String)> {
     let end = rest.find(" ]]")?;
     let parts: Vec<&str> = rest[..end].split(' ').collect();
     if parts.len() != 4 || !["B", "KiB", "MiB", "GiB"].contains(&parts[1]) || !parts[0].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // copied text can look like this too, and the extension ends up in a path and a shell command
+    if parts[2].is_empty() || !parts[2].chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
     let (w, h) = parts[3].split_once('x')?;
@@ -165,7 +174,7 @@ fn request_thumbs() {
     if streaming_mode().peek() {
         return;
     }
-    let media: Vec<Item> = ITEMS.with(|i| i.borrow().iter().filter(|x| x.image.is_some() || x.video).cloned().collect());
+    let media: Vec<Item> = ITEMS.with(|i| i.borrow().iter().filter(|x| (x.image.is_some() || x.video) && !is_sensitive(x.id)).cloned().collect());
     for item in &media {
         request_thumb(item);
     }
@@ -182,6 +191,9 @@ fn describe(item: &Item) -> String {
 }
 
 fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
+    if is_sensitive(item.id) {
+        return Some(Node::label(row.inherit(), "[ Sensitive ]").xalign(0.0));
+    }
     if streaming_mode().peek() {
         return Some(Node::label(row.inherit(), describe(item)).xalign(0.0));
     }
@@ -221,8 +233,8 @@ fn visible_rows() -> Vec<Item> {
         ITEMS.with(|i| {
             i.borrow()
                 .iter()
-                .filter(|i| streaming || (i.image.is_none() && !i.video) || !matches!(t.get(&i.id), Some(Thumb::Loading) | None))
-                .filter(|i| q.is_empty() || i.search.contains(&q))
+                .filter(|i| streaming || (i.image.is_none() && !i.video) || is_sensitive(i.id) || !matches!(t.get(&i.id), Some(Thumb::Loading) | None))
+                .filter(|i| q.is_empty() || (!is_sensitive(i.id) && i.search.contains(&q)))
                 .cloned()
                 .collect()
         })
@@ -262,7 +274,8 @@ fn hide() {
 
 fn activate(item: &Item) {
     hide();
-    let cmd = format!("cliphist decode {} | wl-copy -t {} 2>/dev/null", item.id, item.mime);
+    let hint = if is_sensitive(item.id) { "--sensitive " } else { "" };
+    let cmd = format!("cliphist decode {} | wl-copy {hint}-t {} 2>/dev/null", item.id, item.mime);
     runtime::spawn(async move {
         let _ = exec(&["bash", "-c", &cmd]).await;
     });
@@ -279,6 +292,7 @@ async fn refresh_items() {
                 (!id.is_empty() && !content.is_empty()).then(|| Some((id.parse().ok()?, content.to_string()))).flatten()
             })
             .collect();
+        keep_sensitive(&entries.iter().map(|(id, _)| *id).collect::<Vec<_>>());
         let stale: Vec<u64> = ITEMS.with(|i| {
             let mut items = i.borrow_mut();
             for (id, content) in &entries {
@@ -478,7 +492,14 @@ pub fn clipboard() {
             ctrl(Keysym::g, || with_file(None, |f, _| spawn_exec(vec!["gthumb".into(), f]))),
             ctrl(Keysym::m, || with_file(Some(is_video), |f, id| open_compress(&f, id))),
             ctrl(Keysym::n, || with_file(None, |f, _| show_in_file_manager(&f))),
+            ctrl(Keysym::s, || {
+                if let Some(i) = selected_item() {
+                    set_sensitive(i.id, !is_sensitive(i.id));
+                    request_thumbs();
+                }
+            }),
             ctrl(Keysym::w, || {
+                keep_sensitive(&[]);
                 let cmd = format!("cliphist wipe && rm -rf {0}/* && mkdir -p {0}", cache_dir());
                 spawn_exec(vec!["bash".into(), "-c".into(), cmd]);
                 hide();
@@ -502,7 +523,10 @@ mod tests {
     #[test]
     fn parses_cliphist_entries() {
         assert_eq!(binary_data("[[ binary data 12 KiB png 1920x1080 ]]"), Some(("png".into(), "1920".into(), "1080".into())));
-        assert_eq!(entry_path(7, "[[ binary data 1 B jpeg 1x1 ]]").as_deref(), Some("/tmp/flurry/cliphist/7.jpeg"));
+        assert_eq!(entry_path(7, "[[ binary data 1 B jpeg 1x1 ]]"), Some(format!("{}/7.jpeg", cache_dir())));
+        // copied text posing as a binary entry never reaches a path or the shell
+        assert_eq!(binary_data("[[ binary data 1 B png;$(id) 1x1 ]]"), None);
+        assert_eq!(binary_data("[[ binary data 1 B ../x 1x1 ]]"), None);
         assert_eq!(entry_path(1, "file:///home/a/x%20y.mp4").as_deref(), Some("/home/a/x y.mp4"));
         assert_eq!(entry_path(1, "/tmp/a b"), None);
         assert_eq!(entry_path(1, "hello"), None);

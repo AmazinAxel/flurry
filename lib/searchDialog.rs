@@ -13,7 +13,6 @@ use crate::ui::node::{Align, Background, Node, Sides, Style, rgba};
 use crate::ui::window::{self, Win};
 
 pub struct SearchSpec<T> {
-    pub placeholder: &'static str,
     pub search: Box<dyn Fn(&str) -> Vec<T>>,
     pub activate: Rc<dyn Fn(&T)>,
     pub shift_activate: Option<Rc<dyn Fn(&T)>>,
@@ -74,7 +73,7 @@ pub fn row_style(base: &Style, selected: bool, sensitive: bool) -> Style {
 }
 
 pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>) -> Rc<Win> {
-    let entry = entry::new(spec.placeholder);
+    let entry = entry::new("");
     let items: Rc<RefCell<Vec<T>>> = Rc::default();
     let selected: Rc<RefCell<Option<usize>>> = Rc::default();
     let spec = Rc::new(spec);

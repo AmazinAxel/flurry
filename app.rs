@@ -137,7 +137,7 @@ fn main() {
     // big temporaries (paint layers, decodes) straight from/back to the kernel: glibc's adaptive
     // threshold otherwise moves them onto the heap after the first free, where they stay resident
     unsafe {
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 4 << 20);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20); // blur buffers are ~3MB per card header
     }
     if !ui::wayland::connect() {
         eprintln!("flurry: cannot connect to the Wayland display");

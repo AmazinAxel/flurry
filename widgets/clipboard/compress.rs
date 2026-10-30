@@ -15,7 +15,7 @@ use crate::ui::node::{Align, Node, Style, TRANSPARENT};
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{self, Spec, Win};
 use crate::ui::runtime;
-use crate::widgets::clipboard::clipboard::TMP_DIR;
+use crate::widgets::clipboard::clipboard::tmp_dir;
 use crate::widgets::focus::levelbar;
 
 const TARGETS: [u32; 5] = [10, 20, 50, 100, 500]; // MB
@@ -76,7 +76,7 @@ fn compress() {
         Some(i) => file[..i].to_string(),
         None => file,
     };
-    let out = format!("{TMP_DIR}/{}.mp4", if base == id.to_string() { base } else { format!("{base}_{id}") });
+    let out = format!("{}/{}.mp4", tmp_dir(), if base == id.to_string() { base } else { format!("{base}_{id}") });
     runtime::spawn(async move {
         let result: Result<(), String> = async {
             let d = exec(&["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", &source]).await?;

@@ -49,7 +49,6 @@ fn break_launch(a: &App) {
 
 pub fn launcher() {
     search_dialog("launcher", SearchSpec {
-        placeholder: "Search",
         search: Box::new(|text| if text.is_empty() { vec![] } else { fuzzy_query(text).into_iter().take(5).collect() }),
         activate: Rc::new(launch_app),
         shift_activate: Some(Rc::new(break_launch)),

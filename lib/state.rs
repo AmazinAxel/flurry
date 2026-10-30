@@ -1,4 +1,4 @@
-// Reactive state, the createState/peek/subscribe model from gnim.
+// Reactive state: create, peek, subscribe.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

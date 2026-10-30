@@ -164,14 +164,6 @@ impl Win {
         self.set_visible(false);
     }
 
-    /// Hide + show: recreates the surfaces (lockscreen's prepareUnlock).
-    pub fn remap(self: &Rc<Self>) {
-        if self.visible() {
-            self.surfaces.borrow_mut().clear();
-            self.sync_outputs();
-        }
-    }
-
     pub fn on_show(&self, f: impl Fn() + 'static) {
         self.on_show.borrow_mut().push(Rc::new(f));
     }
@@ -262,6 +254,21 @@ impl Win {
             Some((_, s)) => s.after_commit(f),
             None => super::runtime::idle(f),
         }
+    }
+
+    /// Runs `f` right after the first surface's next commit, ahead of the flush.
+    pub fn on_commit(&self, f: impl FnOnce() + 'static) {
+        if let Some((_, s)) = self.surfaces.borrow().first() {
+            s.on_commit(f);
+        }
+    }
+
+    /// Surfaces stay undrawn until `release`.
+    pub fn hold(&self) {
+        self.surfaces.borrow().iter().for_each(|(_, s)| s.hold());
+    }
+    pub fn release(&self) {
+        self.surfaces.borrow().iter().for_each(|(_, s)| s.release());
     }
 
     /// Steps `f` on every frame of each surface, re-rendering while it returns true.

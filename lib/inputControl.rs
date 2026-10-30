@@ -39,7 +39,7 @@ pub const DIM: [f32; 4] = [0.0, 0.0, 0.0, 0.3];
 
 thread_local! {
     static MODALS: RefCell<Vec<&'static str>> = RefCell::default();
-    // one dim for every modal, mapped before any of them (so stacked under) and kept while switching
+    // one dim for every modal, created before any of them (so stacked under) and kept while switching
     static BACKDROP: Rc<Win> = Win::new(
         Spec { name: "modalDim", anchor: Anchor::all(), dim: Some(DIM), input: false, ..Default::default() },
         |_| Node::hbox(Style::default(), 0.0, vec![]),
@@ -54,12 +54,23 @@ pub fn modal(win: &Rc<Win>) {
     MODALS.with(|m| m.borrow_mut().push(name));
     let weak = Rc::downgrade(win);
     win.on_show(move || {
-        BACKDROP.with(|b| b.show());
+        // the dim waits for this window's first frame: both go out in one flush, never the dim alone
+        let fresh = BACKDROP.with(|b| {
+            let fresh = !b.visible();
+            b.show();
+            if fresh {
+                b.hold();
+            }
+            fresh
+        });
         // the open one goes once this one's first frame is up, so switching never shows a gap;
         // registered after show() has (re)mapped the surfaces, which then wait for a configure
         let weak = weak.clone();
         runtime::idle(move || {
             let Some(w) = weak.upgrade() else { return };
+            if fresh {
+                w.on_commit(|| BACKDROP.with(|b| b.release()));
+            }
             w.after_commit(move || {
                 if !window::get(name).is_some_and(|w| w.visible()) {
                     return;

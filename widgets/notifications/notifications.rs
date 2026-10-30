@@ -13,7 +13,7 @@ use crate::ui::wayland::{Anchor, Layer};
 use crate::ui::window::{Spec, Win};
 use crate::widgets::focus::focus;
 
-const AGS_APPS: [&str; 6] = ["Low battery", "Focus", "Pass", "Compress", "Sync", "Cleanup"];
+const FLURRY_APPS: [&str; 6] = ["Low battery", "Focus", "Pass", "Compress", "Sync", "Cleanup"];
 
 thread_local! {
     /// shown notifications, oldest first (Map insertion order)
@@ -22,7 +22,7 @@ thread_local! {
 }
 
 fn hidden(n: &Notification) -> bool {
-    ((streaming_mode().peek() || focus()) && !AGS_APPS.contains(&n.app_name.as_str())) || n.body.starts_with("Failed to connect to server")
+    ((streaming_mode().peek() || focus()) && !FLURRY_APPS.contains(&n.app_name.as_str())) || n.body.starts_with("Failed to connect to server")
 }
 
 fn refresh() {
@@ -45,10 +45,12 @@ fn item(base: &Style, n: &Notification) -> Node {
     header.padding = Sides::all(8.0);
     header = header.border(Sides::trbl(0.0, 0.0, 3.0, 0.0), blue3());
     let mut app = header.inherit();
-    app.font.family = HAMMERSMITH;
+    app.font.family = IOSEVKA;
+    app.font.weight = 700;
     let mut summary = base.inherit();
     summary.font.size = 18.0;
-    summary.font.family = HAMMERSMITH;
+    summary.font.family = IOSEVKA;
+    summary.font.weight = 700;
     let mut kids = vec![];
     if !n.summary.trim().is_empty() {
         kids.push(Node::label(summary, n.summary.clone()).wrap(30.0).xalign(0.0).align(Align::Start, Align::Fill));

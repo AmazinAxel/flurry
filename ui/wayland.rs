@@ -438,6 +438,10 @@ pub struct Inner {
     after_render: RefCell<Option<Rc<dyn Fn(&Node)>>>,
     /// run once the next frame is committed and flushed
     committed: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// run right after the next frame's commit, so what they commit goes out in the same flush
+    on_commit: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// configured but not drawing until released (a backdrop waiting for what goes over it)
+    held: Cell<bool>,
     /// called each frame; the surface re-renders while it returns true
     animation: RefCell<Option<Rc<dyn Fn() -> bool>>>,
     image: RefCell<Option<Rc<ShmImage>>>,
@@ -643,6 +647,8 @@ impl Surface {
                 on_pointer: RefCell::default(),
                 after_render: RefCell::default(),
                 committed: RefCell::default(),
+                on_commit: RefCell::default(),
+                held: Cell::new(false),
                 animation: RefCell::default(),
                 image: RefCell::default(),
                 img_viewport: RefCell::default(),
@@ -687,6 +693,7 @@ impl Surface {
         s.stale.set(s.stale.get() + 1);
         ctx(|c| c.conn.display().sync(&c.qh, Unmapped(s.wl.id())));
         s.configured.set(false);
+        s.held.set(false);
         s.frame_pending.set(false);
         s.redraw_queued.set(false);
         s.animation.borrow_mut().take();
@@ -711,6 +718,19 @@ impl Surface {
     pub fn after_commit(&self, f: impl FnOnce() + 'static) {
         self.0.committed.borrow_mut().push(Box::new(f));
     }
+    /// Runs `f` right after this surface's next frame is committed, ahead of the flush.
+    pub fn on_commit(&self, f: impl FnOnce() + 'static) {
+        self.0.on_commit.borrow_mut().push(Box::new(f));
+    }
+    /// Keeps the surface from drawing until `release`.
+    pub fn hold(&self) {
+        self.0.held.set(true);
+    }
+    pub fn release(&self) {
+        if self.0.held.replace(false) {
+            self.0.render();
+        }
+    }
     /// Rebuilds and repaints on the next idle pass (coalesced).
     pub fn redraw(&self) {
         let s = self.0.clone();
@@ -725,7 +745,10 @@ impl Surface {
     pub fn set_keymode(&self, k: Keymode) {
         if let Role::Layer(l) = &*self.0.role.borrow() {
             l.set_keyboard_interactivity(k);
-            self.0.wl.commit();
+            // unmapped: a commit here would be an initial commit and map it; the remap's commit applies it
+            if self.0.configured.get() {
+                self.0.wl.commit();
+            }
         }
     }
     /// Shows a shared image (wallpaper) cover-cropped to the surface, without copying it.
@@ -818,7 +841,7 @@ impl Inner {
     }
 
     fn render(self: &Rc<Self>) {
-        if !self.alive() || !self.configured.get() {
+        if !self.alive() || !self.configured.get() || self.held.get() {
             return;
         }
         if self.frame_pending.get() {
@@ -921,6 +944,9 @@ impl Inner {
         target.commit();
         if target != self.wl {
             self.wl.commit();
+        }
+        for f in self.on_commit.take() {
+            f();
         }
         for f in self.committed.take() {
             runtime::after_flush(f);
@@ -1152,6 +1178,8 @@ pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn, image: Option<
             on_pointer: RefCell::default(),
             after_render: RefCell::default(),
             committed: RefCell::default(),
+            on_commit: RefCell::default(),
+            held: Cell::new(false),
             animation: RefCell::default(),
             image: RefCell::new(image),
             img_viewport: RefCell::default(),
