@@ -4,8 +4,7 @@ use crate::lib::iwd;
 use crate::lib::state::State;
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::style::*;
-use crate::ui::node::{Align, Node, Sides, Style};
-use crate::widgets::status::status::volume_icon;
+use crate::ui::node::{Align, Node, Style};
 
 thread_local! {
     static NETWORK_ICON: State<&'static str> = State::new("network-wireless-offline-symbolic");
@@ -49,7 +48,7 @@ pub fn status(base: &Style) -> Node {
         let mut s = base.inherit();
         s.color = light3();
         s.icon_shadow = vec![shadow_(), glow(12.0, light3())];
-        Node::icon(s, name, 14.0)
+        Node::icon(s, name, 26.0)
     };
     let b = battery().peek();
     // visible={Boolean(battery.percentage)}: decided once, as soon as UPower has answered
@@ -68,20 +67,18 @@ pub fn status(base: &Style) -> Node {
         bat_icon.style.opacity = 0.4;
     }
     let mut pct_style = base.inherit();
-    pct_style.font.size = 13.0;
+    pct_style.font.size = 20.0;
     pct_style.font.weight = 700;
     pct_style.color = if b.charging() { green() } else { blue2() };
     let battery_node = Node::overlay(base.inherit(), vec![bat_icon, Node::label(pct_style, pct.to_string()).show(low)]).show(has);
 
-    let s = Style { padding: Sides::trbl(8.0, 0.0, 14.0, 0.0), ..base.inherit() };
-    Node::vbox(s, 7.0, vec![
-        img(volume_icon()),
+    Node::vbox(base.inherit(), 14.0, vec![
         battery_node,
         img(network_icon().peek()),
         img("bluetooth-active-symbolic").show(bt().with(|b| b.powered())),
         img("notifications-disabled-symbolic").show(streaming_mode().peek()),
     ])
-    .align(Align::Fill, Align::Fill)
+    .align(Align::Center, Align::Center)
 }
 
 /// Icon names from UPower are dynamic; intern them for the 'static icon API.

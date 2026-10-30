@@ -1,23 +1,12 @@
-use std::rc::Rc;
+// Quickstatus menu: clock, status icons and date, the media block, then the quicksettings sliders and outputs.
 
 use crate::lib::audio;
-use crate::lib::mediaPlayer::{PLAYLISTS, is_playing, media_scroll, playlist_index};
-use crate::lib::scrollStep::scroll_step;
-use crate::lib::state::State;
+use crate::lib::mediaPlayer::{PLAYLISTS, is_playing, playlist_index, song};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Background, Node, Sides, Style};
-use crate::ui::wayland::{Anchor, PointerEvent};
-use crate::ui::window::{self, Spec, Win};
 use crate::widgets::record::record::recording_indicator;
-use crate::widgets::status::modules::{mpris::mpris, statusIcons::status, time::time};
-
-thread_local! {
-    static STATUS_MARGIN: State<f32> = State::new(0.0);
-}
-
-pub fn status_margin() -> State<f32> {
-    STATUS_MARGIN.with(Clone::clone)
-}
+use crate::widgets::status::modules::{mpris::track, statusIcons::status, time};
+use crate::widgets::status::quicksettings::quicksettings::quick_settings;
 
 pub fn volume_icon() -> &'static str {
     audio::default_speaker().map(|s| s.volume_icon()).unwrap_or("audio-volume-muted-symbolic")
@@ -34,62 +23,37 @@ fn playlist_color() -> tiny_skia::Color {
     }
 }
 
-fn build() -> Node {
-    let base = window();
+/// Play/pause on the left with the mpd song, or the MPRIS track while mpd is paused;
+/// just a centered button when there is neither.
+fn media(base: &Style) -> Node {
     let playlist = playlist_color();
-    let media_style = status_element(&base).border(Sides::all(3.0), shade(playlist, 1.1));
-    let btn = Style { padding: Sides::all(8.0), background: Background::Color(playlist), ..base.inherit() };
-    let play = if is_playing().peek() { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
-    let media = Node::vbox(media_style, 0.0, vec![
-        Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), play, 21.0).expand(true, false)]),
-        mpris(&base),
-    ])
-    .align(Align::Fill, Align::Fill)
-    .id("media");
-
-    let info = Node::vbox(status_element(&base), 0.0, vec![recording_indicator(&base), time(&base), status(&base)]).id("info");
-    Node::vbox(base.inherit(), 0.0, vec![media, info]).align(Align::Fill, Align::End)
-}
-
-pub fn status_window() -> Rc<Win> {
-    let w = Win::new(Spec { name: "status", anchor: Anchor::Bottom | Anchor::Left, ..Default::default() }, |_| build());
-    w.watch(&crate::lib::time::now());
-    w.watch(&is_playing());
-    w.watch(&playlist_index());
-    w.watch(&audio::speakers());
-    w.watch(&audio::default_name());
-    w.watch(&crate::lib::battery::battery());
-    w.watch(&crate::lib::bluetooth::bt());
-    w.watch(&crate::lib::streamingMode::streaming_mode());
-    w.watch(&crate::widgets::status::modules::statusIcons::network_icon());
-    w.watch(&crate::widgets::status::modules::mpris::players());
-    w.watch(&crate::widgets::record::service::is_rec());
-    w.on_pointer(|ev, _| {
-        let PointerEvent::Scroll { x, y, dy, wheel } = ev else { return };
-        let Some(win) = window::get("status") else { return };
-        // each block has its own scroll controller; the gaps between them scroll nothing
-        let (x, y) = (x as f32, y as f32);
-        let inside = |id: &str| win.rect_of(id).is_some_and(|r| x >= r.left() && x < r.right() && y >= r.top() && y < r.bottom());
-        if inside("media") {
-            media_scroll(dy, wheel);
-        } else if inside("info")
-            && let Some(s) = audio::default_speaker()
-        {
-            audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.006));
-        }
-    });
-    w
-}
-
-/// toggleInfoArea
-pub fn toggle_info_area() {
-    let Some(w) = window::get("status") else { return };
-    w.set_visible(!w.visible());
-    let width = if w.visible() {
-        let n = build();
-        n.measure_w().1 + n.style.margin.h()
-    } else {
-        0.0
+    let playing = is_playing().peek();
+    let mut bar = Style { background: Background::Color(playlist), margin: Sides::trbl(18.0, 0.0, 6.0, 0.0), ..base.inherit() };
+    bar = bar.border(Sides::all(3.0), shade(playlist, 1.1));
+    let mut btn = Style { padding: Sides::vh(12.0, 18.0), background: Background::Color(shade(playlist, 0.9)), ..base.inherit() };
+    let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
+    let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
+    let Some((title, artist)) = text else {
+        btn.background = Background::Color(playlist);
+        return Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 26.0)]).expand(true, false).align(Align::Center, Align::Fill).id("mediaBtn")])
+            .id("media");
     };
-    status_margin().set(width);
+    let mut t = base.inherit();
+    t.font.size = 19.0;
+    t.font.weight = 700;
+    let a = Style { font: font(SORA, 16.0), ..base.inherit() };
+    let info = Node::vbox(Style { padding: Sides::vh(8.0, 14.0), ..base.inherit() }, 2.0, vec![
+        Node::label(t, title).xalign(0.0).ellipsize(),
+        Node::label(a, artist.clone()).xalign(0.0).ellipsize().show(!artist.is_empty()),
+    ])
+    .expand(true, false)
+    .align(Align::Fill, Align::Center);
+    Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 26.0).align(Align::Center, Align::Center)]).id("mediaBtn"), info]).id("media")
+}
+
+pub fn quickstatus(base: &Style, focus: Option<&str>) -> Node {
+    let mut icons = Node::vbox(base.inherit(), 0.0, vec![recording_indicator(base), status(base)]).expand(true, false);
+    icons = icons.align(Align::Center, Align::Center);
+    let top = Node::hbox(base.inherit(), 0.0, vec![time::clock(base), icons, time::date(base)]);
+    Node::vbox(base.inherit(), 0.0, vec![top, media(base), quick_settings(base, focus)]).expand(true, false)
 }

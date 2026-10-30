@@ -1,18 +1,20 @@
-// Dimmed overlay with the open aside menu at the bottom-left (lib/asideStatusWindow.tsx).
+// Centered modal hosting the open status menu: quickstatus, bluetooth, wifi or calendar (lib/asideStatusWindow.tsx).
 
 use std::cell::Cell;
 use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
 
-use crate::lib::asideState::{close_aside_window, current};
-use crate::lib::inputControl::{DIM, wrap_focus};
+use crate::lib::menuState::{close_menu, current};
+use crate::lib::inputControl::{modal, wrap_focus};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Background, Node, Sides, Style};
 use crate::ui::wayland::{Anchor, Keymode, PointerEvent};
 use crate::ui::window::{Spec, Win};
-use crate::widgets::status::quicksettings::quicksettings::{self as qs, quick_settings, set_slider, slider_value};
-use crate::widgets::status::status::status_margin;
+use crate::lib::{audio, mediaPlayer};
+use crate::lib::scrollStep::scroll_step;
+use crate::widgets::status::quicksettings::quicksettings::{self as qs, set_slider, slider_value};
+use crate::widgets::status::status::quickstatus;
 use crate::widgets::status::{bluetooth, calendar, network};
 
 thread_local! {
@@ -21,7 +23,7 @@ thread_local! {
 
 fn content(base: &Style, name: &str, focus: Option<&str>) -> Node {
     match name {
-        "quickSettings" => quick_settings(base, focus),
+        "status" => quickstatus(base, focus),
         "bluetooth" => {
             if crate::lib::bluetooth::bt().with(|b| b.available) {
                 bluetooth::menu(base, focus, 0.0)
@@ -34,23 +36,28 @@ fn content(base: &Style, name: &str, focus: Option<&str>) -> Node {
     }
 }
 
-pub fn aside_status_window() -> Rc<Win> {
-    let spec = Spec { name: "asideStatus", anchor: Anchor::all(), keymode: Keymode::Exclusive, dim: Some(DIM), ..Default::default() };
+pub fn menu_window() -> Rc<Win> {
+    let spec = Spec { name: "menu", anchor: Anchor::all(), keymode: Keymode::Exclusive, ..Default::default() };
     let w = Win::new(spec, |v| {
         let base = window();
         let Some(name) = current().peek() else { return Node::hbox(base, 0.0, vec![]) };
         let mut s = base.inherit();
         s = s.border(Sides::all(3.0), blue3());
         s.background = Background::Color(dark2());
-        s.margin = Sides::all(5.0);
-        s.padding = Sides::all(13.0);
-        let menu = Node::hbox(base.inherit(), 0.0, vec![content(&base, name, v.focus.as_deref())]).size(300.0, 0.0);
-        let card = Node::hbox(s, 0.0, vec![menu]).align(Align::Start, Align::End);
-        let mut outer = Node::hbox(base.inherit(), 0.0, vec![card]);
-        outer.style.padding.left = status_margin().peek();
-        outer
+        s.padding = Sides::all(22.0);
+        let menu = Node::hbox(base.inherit(), 0.0, vec![content(&base, name, v.focus.as_deref())]).size(420.0, 0.0);
+        let card = Node::hbox(s, 0.0, vec![menu]).align(Align::Center, Align::Center).id("card");
+        Node::hbox(base.inherit(), 0.0, vec![card])
     });
 
+    modal(&w);
+    // hidden by another modal: forget the open menu
+    let ww = Rc::downgrade(&w);
+    w.visibility.subscribe(move || {
+        if ww.upgrade().is_some_and(|w| !w.visible()) {
+            close_menu();
+        }
+    });
     let ww = Rc::downgrade(&w);
     current().subscribe(move || {
         let Some(w) = ww.upgrade() else { return };
@@ -60,13 +67,12 @@ pub fn aside_status_window() -> Rc<Win> {
         }
         *w.focus.borrow_mut() = match open {
             Some("calendar") => Some("calendar".into()),
-            Some("quickSettings") => qs::first_sink(),
+            Some("status") => qs::first_sink(),
             _ => None,
         };
         w.set_visible(open.is_some());
         w.redraw();
     });
-    w.watch(&status_margin());
     w.watch(&crate::lib::audio::speakers());
     w.watch(&crate::lib::audio::default_name());
     w.watch(&crate::lib::brightness::brightness());
@@ -75,6 +81,14 @@ pub fn aside_status_window() -> Rc<Win> {
     w.watch(&bluetooth::order());
     w.watch(&bluetooth::sticky());
     w.watch(&crate::lib::time::now());
+    w.watch(&mediaPlayer::is_playing());
+    w.watch(&mediaPlayer::song());
+    w.watch(&mediaPlayer::playlist_index());
+    w.watch(&crate::lib::battery::battery());
+    w.watch(&crate::lib::streamingMode::streaming_mode());
+    w.watch(&crate::widgets::status::modules::statusIcons::network_icon());
+    w.watch(&crate::widgets::status::modules::mpris::track());
+    w.watch(&crate::widgets::record::service::is_rec());
     network::watch(&w);
 
     let ww = Rc::downgrade(&w);
@@ -89,7 +103,7 @@ pub fn aside_status_window() -> Rc<Win> {
             return done(&w);
         }
         if ev.sym == Keysym::Escape {
-            close_aside_window();
+            close_menu();
             return true;
         }
         let name = current().peek().unwrap_or("");
@@ -101,7 +115,7 @@ pub fn aside_status_window() -> Rc<Win> {
         }
         if matches!(ev.sym, Keysym::Return | Keysym::KP_Enter | Keysym::space) {
             match name {
-                "quickSettings" if matches!(ev.sym, Keysym::Return | Keysym::KP_Enter) => {
+                "status" if matches!(ev.sym, Keysym::Return | Keysym::KP_Enter) => {
                     qs::activate(&focus, ev.shift);
                 }
                 "bluetooth" => {
@@ -130,12 +144,15 @@ pub fn aside_status_window() -> Rc<Win> {
     let ww = Rc::downgrade(&w);
     w.on_pointer(move |ev, _| {
         let Some(w) = ww.upgrade() else { return };
+        let inside = |id: &str, x: f64, y: f64| w.rect_of(id).is_some_and(|r| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom());
         let hit = |x: f64, y: f64| {
             ["volume", "brightness"].into_iter().find_map(|id| w.rect_of(id).filter(|r| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom()).map(|r| (id, r)))
         };
         match ev {
             PointerEvent::Button { x, y, pressed: true } => {
-                if let Some((id, r)) = hit(x, y) {
+                if inside("mediaBtn", x, y) {
+                    mediaPlayer::play_pause();
+                } else if let Some((id, r)) = hit(x, y) {
                     DRAG.with(|d| d.set(Some(id)));
                     set_slider(id, slider_value(r, x as f32));
                 }
@@ -146,6 +163,16 @@ pub fn aside_status_window() -> Rc<Win> {
                     && let Some(r) = w.rect_of(id)
                 {
                     set_slider(id, slider_value(r, x as f32));
+                }
+            }
+            // quickstatus: the media block scrolls mpd's volume, the rest of the card the speaker's
+            PointerEvent::Scroll { x, y, dy, wheel } if current().peek() == Some("status") => {
+                if inside("media", x, y) {
+                    mediaPlayer::media_scroll(dy, wheel);
+                } else if inside("card", x, y)
+                    && let Some(s) = audio::default_speaker()
+                {
+                    audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.006));
                 }
             }
             _ => {}

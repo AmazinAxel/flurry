@@ -8,10 +8,10 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 use crate::config::sideview_url;
 use crate::lib::dbus::{self, SignalFilter, method, set_prop};
-use crate::lib::inputControl::{Opts, input_control};
+use crate::lib::inputControl::DIM;
 use crate::ui::node::{Node, Style};
-use crate::ui::wayland::{Keymode, Layer};
-use crate::ui::window;
+use crate::ui::wayland::{Anchor, Layer};
+use crate::ui::window::{self, Spec, Win};
 
 thread_local! {
     static HELPER: RefCell<Option<(Child, ChildStdin)>> = const { RefCell::new(None) };
@@ -145,7 +145,7 @@ fn read_scheme() {
 }
 
 pub fn sideview() {
-    input_control("sideviewDim", |_| Node::hbox(Style::default(), 0.0, vec![]), Opts { keymode: Some(Keymode::None), layer: Some(Layer::Top), ..Default::default() });
+    Win::new(Spec { name: "sideviewDim", layer: Layer::Top, anchor: Anchor::all(), dim: Some(DIM), ..Default::default() }, |_| Node::hbox(Style::default(), 0.0, vec![]));
     let Some(bus) = dbus::session() else { return };
     bus.subscribe(
         SignalFilter { interface: Some("org.freedesktop.portal.Settings".into()), member: Some("SettingChanged".into()), ..Default::default() },

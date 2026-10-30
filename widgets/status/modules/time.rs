@@ -1,32 +1,25 @@
 use crate::lib::style::*;
 use crate::lib::time::format_now;
-use crate::ui::node::{Align, Node, Sides, Style};
+use crate::ui::node::{Align, Node, Style};
 
-pub fn time(base: &Style) -> Node {
-    let mut wrap = base.inherit();
-    wrap.font.family = IOSEVKA;
-    wrap.padding = Sides::vh(10.0, 5.0);
-    let date = |text: String, bottom: bool, day: bool| {
-        let mut s = wrap.inherit();
-        s.color = blue2();
-        s.text_shadow = vec![shadow_(), glow(8.0, blue3())];
-        s.font.size = if day { 18.0 } else { 26.0 };
-        s.line_height = Some(if day { 22.0 } else { 26.0 });
-        s.margin = Sides::trbl(if day { 5.0 } else { 0.0 }, 0.0, if bottom { 9.0 } else { 0.0 }, 0.0);
-        Node::label(s, text)
-    };
-    let mut t = wrap.inherit();
-    t.font.size = 34.0;
-    t.font.weight = 700;
-    t.line_height = Some(35.0);
+fn text(base: &Style, s: String, size: f32, weight: u16) -> Node {
+    let mut t = base.inherit();
+    t.font.family = IOSEVKA;
+    t.font.size = size;
+    t.font.weight = weight;
+    t.line_height = Some(size);
     t.color = blue2();
-    t.text_shadow = vec![shadow_(), glow(5.0, blue3())];
-    Node::vbox(wrap.clone(), 0.0, vec![
-        date(format_now("%m"), false, false),
-        date(format_now("%d"), true, false),
-        Node::label(t, format_now("%H\n%M")),
-        date(format_now("%a"), false, true),
-    ])
-    .expand(true, false)
-    .align(Align::Fill, Align::Fill)
+    t.text_shadow = vec![shadow_(), glow(8.0, blue3())];
+    Node::label(t, s)
+}
+
+/// Hours over minutes.
+pub fn clock(base: &Style) -> Node {
+    Node::vbox(base.inherit(), 6.0, vec![text(base, format_now("%H"), 72.0, 700), text(base, format_now("%M"), 72.0, 700)]).align(Align::Start, Align::Center)
+}
+
+/// Month over day over weekday.
+pub fn date(base: &Style) -> Node {
+    Node::vbox(base.inherit(), 6.0, vec![text(base, format_now("%m"), 40.0, 400), text(base, format_now("%d"), 40.0, 400), text(base, format_now("%a"), 28.0, 400)])
+        .align(Align::End, Align::Center)
 }

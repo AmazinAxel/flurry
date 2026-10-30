@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use xkbcommon::xkb::Keysym;
 
-use crate::lib::asideState::{current, focus_aside};
+use crate::lib::menuState::{current, focus_menu};
 use crate::lib::dbus::{prop_bool, prop_str};
 use crate::lib::deviceMenu::{DeviceMenu, aside_button, device_menu};
 use crate::lib::iwd::{self, DEVICE, NETWORK, STATION};
@@ -109,8 +109,8 @@ fn focus_target() -> Option<String> {
     Some(list.first().map(|p| row_id(p)).unwrap_or_else(|| "scan".into()))
 }
 
-fn focus_menu() {
-    focus_aside("wifi", focus_target);
+fn refocus() {
+    focus_menu("wifi", focus_target);
 }
 
 fn queue_refresh() {
@@ -196,9 +196,9 @@ pub async fn refresh() {
     nets().set(next);
     if order != paths().peek() {
         paths().set(order);
-        let in_list = crate::ui::window::get("asideStatus").and_then(|w| w.focused()).is_some_and(|f| f.starts_with("wifi:"));
+        let in_list = crate::ui::window::get("menu").and_then(|w| w.focused()).is_some_and(|f| f.starts_with("wifi:"));
         if !in_list {
-            focus_menu();
+            refocus();
         }
     }
 }
@@ -265,7 +265,7 @@ pub fn start() {
             SHOW_ALL.with(|s| s.set(false));
             PASSWORD.with(|p| p.borrow_mut().take());
         } else {
-            focus_menu();
+            refocus();
         }
         queue_refresh();
     });
@@ -385,7 +385,7 @@ pub fn key(id: &str, ev: &KeyEvent) -> bool {
     if ev.sym == Keysym::Escape {
         let path = PASSWORD.with(|p| p.borrow().as_ref().map(|(p, _)| p.clone()));
         close_password();
-        if let (Some(p), Some(w)) = (path, crate::ui::window::get("asideStatus")) {
+        if let (Some(p), Some(w)) = (path, crate::ui::window::get("menu")) {
             w.grab_focus(&row_id(&p));
         }
         return true;

@@ -1,4 +1,4 @@
-pub mod asideState;
+pub mod menuState;
 pub mod audio;
 pub mod battery;
 pub mod brightness;
@@ -27,5 +27,5 @@ pub mod wallpaper;
 pub mod wrapFocus;
 pub mod notifySend;
 pub mod outTransition;
-pub mod asideStatusWindow;
+pub mod menuWindow;
 pub mod deviceMenu;

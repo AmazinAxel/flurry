@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 
-use lib::{asideState, mediaPlayer, streamingMode::streaming_mode, xdg};
+use lib::{menuState, mediaPlayer, streamingMode::streaming_mode, xdg};
 use ui::{runtime, window};
 use widgets::{clipboard, focus, lockscreen::lockscreen, notifications::notifications as notifs, record::service, sideview, status};
 
@@ -52,12 +52,11 @@ fn request(cmd: &str, arg: Option<&str>) {
             "prevPlaylist" => mediaPlayer::chng_playlist(false),
             _ => {}
         },
-        "toggleQuicksettings" => asideState::set_aside_window("quickSettings"),
-        "toggleCalendar" => asideState::set_aside_window("calendar"),
-        "toggleBluetooth" => asideState::set_aside_window("bluetooth"),
-        "toggleWifi" => asideState::set_aside_window("wifi"),
-        "closeAsideStatusMenuWidget" => asideState::close_aside_window(),
-        "toggleInfoArea" => status::status::toggle_info_area(),
+        "toggleStatus" => menuState::toggle_menu("status"),
+        "toggleCalendar" => menuState::toggle_menu("calendar"),
+        "toggleBluetooth" => menuState::toggle_menu("bluetooth"),
+        "toggleWifi" => menuState::toggle_menu("wifi"),
+        "closeMenu" => menuState::close_menu(),
         "toggleStreamingMode" => streaming_mode().set(!streaming_mode().peek()),
         "toggleFocus" => focus::toggle_focus(),
         "cancelBreak" => focus::cancel_break(),
@@ -150,7 +149,6 @@ fn main() {
     lib::wallpaper::random_wallpaper();
     lib::wallpaper::wallpaper_window();
     focus::focus_menu();
-    status::status::status_window();
     sideview::sideview();
     clipboard::clipboard::clipboard();
     clipboard::compress::compress_window();
@@ -159,7 +157,7 @@ fn main() {
     focus::focus_task();
     widgets::osd::osd::osd();
     widgets::powermenu::powermenu::powermenu();
-    lib::asideStatusWindow::aside_status_window();
+    lib::menuWindow::menu_window();
     widgets::workspaces::workspaces();
     notifs::notifications();
     widgets::launcher::launcher::launcher();
@@ -181,6 +179,7 @@ fn main() {
         status::network::start();
         status::modules::statusIcons::start();
         status::modules::mpris::start();
+        mediaPlayer::watch();
         lib::brightness::monitor();
         service::start();
         lib::apps::reload();

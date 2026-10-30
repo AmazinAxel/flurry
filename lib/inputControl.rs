@@ -1,11 +1,12 @@
 // Fullscreen dimmed dialog windows with key actions (lib/inputControl.tsx).
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
 
 use crate::ui::entry::{Entry, EntryRef};
-use crate::ui::node::Node;
+use crate::ui::node::{Node, Style};
 use crate::ui::wayland::{Anchor, KeyEvent, Keymode, Layer};
 use crate::ui::window::{self, Dir, Spec, View, Win};
 
@@ -35,6 +36,36 @@ pub struct Opts {
 
 pub const DIM: [f32; 4] = [0.0, 0.0, 0.0, 0.3];
 
+thread_local! {
+    static MODALS: RefCell<Vec<&'static str>> = RefCell::default();
+    // one dim for every modal, mapped before any of them (so stacked under) and kept while switching
+    static BACKDROP: Rc<Win> = Win::new(
+        Spec { name: "modalDim", anchor: Anchor::all(), dim: Some(DIM), input: false, ..Default::default() },
+        |_| Node::hbox(Style::default(), 0.0, vec![]),
+    );
+}
+
+/// Makes `win` modal: showing it hides the open one, all sharing one dim surface.
+pub fn modal(win: &Rc<Win>) {
+    let name = win.spec.borrow().name;
+    // own backdrop transparent: still fullscreen for input, content stays in its subsurface
+    win.spec.borrow_mut().dim = Some([0.0; 4]);
+    MODALS.with(|m| m.borrow_mut().push(name));
+    win.on_show(move || {
+        for other in MODALS.with(|m| m.borrow().clone()) {
+            if other != name {
+                window::set_visible(other, false);
+            }
+        }
+        BACKDROP.with(|b| b.show());
+    });
+    win.visibility.subscribe(|| {
+        if !MODALS.with(|m| m.borrow().iter().any(|n| window::get(n).is_some_and(|w| w.visible()))) {
+            BACKDROP.with(|b| b.hide());
+        }
+    });
+}
+
 /// lib/wrapFocus.ts: arrows move focus (with wrap) unless a modifier is held or the focused widget
 /// consumes them (entries own Left/Right and typed letters). hjkl work like arrows outside entries.
 pub fn wrap_focus(win: &Win, ev: &KeyEvent, entry_focused: bool) -> bool {
@@ -59,10 +90,10 @@ pub fn input_control(name: &'static str, build: impl Fn(&View) -> Node + 'static
         layer: opts.layer.unwrap_or(Layer::Overlay),
         anchor: Anchor::all(),
         keymode: opts.keymode.unwrap_or(Keymode::Exclusive),
-        dim: Some(DIM),
         ..Default::default()
     };
     let win = Win::new(spec, build);
+    modal(&win);
     let opts = Rc::new(opts);
 
     let o = opts.clone();

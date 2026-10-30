@@ -16,9 +16,10 @@ req hideNotif
 key 'Write docs'; shot focusMenu-typed
 key -k Return; shot focusTask
 
-req toggleInfoArea; shot status
+req toggleStatus; shot status
 req toggleStreamingMode; shot status-streaming
 req toggleStreamingMode
+req closeMenu
 
 swaymsg workspace 2 >/dev/null; shot workspaces 0.15
 sleep 1
@@ -47,14 +48,13 @@ key -k Escape
 toggle osd; shot osd 0.2
 toggle osd
 
-req toggleQuicksettings; shot quickSettings
 req toggleCalendar; shot calendar
 key -k Right; shot calendar-next
 key -M ctrl -k Left -m ctrl; shot calendar-prev-year
 req toggleBluetooth; shot bluetooth
 req toggleWifi; shot wifi
 key j; shot wifi-down
-req closeAsideStatusMenuWidget
+req closeMenu
 
 req lock; shot lockscreen 1
 key 'x'; key -k Return; shot lockscreen-failed 1

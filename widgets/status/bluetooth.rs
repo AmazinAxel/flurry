@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 
 use xkbcommon::xkb::Keysym;
 
-use crate::lib::asideState::{current, focus_aside};
+use crate::lib::menuState::{current, focus_menu};
 use crate::lib::bluetooth::{self as bt, Device, bt as bt_state};
 use crate::lib::deviceMenu::{DeviceMenu, aside_button, device_menu};
 use crate::lib::json;
@@ -115,7 +115,7 @@ fn move_device(d: &Device, delta: i64) -> bool {
 }
 
 pub fn refocus() {
-    focus_aside("bluetooth", || {
+    focus_menu("bluetooth", || {
         if !bt_state().with(|b| b.powered()) {
             return Some("power".into());
         }
@@ -283,7 +283,7 @@ pub fn key(id: &str, ev: &KeyEvent) -> bool {
     if move_device(&d, delta) {
         let id = id.to_string();
         runtime::idle(move || {
-            if let Some(w) = crate::ui::window::get("asideStatus") {
+            if let Some(w) = crate::ui::window::get("menu") {
                 w.grab_focus(&id);
             }
         });
