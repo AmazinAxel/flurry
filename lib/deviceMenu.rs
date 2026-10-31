@@ -29,7 +29,7 @@ pub fn aside_button(base: &Style, active: bool, connecting: bool, focused: bool)
     s
 }
 
-/// A list row: one outline width from the next, so a focused row's outline touches its neighbor.
+/// A list row: one border width from the next.
 pub fn aside_row(base: &Style, active: bool, connecting: bool, focused: bool) -> Style {
     let mut s = aside_button(base, active, connecting, focused);
     s.margin = Sides::trbl(0.0, SPACE_S, BORDER, SPACE_S);
@@ -37,8 +37,8 @@ pub fn aside_row(base: &Style, active: bool, connecting: bool, focused: bool) ->
 }
 
 pub fn separator(base: &Style) -> Node {
-    // as wide as a focused button's outline; the buttons above end SPACE_S + BORDER short of this margin too
-    let s = Style { margin: Sides::trbl(SPACE_M + BORDER, SPACE_S - BORDER, SPACE_M, SPACE_S - BORDER), min_height: BORDER, background: Background::Color(light3()), ..base.inherit() };
+    // as wide as the buttons; the buttons above end SPACE_S + BORDER short of this margin too
+    let s = Style { margin: Sides::trbl(SPACE_M + BORDER, SPACE_S, SPACE_M, SPACE_S), min_height: BORDER, background: Background::Color(light3()), ..base.inherit() };
     Node::hbox(s, 0.0, vec![])
 }
 

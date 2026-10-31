@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 const NAMES: &[&str] = &[
     "audio-input-microphone", "microphone-disabled", "bluetooth-active", "dialog-password", "display-brightness",
-    "emblem-default", "emoji-flags", "folder-music", "media-playback-pause", "media-playback-start", "media-record",
+    "emblem-default", "media-playback-pause", "media-playback-start", "media-record",
     "network-wireless-acquiring", "network-wireless-encrypted", "network-wireless-offline", "network-wireless",
-    "notifications-disabled", "system-search", "view-refresh", "pan-start", "pan-end",
+    "notifications-disabled", "view-refresh",
 ];
 
 

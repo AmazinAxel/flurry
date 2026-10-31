@@ -110,7 +110,7 @@ pub fn focus_menu() {
         "focusMenu",
         move |v| {
             let base = window();
-            let header = search_entry(&base, &ec, "emoji-flags-symbolic", v.focused("entry"));
+            let header = search_entry(&base, &ec, v.focused("entry"));
             background_section(&base, header, None, 0.0, 400.0)
         },
         Opts { focus: Some("entry"), entries: vec![EntryBinding { id: "entry", entry: e, on_activate: Some(start), on_key: None }], ..Default::default() },
@@ -135,7 +135,7 @@ pub fn focus_task() -> Rc<Win> {
         let base = window();
         let mut l = base.inherit();
         l.margin = Sides::trbl(SWAY_GAP, SPACE_L, SPACE_L, SPACE_L);
-        l = l.border(Sides::all(BORDER), blue3());
+        l = l.border(Sides::trbl(0.0, BORDER, BORDER, BORDER), blue3());
         l.font.size = 32.0;
         l.font.weight = 700;
         l.padding = Sides::vh(SPACE_S, SPACE_M);

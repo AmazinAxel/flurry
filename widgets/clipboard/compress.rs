@@ -119,7 +119,11 @@ pub fn compress_window() {
             background_section(&base, header, None, 100.0, 350.0)
         },
         Opts {
-            actions: vec![(Keysym::Tab, Rc::new(|| target().set((target().peek() + 1) % TARGETS.len()))), (Keysym::Return, Rc::new(compress))],
+            actions: vec![
+                (Keysym::Tab, Rc::new(|| target().set((target().peek() + 1) % TARGETS.len()))),
+                (Keysym::ISO_Left_Tab, Rc::new(|| target().set((target().peek() + TARGETS.len() - 1) % TARGETS.len()))),
+                (Keysym::Return, Rc::new(compress)),
+            ],
             ..Default::default()
         },
     );

@@ -444,7 +444,7 @@ pub fn clipboard() {
         // card's padding, so the rows end as far from the border as they do at the sides
         let list = Node::vbox(Style { padding: Sides::trbl(SPACE_M, 0.0, BORDER, 0.0), ..base.inherit() }, 0.0, nodes);
         let scroll = Node::scroll(Style { margin: Sides::trbl(0.0, 0.0, -BORDER, 0.0), ..base.inherit() }, 460.0, center, list).show(count > 0);
-        let header = search_entry(&base, &ec, "system-search-symbolic", v.focused("entry"));
+        let header = search_entry(&base, &ec, v.focused("entry"));
         background_section(&base, header, Some(scroll), 700.0, 500.0)
     };
     let ctrl = |k: Keysym, f: fn()| -> (Keysym, crate::lib::inputControl::Action) { (k, Rc::new(f)) };

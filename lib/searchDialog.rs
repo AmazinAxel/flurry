@@ -9,7 +9,7 @@ use crate::lib::backgroundSection::background_section;
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::style::*;
 use crate::ui::entry::{self, EntryRef, Look};
-use crate::ui::node::{Align, Background, Node, Sides, Style, rgba};
+use crate::ui::node::{Background, Node, Sides, Style, rgba};
 use crate::ui::window::{self, Win};
 
 pub struct SearchSpec<T> {
@@ -21,21 +21,15 @@ pub struct SearchSpec<T> {
     pub on_show: Option<Rc<dyn Fn()>>,
 }
 
-/// `.searchableDialog entry` inside a BackgroundSection header, with its primary icon.
-pub fn search_entry(base: &Style, entry: &EntryRef, icon: &'static str, focused: bool) -> Node {
+/// `.searchableDialog entry` inside a BackgroundSection header.
+pub fn search_entry(base: &Style, entry: &EntryRef, focused: bool) -> Node {
     let mut s = crate::lib::backgroundSection::header_style(base);
     s.font.size = 24.0;
     s.padding = Sides::trbl(0.0, SPACE_M, 0.0, SPACE_L);
     s.min_height = 36.0;
-    let mut img_style = s.inherit();
-    img_style.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
     let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
     let _ = focused;
-    Node::hbox(s.clone(), 0.0, vec![
-        Node::icon(img_style, icon, 16.0).align(Align::Fill, Align::Center),
-        entry::text_node(entry, s.inherit(), look),
-    ])
-    .focusable("entry")
+    Node::hbox(s.clone(), 0.0, vec![entry::text_node(entry, s.inherit(), look)]).focusable("entry")
 }
 
 /// Graphite `entry` (passSave fields, wifi password) with flurry's square corners.
@@ -105,7 +99,7 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
                 })
                 .collect();
             let content = Node::vbox(base.inherit(), BORDER, rows).show(!list.is_empty());
-            let header = search_entry(&base, &entry, "system-search-symbolic", v.focused("entry"));
+            let header = search_entry(&base, &entry, v.focused("entry"));
             background_section(&base, header, Some(content), 700.0, 500.0)
         }
     };

@@ -101,13 +101,13 @@ pub fn frosted(mut s: Style) -> Style {
 /// `button.active, .button.selected, list row:selected, ...`
 pub fn button_active(mut s: Style) -> Style {
     s.background = Background::Color(blue3());
-    s.border_color = [blue3(); 4];
+    s.border_color = [lighter(blue3()); 4];
     s
 }
 
-/// `button:focus` outline
+/// `button:focus` outline, drawn over the border so the button keeps its size
 pub fn focus_outline(mut s: Style) -> Style {
-    s.outline = Some((BORDER, 0.0, blue2()));
+    s.outline = Some((BORDER, -BORDER, blue1()));
     s
 }
 
