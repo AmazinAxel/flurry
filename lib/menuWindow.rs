@@ -21,7 +21,7 @@ use crate::widgets::status::{bluetooth, calendar, network};
 /// Card width, the same as the launcher/clipboard cards.
 pub const MENU_WIDTH: f32 = 500.0;
 /// Spacing unit inside the cards; also the wallpaper's inner padding.
-pub const GAP: f32 = 20.0;
+pub const GAP: f32 = SPACE_L;
 
 thread_local! {
     static DRAG: Cell<Option<&'static str>> = const { Cell::new(None) };
@@ -33,12 +33,12 @@ fn content(base: &Style, name: &str, focus: Option<&str>) -> (Node, Option<Node>
         "status" => return quickstatus(base, focus),
         "bluetooth" => {
             if crate::lib::bluetooth::bt().with(|b| b.available) {
-                bluetooth::menu(base, focus, 0.0)
+                bluetooth::menu(base, focus)
             } else {
                 Node::hbox(base.inherit(), 0.0, vec![])
             }
         }
-        "wifi" => network::menu(base, focus, 0.0),
+        "wifi" => network::menu(base, focus),
         _ => calendar::calendar(base),
     };
     (menu, None)
@@ -73,6 +73,8 @@ pub fn menu_window() -> Rc<Win> {
         *w.focus.borrow_mut() = match open {
             Some("calendar") => Some("calendar".into()),
             Some("status") => qs::first_sink(),
+            Some("wifi") => network::focus_target(),
+            Some("bluetooth") => bluetooth::focus_target(),
             _ => None,
         };
         w.set_visible(open.is_some());

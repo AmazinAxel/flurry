@@ -5,7 +5,7 @@ use crate::lib::audio;
 use crate::lib::brightness::brightness;
 use crate::lib::outTransition::Flash;
 use crate::lib::style::*;
-use crate::ui::node::{Kind, Node, Sides, Style, fill_rect, shadow};
+use crate::ui::node::{Kind, Node, Sides, Style, fill_rect};
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{Spec, Win};
 use crate::widgets::status::modules::statusIcons::leak;
@@ -24,8 +24,7 @@ fn osd_bar(value: f64) -> Node {
             fill_rect(pm, f, blue2(), ts);
         }
     });
-    let s = Style { box_shadow: vec![shadow(0.0, 0.0, 10.0, blue3())], ..Default::default() };
-    Node::new(Kind::Custom { width: 400.0, height: 12.0, key: Some(value.to_bits()), paint }, s).size(400.0, 0.0)
+    Node::new(Kind::Custom { width: 400.0, height: 12.0, key: Some(value.to_bits()), paint }, Style::default()).size(400.0, 0.0)
 }
 
 pub fn osd() {
@@ -35,14 +34,13 @@ pub fn osd() {
         let base = window();
         let (icon, val) = OSD.with(|o| *o.borrow());
         let mut s = status_element(&base);
-        s.padding = Sides::all(8.0);
-        s.margin = Sides::trbl(0.0, 0.0, 5.0, 0.0);
+        s.padding = Sides::all(SPACE_M);
+        s.margin = Sides::trbl(SPACE_L, SPACE_L, SWAY_GAP, SPACE_L);
         let mut img = base.inherit();
-        img.margin = Sides::trbl(0.0, 8.0, 0.0, 0.0);
-        img.icon_shadow = vec![shadow_(), glow(15.0, light3())];
+        img.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
         let mut n = Node::hbox(s, 0.0, vec![Node::icon(img, icon, 24.0), osd_bar(val).align(crate::ui::node::Align::Fill, crate::ui::node::Align::Fill)]);
         // SLIDE_UP revealer: content slides down out of the window as it hides
-        let h = n.measure_h(n.measure_w().1).1 + 5.0;
+        let h = n.measure_h(n.measure_w().1).1 + SPACE_L * 2.0;
         n.style.translate_y = (1.0 - f.progress()) * h;
         n
     });

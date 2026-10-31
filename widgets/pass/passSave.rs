@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
 
-use crate::lib::backgroundSection::background_section;
+use crate::lib::backgroundSection::{background_section, header_style};
 use crate::lib::clipboard::{copy_login, copy_sensitive, pipe};
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::process::exec_str;
@@ -91,16 +91,16 @@ pub fn pass_save() {
             let generated = GENERATED.with(|g| g.peek());
             let mut icon = base.inherit();
             icon.color = if generated { blue2() } else { dark4() };
-            icon.margin = Sides::trbl(0.0, 3.0, 0.0, 0.0);
-            let content = Node::vbox(base.inherit(), 4.0, vec![
+            icon.margin = Sides::trbl(0.0, SPACE_S, 0.0, 0.0);
+            let content = Node::vbox(base.inherit(), SPACE_S, vec![
                 plain_entry(&base, &site, "site"),
                 plain_entry(&base, &user, "user"),
-                Node::hbox(base.inherit(), 4.0, vec![
+                Node::hbox(base.inherit(), SPACE_S, vec![
                     plain_entry(&base, &pass, "pass"),
                     Node::icon(icon, "dialog-password-symbolic", 16.0).align(Align::Fill, Align::Center),
                 ]),
             ]);
-            let header = Node::hbox(base.inherit(), 0.0, vec![]);
+            let header = Node::label(header_style(&base), "Password");
             Node::hbox(base.inherit(), 0.0, vec![background_section(&base, header, Some(content), 300.0, 400.0)]).align(Align::Center, Align::Center)
         }
     };

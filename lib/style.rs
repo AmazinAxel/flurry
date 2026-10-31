@@ -20,9 +20,27 @@ pub fn blue2() -> Color { hex(0x81a1c1) }
 pub fn blue3() -> Color { hex(0x5e81ac) }
 pub fn blue4() -> Color { hex(0x8fbcbb) }
 
-/// --shadow: 0 1px 3px alpha(@dark1, 0.8)
-pub fn shadow_() -> Shadow {
-    shadow(0.0, 1.0, 3.0, alpha(dark1(), 0.8))
+/// Every border's width.
+pub const BORDER: f32 = 3.0;
+/// Spacing scale: between items, inside controls, inside cards and around them.
+pub const SPACE_S: f32 = 4.0;
+pub const SPACE_M: f32 = 8.0;
+pub const SPACE_L: f32 = 16.0;
+/// Gap of the windows sway tiles: edge-anchored widgets line up with them.
+pub const SWAY_GAP: f32 = 5.0;
+/// Blur of every bloom.
+
+pub const BLOOM: f32 = 8.0;
+
+/// `c` a sixth of the way to white: a border that reads against its own fill.
+pub fn lighter(c: Color) -> Color {
+    let up = |v: f32| v + (1.0 - v) / 6.0;
+    Color::from_rgba(up(c.red()), up(c.green()), up(c.blue()), c.alpha()).unwrap_or(c)
+}
+
+/// A glyph's glow, in whatever color it is drawn.
+pub fn own_bloom() -> Shadow {
+    Shadow { own_color: true, ..glow(BLOOM, alpha(light1(), 0.6)) }
 }
 
 pub fn glow(blur: f32, c: Color) -> Shadow {
@@ -36,51 +54,47 @@ pub fn font(family: &'static str, size: f32) -> Font {
 pub const SORA: &str = "Sora";
 pub const IOSEVKA: &str = "Iosevka Nerd Font Mono";
 
-/// `window`: Sora 16px, @light1, text/icon shadow.
+/// `window`: Sora 16px, @light1, text/icon bloom.
 pub fn window() -> Style {
     Style {
         color: light1(),
         font: font(SORA, 16.0),
-        text_shadow: vec![shadow_()],
-        icon_shadow: vec![shadow_()],
+        text_shadow: vec![own_bloom()],
+        icon_shadow: vec![own_bloom()],
         ..Style::default()
     }
 }
 
 /// `.statusElement`
 pub fn status_element(base: &Style) -> Style {
-    Style { background: Background::Color(dark1()), margin: Sides::trbl(0.0, 0.0, 5.0, 5.0), ..base.inherit() }
-        .border(Sides::all(3.0), dark4())
+    Style { background: Background::Color(dark1()), margin: Sides::all(SPACE_L), ..base.inherit() }
+        .border(Sides::all(BORDER), blue3())
 }
 
 /// `.widgetBackground`
 pub fn widget_background(base: &Style) -> Style {
-    Style { background: Background::Color(dark1()), padding: Sides::all(16.0), ..base.inherit() }.border(Sides::all(3.0), blue3())
+    Style { background: Background::Color(dark1()), padding: Sides::all(SPACE_L), ..base.inherit() }.border(Sides::all(BORDER), blue3())
 }
 
 /// Graphite `button` (border from style.css, square corners from `* { border-radius: 0 }`)
 pub fn button(base: &Style) -> Style {
     let mut s = Style {
         background: Background::Color(rgba(255, 255, 255, 0.04)),
-        padding: Sides::vh(6.0, 10.0),
-        min_height: 24.0,
+        padding: Sides::all(SPACE_M),
+        min_height: 16.0, // a 16px icon's button comes out square
         min_width: 16.0,
-        box_shadow: vec![shadow(0.0, 2.0, 5.0, rgba(0, 0, 0, 0.6))],
         ..base.inherit()
     }
-    .border(Sides::all(1.0), dark4());
+    .border(Sides::all(BORDER), dark4());
     s.font.weight = 500;
     s
 }
 
 /// Frosted look for anything over the tinted wallpaper (menu buttons, calendar): white text on
-/// translucent black, no outline; blue marks the active/selected item.
+/// translucent black; blue marks the active/selected item.
 pub fn frosted(mut s: Style) -> Style {
     s.background = Background::Color(alpha(dark1(), 0.6));
-    s.border = Sides::all(0.0);
     s.color = light1();
-    s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6))];
-    s.icon_shadow = s.text_shadow.clone();
     s
 }
 
@@ -93,7 +107,7 @@ pub fn button_active(mut s: Style) -> Style {
 
 /// `button:focus` outline
 pub fn focus_outline(mut s: Style) -> Style {
-    s.outline = Some((2.0, 1.0, blue2()));
+    s.outline = Some((BORDER, 0.0, blue2()));
     s
 }
 

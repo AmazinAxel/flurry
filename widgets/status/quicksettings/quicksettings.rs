@@ -6,7 +6,7 @@ use tiny_skia::{PathBuilder, Rect, Transform};
 
 use crate::lib::audio;
 use crate::lib::brightness::{self, brightness, set_brightness};
-use crate::lib::deviceMenu::{aside_button, separator};
+use crate::lib::deviceMenu::{aside_row, separator};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash, rgba};
 use crate::widgets::status::quicksettings::sound::{self, apply_selection, name_substitute, node_name, selected};
@@ -45,7 +45,7 @@ pub fn slider(base: &Style, id: &str, value: f64) -> Node {
             }
         }
     });
-    let s = Style { padding: Sides::vh(17.0, 12.0), min_height: 5.0, ..base.inherit() };
+    let s = Style { padding: Sides::vh(SPACE_L, SPACE_M), min_height: 5.0, ..base.inherit() };
     Node::new(Kind::Custom { width: 0.0, height: 5.0, key: None, paint }, s).expand(true, false).id(id)
 }
 
@@ -72,12 +72,12 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             let name = node_name(sp);
             let is_sel = sel.contains(&name);
             let id = format!("sink:{name}");
-            let mut s = aside_button(base, is_sel, false, focus == Some(id.as_str()));
+            let mut s = aside_row(base, is_sel, false, focus == Some(id.as_str()));
             if !is_sel {
                 s.background = Background::Color(rgba(255, 255, 255, 0.08));
             }
             let mut check = s.inherit();
-            check.margin = Sides::trbl(0.0, 7.0, 0.0, 0.0);
+            check.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
             Node::hbox(s.clone(), 0.0, vec![
                 Node::icon(check, "emblem-default-symbolic", 19.0).show(is_sel),
                 Node::label(s.inherit(), name_substitute(&sp.description)).xalign(0.0).expand(true, false).ellipsize(),
@@ -85,10 +85,10 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             .focusable(id)
         })
         .collect();
-    let selector = Node::vbox(base.inherit(), 0.0, sinks);
-    // the knob overhangs the slider box by ~11px, leaving ~6px of visible padding: 8 more matches the 14 below
+    // same gaps around the separator as the device menus; the knob's tip stops 5px into the slider's padding
+    let selector = Node::vbox(Style { padding: Sides::trbl(SPACE_S + BORDER, 0.0, 0.0, 0.0), ..base.inherit() }, 0.0, sinks);
     let mut sep = separator(base);
-    sep.style.margin.top = 8.0;
+    sep.style.margin.top = SPACE_M + SPACE_S - 5.0;
     Node::vbox(base.inherit(), 0.0, vec![Node::vbox(base.inherit(), 0.0, rows), sep, selector]).expand(true, false)
 }
 

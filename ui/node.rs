@@ -45,10 +45,18 @@ pub struct Shadow {
     pub spread: f32,
     pub color: Color,
     pub inset: bool,
+    /// `color`'s alpha over the color the glyph is drawn in
+    pub own_color: bool,
+}
+
+impl Shadow {
+    pub(crate) fn over(&self, drawn: Color) -> Shadow {
+        Shadow { color: if self.own_color { alpha(drawn, self.color.alpha() * drawn.alpha()) } else { self.color }, ..*self }
+    }
 }
 
 pub fn shadow(x: f32, y: f32, blur: f32, color: Color) -> Shadow {
-    Shadow { x, y, blur, spread: 0.0, color, inset: false }
+    Shadow { x, y, blur, spread: 0.0, color, inset: false, own_color: false }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -158,8 +166,9 @@ pub enum Kind {
     /// Arbitrary paint into the content box, with a fixed natural size
     /// `key` identifies what `paint` draws (None: repainted every frame)
     Custom { width: f32, height: f32, key: Option<u64>, paint: Rc<dyn Fn(&mut PixmapMut, Rect, Transform)> },
-    /// Clips its child to `max_height` and scrolls by `offset`
-    Scroll { max_height: f32, offset: f32 },
+    /// Clips its child to `max_height`, keeping the child's `center`th child centered in the view
+    /// as far as the content's ends allow
+    Scroll { max_height: f32, center: Option<usize> },
 }
 
 pub struct Node {
@@ -213,8 +222,8 @@ impl Node {
     pub fn hbox(style: Style, spacing: f32, children: Vec<Node>) -> Self {
         Self { children, ..Self::new(Kind::Box { vertical: false, spacing }, style) }
     }
-    pub fn scroll(style: Style, max_height: f32, offset: f32, child: Node) -> Self {
-        Self { children: vec![child], ..Self::new(Kind::Scroll { max_height, offset }, style) }
+    pub fn scroll(style: Style, max_height: f32, center: Option<usize>, child: Node) -> Self {
+        Self { children: vec![child], ..Self::new(Kind::Scroll { max_height, center }, style) }
     }
     pub fn overlay(style: Style, children: Vec<Node>) -> Self {
         Self { children, ..Self::new(Kind::Overlay, style) }
@@ -593,11 +602,16 @@ impl Node {
                     c.allocate(cx, cy, cw, ch);
                 }
             }
-            Kind::Scroll { offset, .. } => {
-                let offset = *offset;
+            Kind::Scroll { center, .. } => {
+                let center = *center;
                 if let Some(c) = self.children.first_mut() {
                     let (_, nat) = c.outer_h(cw);
-                    c.allocate(cx, cy - offset, cw, nat);
+                    c.allocate(cx, cy, cw, nat);
+                    let row = center.and_then(|i| c.children.get(i)).map(|r| r.rect);
+                    if let Some(row) = row {
+                        let mid = row.y() + row.height() / 2.0 - cy;
+                        c.allocate(cx, cy - (mid - ch / 2.0).clamp(0.0, (nat - ch).max(0.0)).round(), cw, nat);
+                    }
                 }
             }
             _ => {}
@@ -662,6 +676,9 @@ impl Node {
         for sh in s.text_shadow.iter().chain(&s.icon_shadow) {
             out = union(out, grow(r, sh.blur * 1.5, sh.x, sh.y));
         }
+        if let Kind::Picture { blur, .. } = self.kind {
+            out = union(out, grow(r, blur * 1.5, 0.0, 0.0));
+        }
         Some(out)
     }
 
@@ -704,7 +721,7 @@ impl Node {
             for sh in v {
                 f(h, &[sh.x, sh.y, sh.blur, sh.spread]);
                 col(h, sh.color);
-                sh.inset.hash(h);
+                (sh.inset, sh.own_color).hash(h);
             }
             0xff.hash(h);
         };
@@ -798,7 +815,7 @@ impl Node {
                 let x = c.x() + ((c.width() - layout.width()) * l.xalign).max(0.0);
                 let y = c.y() + ((c.height() - layout.height()) / 2.0).max(0.0);
                 for s in &self.style.text_shadow {
-                    paint_text_shadow(pm, &layout, x, y, s, ts);
+                    paint_text_shadow(pm, &layout, x, y, &s.over(self.style.color), ts);
                 }
                 text::draw(pm, &layout, x, y, self.style.color, ts);
             }
@@ -806,7 +823,7 @@ impl Node {
                 let x = c.x() + ((c.width() - size) / 2.0).floor();
                 let y = c.y() + ((c.height() - size) / 2.0).floor();
                 for s in &self.style.icon_shadow {
-                    paint_icon_shadow(pm, name, *size, x, y, s, ts);
+                    paint_icon_shadow(pm, name, *size, x, y, &s.over(self.style.color), ts);
                 }
                 icons::draw(pm, name, *size, x, y, self.style.color, ts);
             }
@@ -1157,12 +1174,11 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
         pm.fill_rect(area, &Paint { shader, anti_alias: false, ..Default::default() }, ts, None);
         return;
     }
-    // Blurred with the image continuing past the box, then cut to it: hard edges, nothing fades or bleeds out.
+    // GTK `filter: blur()` blurs the rendered node; edges fade out over the radius, past the box.
     // The result only depends on the image and the device rect, so it is cached.
     let dev = c.transform(ts).unwrap_or(c);
     let pad = (radius * ts.sx * 1.5).ceil();
     let (ox, oy) = (dev.left().floor() - pad, dev.top().floor() - pad);
-    let (x0, y0) = (dev.left().round(), dev.top().round());
     let key = (img.key(), dev.width().to_bits(), dev.height().to_bits(), (dev.left() - dev.left().floor()).to_bits(), (dev.top() - dev.top().floor()).to_bits(), radius.to_bits());
     // one entry per window header: a single slot made every window switch re-blur the wallpaper (~60ms)
     thread_local! {
@@ -1175,14 +1191,13 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
             let Some(mut layer) = Pixmap::new((dev.width() + pad * 2.0).ceil() as u32 + 1, (dev.height() + pad * 2.0).ceil() as u32 + 1) else {
                 return;
             };
+            let mut clip = tiny_skia::Mask::new(layer.width(), layer.height()).unwrap();
+            clip.fill_path(&PathBuilder::from_rect(c), FillRule::Winding, false, ts.post_translate(-ox, -oy));
             // about to be blurred: bilinear is indistinguishable and much cheaper than bicubic
-            let shader = tiny_skia::Pattern::new(pix, tiny_skia::SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, 1.0, t.post_translate(-ox, -oy));
-            let whole = Rect::from_xywh(0.0, 0.0, layer.width() as f32, layer.height() as f32).unwrap();
-            layer.fill_rect(whole, &Paint { shader, anti_alias: false, ..Default::default() }, Transform::identity(), None);
+            let smooth = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..paint };
+            layer.draw_pixmap(0, 0, pix, &smooth, t.post_translate(-ox, -oy), Some(&clip));
             blur(&mut layer, radius * ts.sx);
-            let (cw, ch) = ((dev.right().round() - x0).max(1.0) as u32, (dev.bottom().round() - y0).max(1.0) as u32);
-            let Some(cut) = tiny_skia::IntRect::from_xywh((x0 - ox) as i32, (y0 - oy) as i32, cw, ch).and_then(|i| layer.clone_rect(i)) else { return };
-            let l = Rc::new(cut);
+            let l = Rc::new(layer);
             BLURRED.with(|b| {
                 let mut b = b.borrow_mut();
                 b.retain(|(k, _)| k.0 == key.0); // a new wallpaper drops the old one's blurs
@@ -1194,7 +1209,7 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
             l
         }
     };
-    blit(pm, Pixmap::as_ref(&layer), x0 as i32, y0 as i32, 1.0);
+    blit(pm, Pixmap::as_ref(&layer), ox as i32, oy as i32, 1.0);
 }
 
 /// rgba from 0-255 channels and 0-1 alpha.

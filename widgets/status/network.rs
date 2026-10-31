@@ -8,11 +8,12 @@ use xkbcommon::xkb::Keysym;
 
 use crate::lib::menuState::{current, focus_menu};
 use crate::lib::dbus::{prop_bool, prop_str};
-use crate::lib::deviceMenu::{DeviceMenu, aside_button, device_menu};
+use crate::lib::deviceMenu::{DeviceMenu, aside_row, device_menu};
 use crate::lib::iwd::{self, DEVICE, NETWORK, STATION};
 use crate::lib::process::exec;
 use crate::lib::searchDialog::plain_entry;
 use crate::lib::state::State;
+use crate::lib::style::{SPACE_M, SPACE_S};
 use crate::lib::streamingMode::streaming_mode;
 use crate::ui::entry::{self, Entry, EntryRef};
 use crate::ui::node::{Align, Node, Sides, Style};
@@ -96,7 +97,7 @@ fn row_id(path: &str) -> String {
     format!("wifi:{path}")
 }
 
-fn focus_target() -> Option<String> {
+pub fn focus_target() -> Option<String> {
     if !wifi_on().peek() {
         return Some("power".into());
     }
@@ -271,7 +272,7 @@ pub fn start() {
     });
 }
 
-pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
+pub fn menu(base: &Style, focus: Option<&str>) -> Node {
     if streaming_mode().peek() {
         return Node::label(base.inherit(), "Streaming mode enabled").align(Align::Center, Align::Fill).expand(true, false);
     }
@@ -284,10 +285,10 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
     for path in &list {
         let net = map.get(path).cloned().unwrap_or(WifiNet { ssid: String::new(), security: "open".into(), level: 0, known: false });
         let id = row_id(path);
-        let s = aside_button(base, *path == conn && *path != joining, *path == joining, focus == Some(id.as_str()));
+        let s = aside_row(base, *path == conn && *path != joining, *path == joining, focus == Some(id.as_str()));
         let icon = crate::widgets::status::modules::statusIcons::leak(&format!("network-wireless-signal-{}-symbolic", LEVELS[net.level]));
         rows.push(
-            Node::hbox(s.clone(), 0.0, vec![Node::hbox(s.inherit(), 10.0, vec![
+            Node::hbox(s.clone(), 0.0, vec![Node::hbox(s.inherit(), SPACE_M, vec![
                 Node::icon(s.inherit(), icon, 16.0),
                 Node::label(s.inherit(), net.ssid.clone()).xalign(0.0).expand(true, false).ellipsize(),
                 Node::icon(s.inherit(), "network-wireless-encrypted-symbolic", 16.0).show(net.security != "open"),
@@ -299,13 +300,13 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
             && p == path
         {
             let mut entry = plain_entry(base, e, "wifi-password");
-            entry.style.margin = Sides::all(4.0);
+            entry.style.margin = Sides::all(SPACE_S);
             rows.push(entry);
         }
     }
     let icon = if on { "network-wireless-symbolic" } else { "network-wireless-offline-symbolic" };
     let scanning = scanning().peek();
-    device_menu(DeviceMenu { base, powered: on, power_icon: icon, scanning, empty: list.is_empty(), focus, scroll, rows })
+    device_menu(DeviceMenu { base, powered: on, power_icon: icon, scanning, empty: list.is_empty(), focus, rows })
 }
 
 pub fn on_focus(id: &str) {

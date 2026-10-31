@@ -19,12 +19,11 @@ pub fn record_menu() {
         |_| {
             let base = window();
             let hs = header_style(&base);
-            let mut img = hs.inherit();
-            img.icon_shadow = vec![shadow_(), glow(10.0, light3())];
+            let img = hs.inherit();
             let mut label = hs.inherit();
             label.font.size = 35.0;
             let mic = if rec_mic().peek() { "audio-input-microphone-symbolic" } else { "microphone-disabled-symbolic" };
-            let header = Node::hbox(hs.inherit(), 8.0, vec![Node::icon(img, mic, 32.0), Node::label(label, rec_quality().peek())])
+            let header = Node::hbox(hs.inherit(), SPACE_M, vec![Node::icon(img, mic, 32.0), Node::label(label, rec_quality().peek())])
                 .expand(true, true)
                 .align(Align::Center, Align::Center);
             background_section(&base, header, None, 100.0, 350.0)

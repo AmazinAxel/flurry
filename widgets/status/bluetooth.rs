@@ -6,9 +6,10 @@ use xkbcommon::xkb::Keysym;
 
 use crate::lib::menuState::{current, focus_menu};
 use crate::lib::bluetooth::{self as bt, Device, bt as bt_state};
-use crate::lib::deviceMenu::{DeviceMenu, aside_button, device_menu};
+use crate::lib::deviceMenu::{DeviceMenu, aside_row, device_menu};
 use crate::lib::json;
 use crate::lib::state::State;
+use crate::lib::style::SPACE_M;
 use crate::ui::node::{Align, Node, Style};
 use crate::ui::runtime;
 use crate::ui::wayland::KeyEvent;
@@ -114,13 +115,15 @@ fn move_device(d: &Device, delta: i64) -> bool {
     true
 }
 
+pub fn focus_target() -> Option<String> {
+    if !bt_state().with(|b| b.powered()) {
+        return Some("power".into());
+    }
+    Some(focus_device().map(|d| row_id(&d)).unwrap_or_else(|| "scan".into()))
+}
+
 pub fn refocus() {
-    focus_menu("bluetooth", || {
-        if !bt_state().with(|b| b.powered()) {
-            return Some("power".into());
-        }
-        Some(focus_device().map(|d| row_id(&d)).unwrap_or_else(|| "scan".into()))
-    });
+    focus_menu("bluetooth", focus_target);
 }
 
 pub fn start() {
@@ -150,7 +153,7 @@ pub fn start() {
     });
 }
 
-pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
+pub fn menu(base: &Style, focus: Option<&str>) -> Node {
     let b = bt_state().peek();
     let devices = visible_devices();
     let none_listed = !devices.iter().any(listed);
@@ -159,11 +162,11 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
         .filter(|d| listed(d))
         .map(|d| {
             let id = row_id(d);
-            let s = aside_button(base, d.connected && !d.connecting, d.connecting, focus == Some(id.as_str()));
+            let s = aside_row(base, d.connected && !d.connecting, d.connecting, focus == Some(id.as_str()));
             let battery = d.connected && d.battery >= 0.0;
             let icon = leak(&format!("{}-symbolic", d.icon));
             Node::hbox(s.clone(), 0.0, vec![
-                Node::hbox(s.inherit(), 10.0, vec![
+                Node::hbox(s.inherit(), SPACE_M, vec![
                     Node::icon(s.inherit(), icon, 16.0),
                     Node::label(s.inherit(), name_substitute(&d.alias)).xalign(0.0).expand(true, false).ellipsize(),
                     Node::label(s.inherit(), format!("{}%", (d.battery * 100.0).round() as i64)).align(Align::End, Align::Fill).show(battery),
@@ -182,7 +185,6 @@ pub fn menu(base: &Style, focus: Option<&str>, scroll: f32) -> Node {
         scanning: b.discovering(),
         empty: none_listed,
         focus,
-        scroll,
         rows,
     })
 }
@@ -279,13 +281,10 @@ pub fn key(id: &str, ev: &KeyEvent) -> bool {
     if !ev.shift {
         return false;
     }
-    if move_device(&d, delta) {
-        let id = id.to_string();
-        runtime::idle(move || {
-            if let Some(w) = crate::ui::window::get("menu") {
-                w.grab_focus(&id);
-            }
-        });
+    if move_device(&d, delta)
+        && let Some(w) = crate::ui::window::get("menu")
+    {
+        w.grab_focus(id);
     }
     true
 }

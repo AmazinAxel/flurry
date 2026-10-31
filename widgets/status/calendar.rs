@@ -87,18 +87,19 @@ pub fn calendar(base: &Style) -> Node {
     let mut cal = frosted(base.inherit());
     cal.min_width = 0.0;
     cal.background = Background::None;
-    let cell = Style { padding: Sides::trbl(9.0, 7.0, 9.0, 7.0), ..cal.inherit() };
+    let cell = Style { padding: Sides::all(SPACE_M - BORDER), ..cal.inherit() }.border(Sides::all(BORDER), tiny_skia::Color::TRANSPARENT);
 
     // "October 2026", left-aligned
     let mut header = cal.inherit();
-    header.padding = Sides::vh(3.0, 10.0);
+    header.padding = Sides::vh(SPACE_S, SPACE_M);
     header.min_height = 36.0;
     let title = Node::label(header.inherit(), day_format(first, "%B %Y")).xalign(0.0).expand(true, false).align(Align::Fill, Align::Center);
     let head = Node::hbox(header, 0.0, vec![title]);
 
     // weekday names, as tall as a day row (GtkCalendar's grid rows are homogeneous)
     let sample = Node::label(cell.clone(), "30");
-    let mut names = Style { min_height: sample.measure_h(sample.measure_w().1).1, ..cal.inherit() };
+    let side = sample.measure_h(sample.measure_w().1).1;
+    let mut names = Style { min_height: side, ..cal.inherit() };
     names.font.size = 14.0;
     let mut rows = vec![week_row(&cal.inherit(), (0..7).map(|i| Node::label(names.clone(), day_format(start + i, "%a")).expand(true, false)).collect())];
 
@@ -113,14 +114,16 @@ pub fn calendar(base: &Style) -> Node {
                 }
                 if day == today {
                     s.background = Background::Color(blue3());
+                    s.border_color = [blue2(); 4];
                     s.color = light1();
                 }
-                Node::label(s, dd.to_string()).expand(true, false)
+                // square, centered in its column
+                Node::label(s, dd.to_string()).size(side, side).expand(true, false).align(Align::Center, Align::Center)
             })
             .collect();
         rows.push(week_row(&cal.inherit(), cells));
     }
-    let grid = Node::vbox(Style { margin: Sides::all(3.0), ..cal.inherit() }, 0.0, rows);
+    let grid = Node::vbox(Style { margin: Sides::all(SPACE_S), ..cal.inherit() }, 0.0, rows);
     Node::vbox(cal, 0.0, vec![head, grid]).expand(true, false).focusable("calendar")
 }
 

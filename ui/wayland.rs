@@ -742,6 +742,11 @@ impl Surface {
             s.render();
         });
     }
+    /// `redraw` that doesn't wait out a frame in flight: what's on screen is already wrong.
+    pub fn redraw_now(&self) {
+        self.0.frame_pending.set(false);
+        self.redraw();
+    }
     pub fn set_keymode(&self, k: Keymode) {
         if let Role::Layer(l) = &*self.0.role.borrow() {
             l.set_keyboard_interactivity(k);
@@ -1580,7 +1585,7 @@ mod tests {
     use super::*;
     use crate::ui::node::{Background, Node, Sides, Style, shadow};
 
-    fn tree(sel: usize, scroll: f32, text: &str) -> Node {
+    fn tree(sel: usize, center: Option<usize>, text: &str) -> Node {
         let rows = (0..12)
             .map(|i| {
                 let mut s = Style { padding: Sides::all(8.0), margin: Sides::trbl(0.0, 0.0, 8.0, 0.0), ..Default::default() };
@@ -1594,7 +1599,7 @@ mod tests {
             })
             .collect();
         let list = Node::vbox(Style::default(), 0.0, rows);
-        let sc = Node::scroll(Style::default(), 300.0, scroll, list);
+        let sc = Node::scroll(Style::default(), 300.0, center, list);
         Node::vbox(Style { padding: Sides::all(16.0), background: Background::Color(Color::from_rgba8(20, 20, 30, 230)), ..Default::default() }, 0.0, vec![
             Node::label(Style::default(), "header"),
             sc,
@@ -1612,11 +1617,11 @@ mod tests {
     fn partial_repaint_matches_full() {
         let (w, h) = (500, 800);
         let ts = Transform::from_scale(2.0, 2.0);
-        let frames = [(0, 0.0, "a"), (1, 0.0, "a"), (1, 0.0, "b"), (5, 37.0, "b"), (5, 37.0, "b"), (2, 37.0, "c")];
+        let frames = [(0, None, "a"), (1, None, "a"), (1, None, "b"), (5, Some(5), "b"), (5, Some(5), "b"), (2, Some(5), "c")];
         let mut damage = Damage::default();
         let mut buf: Option<tiny_skia::Pixmap> = None;
-        for (n, &(sel, scroll, text)) in frames.iter().enumerate() {
-            let mut node = tree(sel, scroll, text);
+        for (n, &(sel, center, text)) in frames.iter().enumerate() {
+            let mut node = tree(sel, center, text);
             let want = full(&mut node, ts, w, h);
             let mut items = vec![];
             node.paint_items(ts, 0, None, &mut items);
@@ -1645,5 +1650,18 @@ mod tests {
             damage.commit(n as u64 + 1, items, (w, h), changed);
             buf = Some(got);
         }
+    }
+
+    #[test]
+    fn scroll_centers_row_within_content() {
+        let row_top = |center: usize, row: usize| {
+            let rows = (0..10).map(|_| Node::vbox(Style { min_height: 50.0, ..Default::default() }, 0.0, vec![])).collect();
+            let mut n = Node::scroll(Style::default(), 200.0, Some(center), Node::vbox(Style::default(), 0.0, rows));
+            n.allocate(0.0, 0.0, 100.0, 200.0);
+            n.children[0].children[row].rect.top()
+        };
+        assert_eq!(row_top(0, 0), 0.0, "first row: pinned to the top");
+        assert_eq!(row_top(5, 5), 75.0, "middle row: centered");
+        assert_eq!(row_top(9, 9), 150.0, "last row: pinned to the bottom, fully visible");
     }
 }

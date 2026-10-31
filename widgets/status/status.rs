@@ -9,7 +9,7 @@ const TOP_HEIGHT: f32 = 220.0;
 const CONTROL_FONT: f32 = 19.0;
 use crate::lib::mediaPlayer::{PLAYLISTS, is_playing, playlist_index, song};
 use crate::lib::style::*;
-use crate::ui::node::{Align, Background, Node, Shadow, Sides, Style, alpha};
+use crate::ui::node::{Align, Background, Node, Sides, Style};
 use crate::widgets::status::modules::{mpris::track, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
 use crate::widgets::status::quicksettings::quicksettings::quick_settings;
 
@@ -35,11 +35,11 @@ fn media(base: &Style) -> Node {
     let playing = is_playing().peek();
     let bar = Style {
         background: Background::Color(playlist),
-        box_shadow: vec![Shadow { spread: 2.0, ..glow(10.0, alpha(playlist, 0.7)) }],
-        margin: Sides::trbl(6.0, 0.0, 6.0, 0.0),
+        margin: Sides::vh(SPACE_M, 0.0),
         ..base.inherit()
-    };
-    let btn = Style { padding: Sides::vh(12.0, 18.0), ..base.inherit() };
+    }
+    .border(Sides::all(BORDER), lighter(playlist));
+    let btn = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
     let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
     let Some((title, artist)) = text else {
@@ -50,7 +50,7 @@ fn media(base: &Style) -> Node {
     t.font.size = 22.0;
     t.font.weight = 700;
     let a = Style { font: font(SORA, 18.0), ..base.inherit() };
-    let info = Node::vbox(Style { padding: Sides::vh(8.0, 14.0), ..base.inherit() }, 2.0, vec![
+    let info = Node::vbox(Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() }, SPACE_S, vec![
         Node::label(t, title).xalign(0.0).ellipsize(),
         Node::label(a, artist.clone()).xalign(0.0).ellipsize().show(!artist.is_empty()),
     ])

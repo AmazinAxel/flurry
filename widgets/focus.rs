@@ -49,7 +49,7 @@ fn active() -> bool {
     BREAK_TIMERS.with(|t| !t.borrow().is_empty())
 }
 
-/// 10s wait shown as a levelbar, then the blocked app runs for at most 2 minutes.
+/// 10s wait shown as a levelbar, then the blocked app runs for at most 5 minutes.
 pub fn start_break(cmd: &str) {
     if active() {
         return;
@@ -61,7 +61,7 @@ pub fn start_break(cmd: &str) {
         end_break();
         let cmd = cmd.clone();
         runtime::spawn(async move {
-            let _ = exec(&["systemd-run", "--user", "--scope", "--collect", "-p", "RuntimeMaxSec=120", "sh", "-c", &cmd]).await;
+            let _ = exec(&["systemd-run", "--user", "--scope", "--collect", "-p", "RuntimeMaxSec=300", "sh", "-c", &cmd]).await;
             end_break();
             let id = CLOSING_NOTIF.with(|n| n.replace(0));
             if id != 0 {
@@ -134,11 +134,11 @@ pub fn focus_task() -> Rc<Win> {
     let w = Win::new(spec, |_| {
         let base = window();
         let mut l = base.inherit();
-        l.margin = Sides::trbl(5.0, 0.0, 0.0, 0.0);
-        l = l.border(Sides::trbl(0.0, 3.0, 3.0, 3.0), blue3());
+        l.margin = Sides::trbl(SWAY_GAP, SPACE_L, SPACE_L, SPACE_L);
+        l = l.border(Sides::all(BORDER), blue3());
         l.font.size = 32.0;
         l.font.weight = 700;
-        l.padding = Sides::vh(3.0, 6.0);
+        l.padding = Sides::vh(SPACE_S, SPACE_M);
         l.background = Background::Color(dark1());
         let wait = break_wait().peek();
         let progress = BREAK_START.with(|s| s.get()).map(|s| s.elapsed().as_secs_f64() / 10.0).unwrap_or(wait.max(0.0));

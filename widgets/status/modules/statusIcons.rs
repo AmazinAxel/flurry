@@ -4,7 +4,7 @@ use crate::lib::iwd;
 use crate::lib::state::State;
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::style::*;
-use crate::ui::node::{Align, Node, Style, alpha, shadow};
+use crate::ui::node::{Align, Node, Style, alpha};
 
 thread_local! {
     static NETWORK_ICON: State<&'static str> = State::new("network-wireless-offline-symbolic");
@@ -46,7 +46,6 @@ thread_local! {
 fn img(base: &Style, name: &'static str) -> Node {
     let mut s = base.inherit();
     s.color = light1();
-    s.icon_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(12.0, alpha(blue2(), 0.8))];
     Node::icon(s, name, 36.0)
 }
 
@@ -65,23 +64,23 @@ pub fn battery_icon(base: &Style) -> Node {
     let pct = (b.percentage * 100.0).round() as i64;
     let low = pct < 99;
     let mut bat_icon = img(base, if b.icon.is_empty() { "battery-missing-symbolic" } else { leak(&b.icon) });
+    bat_icon.style.color = blue3();
     if low {
         bat_icon.style.opacity = 0.4;
     }
     let mut pct_style = base.inherit();
     pct_style.font.size = 24.0;
     pct_style.font.weight = 700;
-    pct_style.color = if b.charging() { green() } else { blue2() };
+    pct_style.color = if b.charging() { green() } else { alpha(blue1(), 0.9) };
     Node::overlay(base.inherit(), vec![bat_icon, Node::label(pct_style, pct.to_string()).show(low)]).show(has)
 }
 
 pub fn status(base: &Style) -> Node {
     let mut rec = base.inherit();
     rec.color = red();
-    rec.icon_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(12.0, red())];
 
     // one evenly spaced column, centered on the row whatever is shown
-    Node::vbox(base.inherit(), 10.0, vec![
+    Node::vbox(base.inherit(), SPACE_M, vec![
         Node::icon(rec, "media-record-symbolic", 36.0).show(crate::widgets::record::service::is_rec().peek()),
         battery_icon(base),
         img(base, network_icon().peek()),

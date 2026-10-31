@@ -257,8 +257,20 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         let x = r.x() - e.scroll;
         let y = r.y() + ((r.height() - layout.height()) / 2.0).floor();
         let clip = r;
-        // paint into a layer bounded horizontally to the text area (vertical slack for shadows)
+        // paint into a layer bounded horizontally to the text area (vertical slack for descenders)
         let bound = Rect::from_ltrb(r.left(), r.top() - r.height(), r.right(), r.bottom() + r.height()).unwrap_or(r);
+        // shadows blur only the glyphs that are shown, so they fade out past the text area's edges
+        for sh in shadows.iter().filter(|_| !text_s.is_empty()) {
+            let content = super::node::hash(&(layout.content_hash(), (x - r.x()).to_bits(), (y - r.y()).to_bits(), r.width().to_bits(), r.height().to_bits()));
+            let area = bound.transform(Transform::from_translate(sh.x, sh.y)).unwrap_or(bound);
+            let tint = sh.over(color).color;
+            super::node::blurred(pm, area, sh.blur, tint, ts, content, |p, t| {
+                if let Some((mut layer, (ox, oy))) = super::node::clip_layer(bound, t) {
+                    text::draw(&mut layer.as_mut(), &layout, x, y, Color::BLACK, t.post_translate(-ox, -oy));
+                    super::node::blit(p, layer.as_ref(), (ox + sh.x * ts.sx) as i32, (oy + sh.y * ts.sy) as i32, 1.0);
+                }
+            });
+        }
         let Some((mut area, (lx, ly))) = super::node::clip_layer(bound, ts) else { return };
         let outer = pm;
         let pm = &mut area.as_mut();
@@ -269,9 +281,6 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
             if let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height()).and_then(|s| s.intersect(&clip)) {
                 fill_rect(pm, sel, look.selection_bg, ts);
             }
-        }
-        for sh in &shadows {
-            super::node::paint_text_shadow(pm, &layout, x, y, sh, ts);
         }
         text::draw(pm, &layout, x, y, color, ts);
         if a != b && !shown.is_empty() {

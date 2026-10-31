@@ -38,8 +38,23 @@ impl Sink {
         self.known
     }
 
-    fn set_props(&mut self, channels: Option<Vec<f32>>, mute: Option<bool>) {
+    /// Node Props. A device sink's are only placeholders until its Route has answered: new nodes
+    /// start at 1.0 and WirePlumber restores the saved volume on the Route.
+    fn set_node_props(&mut self, channels: Option<Vec<f32>>, mute: Option<bool>) {
+        if self.routed {
+            return;
+        }
+        self.known |= (channels.is_some() || mute.is_some()) && self.device.zip(self.profile_device).is_none();
+        self.set_props(channels, mute);
+    }
+
+    fn set_route_props(&mut self, channels: Option<Vec<f32>>, mute: Option<bool>) {
+        self.routed = true;
         self.known |= channels.is_some() || mute.is_some();
+        self.set_props(channels, mute);
+    }
+
+    fn set_props(&mut self, channels: Option<Vec<f32>>, mute: Option<bool>) {
         if let Some(c) = channels {
             self.volume = c.iter().fold(0.0f32, |a, b| a.max(b.cbrt())) as f64;
             self.channels = c;
@@ -70,8 +85,6 @@ impl Sink {
 struct Route {
     index: i32,
     device: i32,
-    channels: Option<Vec<f32>>,
-    mute: Option<bool>,
 }
 
 struct PortInfo {
@@ -100,6 +113,8 @@ thread_local! {
     static SINKS: State<Vec<Sink>> = State::new(vec![]);
     static DEFAULT: State<Option<String>> = State::new(None);
     static READY: State<bool> = State::new(false);
+    /// Route reads in flight: (core sync sequence, sink), answered after the device's params
+    static ROUTE_READS: RefCell<Vec<(spa::utils::result::AsyncSeq, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn speakers() -> State<Vec<Sink>> {
@@ -194,6 +209,14 @@ pub fn start() {
             if Some(seq) == pending {
                 ready().set(true);
             }
+            // the device has no Route for this sink: its node Props are all there is
+            let read = ROUTE_READS.with(|r| {
+                let mut r = r.borrow_mut();
+                r.iter().position(|(s, _)| *s == seq).map(|i| r.remove(i).1)
+            });
+            if let Some(id) = read {
+                update_sink(id, |s| s.known = true);
+            }
         })
         .error(move |id, _, res, _| {
             // core connection lost (pipewire restarted): drop everything and reconnect
@@ -256,31 +279,31 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
             let Some(props) = info.props() else { return };
             let device: Option<u32> = props.get("device.id").and_then(|v| v.parse().ok());
             let pd: Option<i32> = props.get("card.profile.device").and_then(|v| v.parse().ok());
-            let route = device.zip(pd).and_then(|(dev, pd)| {
-                with(|p| p.devices.get(&dev).and_then(|(_, _, routes)| routes.iter().find(|r| r.device == pd).map(|r| (r.channels.clone(), r.mute))))
-                    .flatten()
-            });
             update_sink(id, |s| {
                 s.device = device.or(s.device);
                 s.profile_device = pd.or(s.profile_device);
-                if let Some((c, m)) = route {
-                    s.routed = true;
-                    s.set_props(c, m);
-                }
             });
+            // a device's cached Route can predate the volume restore: always ask for the current one
+            let unread = speakers().with(|l| l.iter().any(|s| s.id == id && !s.known));
+            if let (Some(dev), Some(_), true) = (device, pd, unread) {
+                with(|p| {
+                    if let Some((d, _, _)) = p.devices.get(&dev) {
+                        d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
+                        if let Ok(seq) = p.core.sync(0) {
+                            ROUTE_READS.with(|r| r.borrow_mut().push((seq, id)));
+                        }
+                    }
+                });
+            }
         })
         .param(move |_, _, _, _, pod| {
             let Some(pod) = pod else { return };
             if let Some(Value::Object(o)) = deserialize(pod.as_bytes()) {
                 let (channels, mute) = parse_props(o);
-                update_sink(id, |s| {
-                    if !s.routed {
-                        s.set_props(channels, mute);
-                    }
-                });
+                update_sink(id, |s| s.set_node_props(channels, mute));
                 // a routed sink's volume lives on its device, whose Route param isn't re-sent when
                 // it changes (only at subscribe): the node's Props change is the cue to re-read it
-                let device = speakers().with(|l| l.iter().find(|s| s.id == id && s.routed).and_then(|s| s.device));
+                let device = speakers().with(|l| l.iter().find(|s| s.id == id && s.profile_device.is_some()).and_then(|s| s.device));
                 if let Some(dev) = device {
                     with(|p| {
                         if let Some((d, _, _)) = p.devices.get(&dev) {
@@ -329,17 +352,15 @@ fn bind_device(reg: &pw::registry::Registry, id: u32) {
                 Some(Value::Object(props)) => parse_props(props),
                 _ => (None, None),
             };
-            let (c, m) = (channels.clone(), mute);
             with(|p| {
                 if let Some((_, _, routes)) = p.devices.get_mut(&id) {
                     routes.retain(|r| r.device != device);
-                    routes.push(Route { index, device, channels: c, mute: m });
+                    routes.push(Route { index, device });
                 }
             });
             speakers().update(|list| {
                 for s in list.iter_mut().filter(|s| s.device == Some(id) && s.profile_device == Some(device)) {
-                    s.routed = true;
-                    s.set_props(channels.clone(), mute);
+                    s.set_route_props(channels.clone(), mute);
                 }
             });
         })
@@ -496,4 +517,29 @@ pub fn link(output: &str, input: &str, connect: bool) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_sink_volume_comes_from_its_route() {
+        let mut s = Sink { device: Some(1), profile_device: Some(3), ..Default::default() };
+        s.set_node_props(Some(vec![1.0, 1.0]), Some(false));
+        assert!(!s.known(), "a new node's 1.0 is not its volume yet");
+        s.set_route_props(Some(vec![0.027, 0.027]), Some(false));
+        assert!(s.known());
+        assert!((s.volume - 0.3).abs() < 1e-3);
+        s.set_node_props(Some(vec![1.0, 1.0]), None);
+        assert!((s.volume - 0.3).abs() < 1e-3, "node Props never override the Route");
+    }
+
+    #[test]
+    fn deviceless_sink_volume_comes_from_node_props() {
+        let mut s = Sink::default();
+        s.set_node_props(Some(vec![0.125, 0.125]), Some(false));
+        assert!(s.known());
+        assert!((s.volume - 0.5).abs() < 1e-3);
+    }
 }

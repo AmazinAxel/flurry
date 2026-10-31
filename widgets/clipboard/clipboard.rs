@@ -54,7 +54,6 @@ thread_local! {
     static THUMBS: RefCell<HashMap<u64, Thumb>> = RefCell::default();
     static QUERY: RefCell<String> = const { RefCell::new(String::new()) };
     static SELECTED: Cell<Option<u64>> = const { Cell::new(None) };
-    static SCROLL: Cell<f32> = const { Cell::new(0.0) };
     static PRODUCE: Rc<runtime::Queue> = Rc::default();
     static REFRESH: Rc<runtime::Queue> = Rc::default();
 }
@@ -201,12 +200,11 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
         return match THUMBS.with(|t| t.borrow().get(&item.id).cloned()) {
             Some(Thumb::Ready(p, k)) => {
                 let (w, h) = (p.width() as f32 / k, p.height() as f32 / k);
-                let mut s = base.inherit();
-                s.box_shadow = vec![shadow_()];
+                let s = base.inherit();
                 let pic = Node::new(Kind::Picture { pixmap: crate::ui::node::Img::Pix(p), cover: false, blur: 0.0, density: k }, base.inherit());
                 let mut kids = vec![pic];
                 if item.video {
-                    let ps = Style { background: Background::Color(rgba(0, 0, 0, 0.5)), padding: Sides::all(8.0), color: tiny_skia::Color::WHITE, ..base.inherit() };
+                    let ps = Style { background: Background::Color(rgba(0, 0, 0, 0.5)), padding: Sides::all(SPACE_M), color: tiny_skia::Color::WHITE, ..base.inherit() };
                     kids.push(Node::icon(ps, "media-playback-start-symbolic", 42.0).align(Align::Center, Align::Center));
                 }
                 Some(Node::overlay(s, kids).size(w, h).align(Align::Center, Align::Center))
@@ -248,7 +246,6 @@ fn select_top(keep: bool) {
     let cur = SELECTED.with(Cell::get);
     if !keep || cur.is_none() || !rows.iter().any(|r| Some(r.id) == cur) {
         SELECTED.with(|s| s.set(rows.first().map(|r| r.id)));
-        SCROLL.with(|s| s.set(0.0));
     }
 }
 
@@ -408,24 +405,9 @@ fn spawn_exec(argv: Vec<String>) {
     });
 }
 
-/// Keeps the selected row inside the 460px viewport.
-fn scroll_into_view(rows: &[(u64, f32, f32)], viewport: f32) {
-    let sel = SELECTED.with(Cell::get);
-    let Some(&(_, top, h)) = rows.iter().find(|r| Some(r.0) == sel) else { return };
-    SCROLL.with(|s| {
-        let mut off = s.get();
-        if top < off {
-            off = top;
-        } else if top + h > off + viewport {
-            off = top + h - viewport;
-        }
-        s.set(off.max(0.0));
-    });
-}
-
 pub fn clipboard() {
     let _ = std::fs::create_dir_all(cache_dir());
-    let e = entry::new("Clipboard");
+    let e = entry::new("");
     e.borrow_mut().on_change = Some(Rc::new(|text: &str| {
         QUERY.with(|q| *q.borrow_mut() = text.to_lowercase());
         select_top(false);
@@ -439,31 +421,29 @@ pub fn clipboard() {
         let rows = visible_rows();
         let sel = SELECTED.with(Cell::get);
         let mut nodes = vec![];
-        let mut geometry = vec![];
-        let mut y = 10.0;
+        let mut center = None;
         let count = rows.len();
         for (i, item) in rows.iter().enumerate() {
             let selected = Some(item.id) == sel;
             let mut s = base.inherit();
-            s.padding = Sides::all(8.0);
-            s = s.border(Sides::all(1.0), dark4());
+            s.padding = Sides::all(SPACE_M);
+            s = s.border(Sides::all(BORDER), dark4());
             s.background = Background::Color(dark2());
-            s.margin.bottom = if i + 1 == count { 0.0 } else { 8.0 };
+            s.margin.bottom = if i + 1 == count { 0.0 } else { BORDER };
             s.color = light1();
             if selected {
                 s = focus_outline(s);
-                s.translate_y = -2.0;
             }
             let Some(inner) = item_node(&base, item, &s) else { continue };
-            let row = Node::vbox(s, 0.0, vec![inner]);
-            let h = row.measure_h(500.0 - 32.0 - 6.0).1;
-            geometry.push((item.id, y, h + row.style.margin.bottom));
-            y += h + row.style.margin.bottom;
-            nodes.push(row);
+            if selected {
+                center = Some(nodes.len());
+            }
+            nodes.push(Node::vbox(s, 0.0, vec![inner]));
         }
-        scroll_into_view(&geometry, 460.0);
-        let list = Node::vbox(Style { padding: Sides::trbl(10.0, 0.0, 0.0, 0.0), ..base.inherit() }, 0.0, nodes);
-        let scroll = Node::scroll(base.inherit(), 460.0, SCROLL.with(Cell::get), list).show(count > 0);
+        // room for the first and last rows' outline inside the clip; the last row's hangs into the
+        // card's padding, so the rows end as far from the border as they do at the sides
+        let list = Node::vbox(Style { padding: Sides::trbl(SPACE_M, 0.0, BORDER, 0.0), ..base.inherit() }, 0.0, nodes);
+        let scroll = Node::scroll(Style { margin: Sides::trbl(0.0, 0.0, -BORDER, 0.0), ..base.inherit() }, 460.0, center, list).show(count > 0);
         let header = search_entry(&base, &ec, "system-search-symbolic", v.focused("entry"));
         background_section(&base, header, Some(scroll), 700.0, 500.0)
     };

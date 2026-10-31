@@ -25,11 +25,10 @@ pub struct SearchSpec<T> {
 pub fn search_entry(base: &Style, entry: &EntryRef, icon: &'static str, focused: bool) -> Node {
     let mut s = crate::lib::backgroundSection::header_style(base);
     s.font.size = 24.0;
-    s.padding = Sides::trbl(0.0, 8.0, 0.0, 32.0);
+    s.padding = Sides::trbl(0.0, SPACE_M, 0.0, SPACE_L);
     s.min_height = 36.0;
-    s.outline = Some((2.0, -3.0, rgba(255, 255, 255, 0x1c as f32 / 255.0)));
     let mut img_style = s.inherit();
-    img_style.margin = Sides::trbl(0.0, 6.0, 2.0, 2.0);
+    img_style.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
     let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
     let _ = focused;
     Node::hbox(s.clone(), 0.0, vec![
@@ -43,8 +42,9 @@ pub fn search_entry(base: &Style, entry: &EntryRef, icon: &'static str, focused:
 pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str) -> Node {
     let mut s = base.inherit();
     s.min_height = 36.0;
-    s.padding = Sides::vh(0.0, 8.0);
+    s.padding = Sides::vh(0.0, SPACE_M);
     s.background = Background::Color(rgba(255, 255, 255, 0.04));
+    s = s.border(Sides::all(BORDER), dark4());
     // Graphite entry text; :focus-within never matches (GTK does not consider layer windows active)
     s.color = rgba(255, 255, 255, 0.7);
     let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
@@ -61,10 +61,8 @@ pub fn sel_fg() -> tiny_skia::Color {
 /// `.searchableDialog button` row, selected/disabled states.
 pub fn row_style(base: &Style, selected: bool, sensitive: bool) -> Style {
     let mut s = button(base);
-    s.padding = Sides::all(8.0);
     if selected {
         s = focus_outline(s);
-        s.translate_y = -2.0;
     }
     if !sensitive {
         s.opacity = 0.35;
@@ -106,7 +104,7 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
                     Node::hbox(s, 0.0, vec![inner])
                 })
                 .collect();
-            let content = Node::vbox(Style { margin: Sides::trbl(6.0, 0.0, 0.0, 0.0), ..base.inherit() }, 6.0, rows).show(!list.is_empty());
+            let content = Node::vbox(base.inherit(), BORDER, rows).show(!list.is_empty());
             let header = search_entry(&base, &entry, "system-search-symbolic", v.focused("entry"));
             background_section(&base, header, Some(content), 700.0, 500.0)
         }

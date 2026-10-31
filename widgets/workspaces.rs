@@ -37,14 +37,13 @@ fn update() {
 
 fn column(base: &Style, focused: i64, occupied: &BTreeSet<i64>) -> Node {
     let mut col = status_element(base);
-    col.padding = Sides::vh(3.0, 0.0);
-    col.margin = Sides::trbl(5.0, 0.0, 0.0, 5.0);
+    col.padding = Sides::vh(SPACE_S, 0.0);
+    col.margin = Sides::trbl(SWAY_GAP, SPACE_L, SPACE_L, SWAY_GAP);
     let mut kids: Vec<Node> = (1..=9)
         .map(|id| {
-            let mut s = Style { min_width: 21.0, min_height: 26.0, margin: Sides::vh(5.0, 8.0), background: Background::Color(dark2()), ..base.inherit() };
+            let mut s = Style { min_width: 21.0, min_height: 26.0, margin: Sides::vh(SPACE_S, SPACE_M), background: Background::Color(dark2()), ..base.inherit() };
             if focused == id {
                 s.background = Background::Color(blue2());
-                s.box_shadow = vec![glow(5.0, blue3())];
                 s.min_height = 34.0;
             } else if occupied.contains(&id) {
                 s.background = Background::Color(dark4());
@@ -56,7 +55,7 @@ fn column(base: &Style, focused: i64, occupied: &BTreeSet<i64>) -> Node {
     let count = SCRATCHPAD.with(|s| s.peek());
     let mut l = base.inherit();
     l.opacity = 0.5;
-    l.margin = Sides::trbl(2.0, 8.0, 3.0, 8.0);
+    l.margin = Sides::vh(SPACE_S, SPACE_M);
     kids.push(Node::label(l, count.to_string()).show(count > 0));
     Node::vbox(col, 0.0, kids)
 }
@@ -74,7 +73,7 @@ pub fn workspaces() {
         let (w, h) = (full.measure_w().1 + full.style.margin.h(), full.measure_h(f32::MAX).1 + full.style.margin.v());
         let mut n = n.align(Align::Start, Align::Start);
         // SLIDE_RIGHT revealer hiding: content slides left out of the window
-        n.style.margin.left -= (1.0 - f.progress()) * (w + 5.0);
+        n.style.margin.left -= (1.0 - f.progress()) * (w + SPACE_L);
         Node::hbox(base.inherit(), 0.0, vec![n]).size(w, h).align(Align::Start, Align::Start)
     });
     let w2: Rc<Win> = w.clone();

@@ -59,7 +59,8 @@ impl Flash {
         self.hiding.set(None);
         self.count.set(self.count.get() + 1);
         win.show();
-        win.redraw();
+        // shown again mid slide-out: the old content must not stay up for another frame
+        win.redraw_now();
         let (f, w) = (self.clone(), Rc::downgrade(win));
         runtime::timeout(self.ms, move || {
             f.count.set(f.count.get() - 1);

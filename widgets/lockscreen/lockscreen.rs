@@ -15,7 +15,7 @@ use crate::lib::sway;
 use crate::lib::time::{format_now, now};
 use crate::lib::wallpaper;
 use crate::ui::entry::{self, Entry, EntryRef};
-use crate::ui::node::{Align, Background, Kind, LabelSpec, Node, Shadow, Sides, Style, alpha, hash, rgba, shadow};
+use crate::ui::node::{Align, Background, Kind, LabelSpec, Node, Sides, Style, alpha, hash, rgba};
 use crate::ui::runtime::{self, Timer};
 use crate::ui::wayland::{self, KeyEvent, Keymode, LockEvent, Surface};
 use crate::ui::window;
@@ -135,22 +135,21 @@ fn clock_style(failed: Failed) -> Style {
     let mut s = window();
     s.font = font(IOSEVKA, 192.0);
     s.color = alpha(blue1(), 0.9);
-    s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(32.0, alpha(blue2(), 0.8))];
+    s.text_shadow = vec![glow(32.0, alpha(blue2(), 0.8))];
     match failed {
         Failed::Password => {
             s.color = red();
-            s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(16.0, red())];
+            s.text_shadow = vec![glow(16.0, red())];
         }
         Failed::Fprint => {
             s.color = orange();
-            s.text_shadow = vec![shadow(0.0, 2.0, 6.0, alpha(dark1(), 0.6)), glow(16.0, orange())];
+            s.text_shadow = vec![glow(16.0, orange())];
         }
         Failed::None => {}
     }
-    s = s.border(Sides::all(3.0), blue3());
+    s = s.border(Sides::all(BORDER), blue3());
     s.padding = Sides::trbl(30.0, 31.0, 20.0, 26.0);
     s.background = Background::Color(alpha(dark1(), 0.45));
-    s.box_shadow = vec![Shadow { ..shadow(0.0, 0.0, 48.0, alpha(dark1(), 0.35)) }];
     s
 }
 
@@ -162,7 +161,7 @@ fn build(_w: f32, _h: f32) -> Node {
         *line_height = Some(0.75);
     }
     let mut bat = battery_icon(&base).align(Align::Start, Align::End);
-    bat.style.margin = Sides::all(24.0);
+    bat.style.margin = Sides::all(SPACE_L);
     Node::overlay(base.inherit(), vec![clock, bat])
 }
 

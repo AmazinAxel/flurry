@@ -285,6 +285,12 @@ impl Win {
         }
     }
 
+    pub fn redraw_now(&self) {
+        for (_, s) in self.surfaces.borrow().iter() {
+            s.redraw_now();
+        }
+    }
+
     /// Redraws whenever `state` changes.
     pub fn watch<T: Clone + PartialEq + 'static>(self: &Rc<Self>, state: &State<T>) {
         let weak = Rc::downgrade(self);
