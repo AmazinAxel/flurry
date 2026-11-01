@@ -13,6 +13,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      pr: ${{ steps.update.outputs.pull-request-number }}
 
     steps:
       - name: Checkout
@@ -31,19 +33,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      # only a lock that still builds gets merged
-      - name: Build
-        if: ${{ steps.update.outputs.pull-request-number != '' }}
-        run: |
-          gh pr checkout "$PR"
-          nix develop -c cargo test
-        env:
-          PR: ${{ steps.update.outputs.pull-request-number }}
-          GH_TOKEN: ${{ github.token }}
+  # the new lock's code runs here, with a read-only token that isn't left in the checkout
+  test:
+    needs: update-flake-lock
+    if: ${{ needs.update-flake-lock.outputs.pr != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/pull/${{ needs.update-flake-lock.outputs.pr }}/head
+          persist-credentials: false
+
+      - name: Head
+        id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
+
+      - name: Lint
+        run: nix develop -c cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: nix develop -c cargo test
+
+      - name: Package
+        run: nix build .#checks.x86_64-linux.package
+
+  # only a lock that still builds gets merged, and only the commit that was tested
+  merge:
+    needs: [update-flake-lock, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
       - name: Merge PR
-        if: ${{ steps.update.outputs.pull-request-number != '' }}
-        run: gh pr merge "$PR" --rebase --delete-branch
+        run: gh pr merge "$PR" --repo "$REPO" --rebase --delete-branch --match-head-commit "$SHA"
         env:
-          PR: ${{ steps.update.outputs.pull-request-number }}
+          PR: ${{ needs.update-flake-lock.outputs.pr }}
+          SHA: ${{ needs.test.outputs.sha }}
+          REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}

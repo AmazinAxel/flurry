@@ -68,12 +68,19 @@ pub fn unwatch(fd: RawFd) {
     RT.with(|rt| {
         rt.fds.borrow_mut().remove(&fd);
         rt.pri.borrow_mut().retain(|&p| p != fd);
+        rt.poll_out.borrow_mut().retain(|&p| p != fd);
     });
 }
 
-/// The next poll also calls `fd`'s watch once it's writable (a write that hit a full socket).
+/// Polls also call `fd`'s watch once it's writable (a write that hit a full socket); it stays
+/// armed until that happens or `unwatch`.
 pub fn poll_out(fd: RawFd) {
-    RT.with(|rt| rt.poll_out.borrow_mut().push(fd));
+    RT.with(|rt| {
+        let mut out = rt.poll_out.borrow_mut();
+        if !out.contains(&fd) {
+            out.push(fd);
+        }
+    });
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,7 +211,7 @@ pub fn iterate(block: bool) {
     let mut fds = RT.with(|rt| {
         let mut v = std::mem::take(&mut *rt.pollfds.borrow_mut());
         v.clear();
-        let out = std::mem::take(&mut *rt.poll_out.borrow_mut());
+        let out = rt.poll_out.borrow();
         let pri = rt.pri.borrow();
         let events = |fd| {
             if pri.contains(&fd) {
@@ -226,9 +233,23 @@ pub fn iterate(block: bool) {
                 unwatch(p.fd);
                 continue;
             }
+            // signalled writable (or failed): disarmed; a write that fills it again re-arms
+            if p.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
+                RT.with(|rt| rt.poll_out.borrow_mut().retain(|&o| o != p.fd));
+            }
             if let Some(f) = RT.with(|rt| rt.fds.borrow().get(&p.fd).cloned()) {
                 guard(|| f());
                 poll_tasks();
+            }
+            // sysfs reports every change as POLLPRI|POLLERR, and a removed attribute the same way
+            // forever: one that can't be read anymore is gone, stop watching it
+            if p.revents & libc::POLLERR != 0 && RT.with(|rt| rt.pri.borrow().contains(&p.fd)) {
+                let mut b = 0u8;
+                if unsafe { libc::pread(p.fd, (&raw mut b).cast(), 1, 0) } < 0
+                    && !matches!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock)
+                {
+                    unwatch(p.fd);
+                }
             }
         }
     }

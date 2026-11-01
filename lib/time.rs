@@ -32,8 +32,11 @@ pub fn update() {
     // pick up timezone changes (travel, DST rules) on every tick and wake-up
     unsafe { tzset() };
     let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    now().set(d.as_secs() as i64);
-    let ms = (60 - d.as_secs() % 60) * 1000 - d.subsec_millis() as u64;
+    // minute-aligned, so a re-sync within the same minute changes nothing
+    now().set((d.as_secs() / 60 * 60) as i64);
+    // rounded up: a timer a fraction of a millisecond early would tick twice for one minute
+    let into_minute = (d.as_secs() % 60) as u128 * 1_000_000_000 + d.subsec_nanos() as u128;
+    let ms = (60_000_000_000 - into_minute).div_ceil(1_000_000) as u64;
     let t = runtime::timeout(ms, update);
     TICK.with(|x| *x.borrow_mut() = Some(t));
 }

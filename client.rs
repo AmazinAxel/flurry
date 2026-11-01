@@ -15,8 +15,14 @@ fn main() {
         eprintln!("flurry: {}", std::process::Command::new(shell).exec());
         std::process::exit(1);
     }
-    // one datagram, no reply: a busy shell never stalls the keybind
-    let sent = xdg::socket_path().zip(UnixDatagram::unbound().ok()).is_some_and(|(p, s)| s.send_to(args.join(" ").as_bytes(), p).is_ok());
+    // one datagram, no reply, never blocking: a busy shell (full queue) drops it, never stalls the keybind
+    let sent = xdg::socket_path().zip(UnixDatagram::unbound().ok()).is_some_and(|(p, s)| {
+        let _ = s.set_nonblocking(true);
+        match s.send_to(args.join(" ").as_bytes(), p) {
+            Ok(_) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+        }
+    });
     if !sent {
         eprintln!("flurry is not running");
         std::process::exit(1);

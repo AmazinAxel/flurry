@@ -65,7 +65,8 @@ fn apply(pl: &mut Player, props: &PropMap) {
     }
 }
 
-fn refresh(name: String) {
+/// GetAll for `name`; a reply outdated by a change meanwhile is asked again once (`retry`).
+fn refresh(name: String, retry: bool) {
     let Some(bus) = dbus::session() else { return };
     let Some(seq) = PLAYERS.with(|p| p.borrow_mut().get_mut(&name).map(|pl| {
         pl.seq += 1;
@@ -75,12 +76,18 @@ fn refresh(name: String) {
         let Ok(m) = r else { return };
         let Ok(props) = m.read1::<PropMap>() else { return };
         // gone, or changed since the call went out
-        PLAYERS.with(|p| {
-            if let Some(pl) = p.borrow_mut().get_mut(&name).filter(|pl| pl.seq == seq) {
+        let stale = PLAYERS.with(|p| match p.borrow_mut().get_mut(&name) {
+            Some(pl) if pl.seq == seq => {
                 *pl = Player { owner: std::mem::take(&mut pl.owner), seq, ..Default::default() };
                 apply(pl, &props);
+                false
             }
+            Some(_) => true,
+            None => false,
         });
+        if stale && retry {
+            return refresh(name, false);
+        }
         publish();
     });
 }
@@ -99,7 +106,7 @@ fn set(name: &str, owner: &str) {
         }
     });
     if !owner.is_empty() {
-        refresh(name.into());
+        refresh(name.into(), true);
     }
     publish();
 }
@@ -121,7 +128,7 @@ pub fn start() {
             }
         },
     );
-    // applied to the player owning the sender's unique name
+    // applied to the players owned by the sender's unique name
     bus.subscribe(
         SignalFilter { path: Some(PATH.into()), interface: Some("org.freedesktop.DBus.Properties".into()), member: Some("PropertiesChanged".into()), ..Default::default() },
         |m| {
@@ -130,15 +137,20 @@ pub fn start() {
             if iface != PLAYER {
                 return;
             }
-            let stale = PLAYERS.with(|p| {
+            // one connection can own several player names
+            let stale: Vec<String> = PLAYERS.with(|p| {
                 let mut p = p.borrow_mut();
-                let (name, pl) = p.iter_mut().find(|(_, pl)| pl.owner == *sender)?;
-                pl.seq += 1;
-                apply(pl, &changed);
-                invalidated.iter().any(|k| k == "PlaybackStatus" || k == "Metadata").then(|| name.clone())
+                p.iter_mut()
+                    .filter(|(_, pl)| pl.owner == *sender)
+                    .filter_map(|(name, pl)| {
+                        pl.seq += 1;
+                        apply(pl, &changed);
+                        invalidated.iter().any(|k| k == "PlaybackStatus" || k == "Metadata").then(|| name.clone())
+                    })
+                    .collect()
             });
-            if let Some(name) = stale {
-                refresh(name);
+            for name in stale {
+                refresh(name, true);
             }
             publish();
         },

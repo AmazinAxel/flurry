@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::lib::apps::{App, exec_argv, fuzzy_query, launch, shell_line};
+use crate::lib::apps::{App, exec_argv, fuzzy_query, launch, reload_if_changed, shell_line};
 use crate::lib::searchDialog::{SearchSpec, search_dialog};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Node};
@@ -44,6 +44,6 @@ pub fn launcher() {
             n
         }),
         sensitive: Some(Box::new(|a| !(focus() && blockable(a)))),
-        on_show: None,
+        on_show: Some(Rc::new(reload_if_changed)),
     });
 }

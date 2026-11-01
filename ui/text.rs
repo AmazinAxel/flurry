@@ -2,7 +2,7 @@
 // hands out glyph outlines, which tiny-skia fills. Unhinted, grayscale, fractional positioning: the same output GTK4
 // gives at scale 2.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::rc::Rc;
@@ -294,12 +294,17 @@ pub struct Layout {
     pub lines: Vec<Line>,
     pub ascent: f32,
     pub line_height: f32,
+    /// content_hash, computed on first use (0: not yet)
+    hash: Cell<u64>,
 }
 
 impl Layout {
     /// Identifies the painted glyphs (shadow caches).
     pub fn content_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
+        if self.hash.get() != 0 {
+            return self.hash.get();
+        }
         let mut s = std::hash::DefaultHasher::new();
         Rc::as_ptr(&self.family).hash(&mut s);
         self.size.to_bits().hash(&mut s);
@@ -310,7 +315,9 @@ impl Layout {
             }
             u32::MAX.hash(&mut s);
         }
-        s.finish()
+        let h = s.finish().max(1);
+        self.hash.set(h);
+        h
     }
 
     pub fn width(&self) -> f32 {
@@ -346,13 +353,18 @@ fn shape_run(fam: &Family, size: f32, text: &str) -> Run {
     if fam.faces.is_empty() {
         return Run { glyphs };
     }
-    let face_for = |c: char| fam.faces.iter().position(|f| f.has(c)).unwrap_or(0);
     let chars: Vec<(usize, char)> = text.char_indices().collect();
+    // a char asking for emoji presentation (VS16) takes a color face that has it
+    let face_for = |k: usize| {
+        let c = chars[k].1;
+        let color = chars.get(k + 1).is_some_and(|n| n.1 == '\u{FE0F}');
+        color.then(|| fam.faces.iter().position(|f| f.png && f.has(c))).flatten().or_else(|| fam.faces.iter().position(|f| f.has(c))).unwrap_or(0)
+    };
     let mut i = 0;
     while i < chars.len() {
-        let face = face_for(chars[i].1);
+        let face = face_for(i);
         let mut j = i + 1;
-        while j < chars.len() && (chars[j].1.is_whitespace() || joins_previous(chars[j].1) || face_for(chars[j].1) == face) {
+        while j < chars.len() && (chars[j].1.is_whitespace() || joins_previous(chars[j].1) || face_for(j) == face) {
             j += 1;
         }
         let begin = chars[i].0;
@@ -393,21 +405,38 @@ fn shape_face(f: &Face, idx: usize, size: f32, s: &str, base: usize, out: &mut V
 thread_local! {
     /// Shaped layouts by a hash of their inputs (the text is kept to rule out collisions): a label is
     /// measured and painted several times per render, and most text is unchanged between renders.
-    /// Bounded; cleared wholesale when full.
-    static LAYOUTS: RefCell<HashMap<u64, (String, Rc<Layout>)>> = RefCell::default();
+    /// Bounded: when full, entries unused since the previous trim (generation) go.
+    static LAYOUTS: RefCell<HashMap<u64, (String, Rc<Layout>, Cell<u32>)>> = RefCell::default();
+    static LAYOUT_GEN: Cell<u32> = const { Cell::new(0) };
     static CHAR_WIDTHS: RefCell<HashMap<(&'static str, u16, u32), f32>> = RefCell::default();
 }
 
 const LAYOUT_CACHE: usize = 512;
 
+/// Drops every cached layout, glyph mask and color glyph (nothing on screen needs them right now).
+pub fn trim_caches() {
+    LAYOUTS.with(|c| *c.borrow_mut() = HashMap::new());
+    GLYPHS.with(|c| *c.borrow_mut() = (HashMap::new(), 0));
+    EMOJI.with(|c| *c.borrow_mut() = HashMap::new());
+}
+
 /// Lays out `text`; `max_width` triggers wrapping (Wrap::Word) or ellipsizing (`ellipsize`).
 pub fn layout(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool) -> Rc<Layout> {
-    layout_spaced(text, font, max_width, wrap, ellipsize, None, None)
+    layout_spaced(text, font, max_width, wrap, ellipsize, None, None, None)
+}
+
+/// Width of `text` on one line, not cached (an entry's caret and selection prefixes would only
+/// crowd out the layouts that are reused).
+pub fn width_uncached(text: &str, font: &Font) -> f32 {
+    layout_uncached(text, font, None, Wrap::None, false).width()
 }
 
 /// `layout` with CSS line-height `px` (extra space split above/below), then a Pango line-height
-/// `factor` on top.
-pub fn layout_spaced(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool, px: Option<f32>, factor: Option<f32>) -> Rc<Layout> {
+/// `factor` on top; past `max_lines` lines the rest is cut and the last kept line ellipsized.
+#[allow(clippy::too_many_arguments)]
+pub fn layout_spaced(
+    text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool, px: Option<f32>, factor: Option<f32>, max_lines: Option<usize>,
+) -> Rc<Layout> {
     let key = crate::ui::node::hash(&(
         text,
         font.family,
@@ -418,11 +447,28 @@ pub fn layout_spaced(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap
         ellipsize,
         px.map(f32::to_bits),
         factor.map(f32::to_bits),
+        max_lines,
     ));
-    if let Some(l) = LAYOUTS.with(|c| c.borrow().get(&key).filter(|(t, _)| t == text).map(|(_, l)| l.clone())) {
+    let generation = LAYOUT_GEN.with(Cell::get);
+    let hit = LAYOUTS.with(|c| {
+        c.borrow().get(&key).filter(|(t, ..)| t == text).map(|(_, l, g)| {
+            g.set(generation);
+            l.clone()
+        })
+    });
+    if let Some(l) = hit {
         return l;
     }
     let mut l = layout_uncached(text, font, max_width, wrap, ellipsize);
+    if let Some(n) = max_lines
+        && l.lines.len() > n
+    {
+        l.lines.truncate(n.max(1));
+        let fam = l.family.clone();
+        if let Some(last) = l.lines.last_mut() {
+            ellipsize_line(&fam, font, last, max_width.unwrap_or(f32::INFINITY));
+        }
+    }
     let h = px.unwrap_or(l.line_height) * factor.unwrap_or(1.0);
     l.ascent += (h - l.line_height) / 2.0;
     l.line_height = h;
@@ -430,9 +476,14 @@ pub fn layout_spaced(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap
     LAYOUTS.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() >= LAYOUT_CACHE {
-            c.clear();
+            // keep what was used since the last trim; if that is most of it, start over
+            c.retain(|_, (.., g)| g.get() == generation);
+            if c.len() >= LAYOUT_CACHE * 3 / 4 {
+                c.clear();
+            }
+            LAYOUT_GEN.with(|g| g.set(generation.wrapping_add(1)));
         }
-        c.insert(key, (text.to_string(), l.clone()));
+        c.insert(key, (text.to_string(), l.clone(), Cell::new(LAYOUT_GEN.with(Cell::get))));
     });
     l
 }
@@ -458,7 +509,7 @@ fn layout_uncached(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, 
             _ => lines.push(to_line(&run.glyphs)),
         }
     }
-    Layout { family: fam, size: font.size, lines, ascent, line_height: (ascent + descent).ceil() }
+    Layout { family: fam, size: font.size, lines, ascent, line_height: (ascent + descent).ceil(), hash: Cell::new(0) }
 }
 
 fn to_line(glyphs: &[(usize, u32, f32, f32, f32, usize)]) -> Line {
@@ -528,6 +579,23 @@ fn ellipsize_run(fam: &Family, font: &Font, run: &Run, max: f32) -> Line {
     let mut glyphs = g[..keep].to_vec();
     glyphs.extend(dots.glyphs);
     to_line(&glyphs)
+}
+
+/// A cut line ended with an ellipsis, glyphs dropped from its end until it fits in `max`.
+fn ellipsize_line(fam: &Family, font: &Font, line: &mut Line, max: f32) {
+    let dots = shape_run(fam, font.size, "…");
+    let dots_w: f32 = dots.glyphs.iter().map(|g| g.2).sum();
+    while line.width + dots_w > max
+        && let Some(g) = line.glyphs.pop()
+    {
+        line.width = g.x;
+    }
+    let mut x = line.width;
+    for &(face, id, adv, xo, yo, _) in &dots.glyphs {
+        line.glyphs.push(Glyph { face, id, x: x + xo, y: yo });
+        x += adv;
+    }
+    line.width = x;
 }
 
 thread_local! {
@@ -609,10 +677,15 @@ struct Coverage {
     y: i32,
 }
 
+type GlyphKey = (usize, u32, u32, bool, u8, u8);
+
 thread_local! {
-    /// (face, glyph, device scale, embolden, quarter-pixel phase x/y) -> coverage
-    static GLYPHS: RefCell<HashMap<(usize, u32, u32, bool, u8, u8), Option<Rc<Coverage>>>> = RefCell::default();
+    /// (face, glyph, device scale, embolden, quarter-pixel phase x/y) -> coverage, and the masks' bytes
+    static GLYPHS: RefCell<(HashMap<GlyphKey, Option<Rc<Coverage>>>, usize)> = RefCell::default();
 }
+
+/// Mask bytes kept before the glyph cache starts over (a few windows' worth of text).
+const GLYPH_BUDGET: usize = 4 << 20;
 
 /// Draws an outline glyph from its cached coverage mask: rasterizing every glyph every frame was
 /// most of a text-heavy window's paint time. Positions snap to quarter pixels.
@@ -622,14 +695,17 @@ fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, path: 
     let (px, py) = ((qx / 4.0).floor(), (qy / 4.0).floor());
     let (fx, fy) = ((qx - px * 4.0) as u8, (qy - py * 4.0) as u8);
     let key = (Rc::as_ptr(face) as usize, glyph, t.sx.to_bits(), embolden, fx, fy);
-    let mask = GLYPHS.with(|c| c.borrow().get(&key).cloned()).unwrap_or_else(|| {
+    let mask = GLYPHS.with(|c| c.borrow().0.get(&key).cloned()).unwrap_or_else(|| {
         let m = rasterize(face, path, embolden, t.sx, fx as f32 / 4.0, fy as f32 / 4.0).map(Rc::new);
         GLYPHS.with(|c| {
-            let mut c = c.borrow_mut();
-            if c.len() >= 8192 {
-                c.clear();
+            let (map, bytes) = &mut *c.borrow_mut();
+            let size = m.as_ref().map_or(0, |m| m.mask.data().len()) + 64;
+            if map.len() >= 8192 || *bytes + size > GLYPH_BUDGET {
+                map.clear();
+                *bytes = 0;
             }
-            c.insert(key, m.clone());
+            *bytes += size;
+            map.insert(key, m.clone());
         });
         m
     });

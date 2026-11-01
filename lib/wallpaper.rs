@@ -1,6 +1,6 @@
-// Random wallpaper from ~/Wallpapers (lib/wallpaper.tsx). The decoded image lives in exactly one shm
-// buffer: every monitor's background surface shows it, and BackgroundSection headers and the
-// lockscreen draw from the same memory.
+// Random wallpaper from ~/Wallpapers (lib/wallpaper.tsx). The decoded image, shrunk to cover the
+// largest output, lives in exactly one shm buffer: every monitor's background surface shows it, and
+// BackgroundSection headers and the lockscreen draw from the same memory.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -51,25 +51,78 @@ fn list_files(dir: &str, out: &mut Vec<String>) {
     }
 }
 
-fn random(n: usize) -> usize {
-    let mut x = 0u64;
-    unsafe { libc::getrandom((&raw mut x).cast(), 8, 0) };
-    (x % n as u64) as usize
+/// 8 random bytes; None if the kernel won't give them (a few retries on EINTR or a short read).
+fn random_u64() -> Option<u64> {
+    let mut b = [0u8; 8];
+    let mut got = 0;
+    for _ in 0..8 {
+        let r = unsafe { libc::getrandom(b[got..].as_mut_ptr().cast(), 8 - got, 0) };
+        if r > 0 {
+            got += r as usize;
+            if got == 8 {
+                return Some(u64::from_ne_bytes(b));
+            }
+        } else if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return None;
+        }
+    }
+    None
 }
 
-/// A random wallpaper other than `cur`, read and decoded straight into shared memory; a few
-/// candidates are tried in case one is broken. Runs on a worker thread (listing included).
+/// Uniform in 0..n (rejection sampling, no modulo bias).
+fn random(n: usize) -> Option<usize> {
+    let n = n as u64;
+    // the largest multiple of n: values from it up are rejected (less than half the range)
+    let limit = u64::MAX - u64::MAX % n;
+    for _ in 0..16 {
+        let x = random_u64()?;
+        if x < limit {
+            return Some((x % n) as usize);
+        }
+    }
+    None
+}
+
+/// Device pixel sizes of the active outputs (sway's logical rects at their scale): a wallpaper
+/// never needs more than covering the largest.
+fn output_sizes() -> Vec<(f64, f64)> {
+    let Some(outs) = crate::lib::sway::outputs() else { return vec![] };
+    outs.arr()
+        .iter()
+        .filter(|o| o.get("active").bool() == Some(true))
+        .filter_map(|o| {
+            let (r, s) = (o.get("rect"), o.get("scale").num().unwrap_or(1.0));
+            Some((r.get("width").num()? * s, r.get("height").num()? * s))
+        })
+        .collect()
+}
+
+/// The size a `w`x`h` image is shrunk to so it still covers every output.
+fn cover_size(w: u32, h: u32, outputs: &[(f64, f64)]) -> (u32, u32) {
+    let s = outputs.iter().map(|&(ow, oh)| (ow / w as f64).max(oh / h as f64)).fold(0.0, f64::max);
+    if outputs.is_empty() || s >= 1.0 {
+        return (w, h);
+    }
+    ((w as f64 * s).ceil() as u32, (h as f64 * s).ceil() as u32)
+}
+
+/// A random wallpaper other than `cur`, read and decoded into shared memory, shrunk to cover the
+/// largest output; a few candidates are tried in case one is broken. Runs on a worker thread
+/// (listing included).
 fn load(cur: Option<String>) -> Option<(String, ShmPixels)> {
     let mut files = vec![];
     list_files(&format!("{}/Wallpapers", crate::lib::xdg::home_dir()), &mut files);
     files.retain(|f| Some(f) != cur.as_ref());
+    let outputs = output_sizes();
     for _ in 0..3 {
         if files.is_empty() {
             break;
         }
-        let path = files.swap_remove(random(files.len()));
+        let Some(i) = random(files.len()) else { break };
+        let path = files.swap_remove(i);
         let Ok(bytes) = std::fs::read(&path) else { continue };
-        if let Some(p) = image::decode_into(&bytes, ShmPixels::new, ShmPixels::data) {
+        let fit = |w, h| cover_size(w, h, &outputs);
+        if let Some(p) = image::decode_into(&bytes, image::WALLPAPER_PIXELS, fit, ShmPixels::new, ShmPixels::data) {
             return Some((path, p));
         }
     }
@@ -77,7 +130,7 @@ fn load(cur: Option<String>) -> Option<(String, ShmPixels)> {
 }
 
 /// Swaps in another random wallpaper at once: the next one is always decoded ahead of time, which
-/// costs a second full-size image in memory. Decodes never block the loop (lock, unlock, startup).
+/// costs a second (output-sized) image in memory. Decodes never block the loop (lock, unlock, startup).
 pub fn random_wallpaper() {
     match NEXT.with(|n| n.borrow_mut().take()) {
         Some(next) => {
@@ -146,4 +199,17 @@ pub fn wallpaper_window() -> Rc<Win> {
     });
     apply(&w);
     w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn covers_the_largest_output() {
+        assert_eq!(cover_size(6000, 4000, &[(2560.0, 1440.0), (1920.0, 1080.0)]), (2560, 1707));
+        assert_eq!(cover_size(1000, 1000, &[(2560.0, 1440.0)]), (1000, 1000));
+        assert_eq!(cover_size(6000, 4000, &[]), (6000, 4000));
+        assert!(random(3).is_some_and(|i| i < 3));
+    }
 }

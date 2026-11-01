@@ -22,8 +22,7 @@ pub struct SearchSpec<T> {
 }
 
 /// `.searchableDialog entry` inside a BackgroundSection header.
-/// `_focused` is unused (callers still pass it).
-pub fn search_entry(base: &Style, entry: &EntryRef, _focused: bool) -> Node {
+pub fn search_entry(base: &Style, entry: &EntryRef) -> Node {
     let mut s = crate::lib::backgroundSection::header_style(base);
     s.font.size = 24.0;
     s.padding = Sides::trbl(0.0, SPACE_M, 0.0, SPACE_L);
@@ -87,7 +86,7 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
 
     let build = {
         let (entry, items, selected, spec) = (entry.clone(), items.clone(), selected.clone(), spec.clone());
-        move |v: &window::View| {
+        move |_: &window::View| {
             let base = window();
             let list = items.borrow();
             let sel = *selected.borrow();
@@ -102,7 +101,7 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
                 })
                 .collect();
             let content = Node::vbox(base.inherit(), BORDER, rows).show(!list.is_empty());
-            let header = search_entry(&base, &entry, v.focused("entry"));
+            let header = search_entry(&base, &entry);
             background_section(&base, header, Some(content), 700.0, 500.0)
         }
     };

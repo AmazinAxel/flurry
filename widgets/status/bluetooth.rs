@@ -21,6 +21,8 @@ thread_local! {
     static FOCUSED: FocusMemory = const { FocusMemory::new("bt:") };
     /// powered + per-device connected/connecting, to refocus only when one changes
     static LAST: RefCell<String> = const { RefCell::new(String::new()) };
+    /// device paths with a Pair call in flight: Enter on them again is ignored
+    static PAIRING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 fn order_path() -> String {
@@ -178,9 +180,12 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
         .map(|d| {
             let id = row_id(d);
             let s = aside_row(base, d.connected && !d.connecting, d.connecting, focus == Some(id.as_str()));
-            // a pairing code takes the battery's place
-            let trailing = match &b.pairing {
-                Some(p) if p.device == d.path => Trailing::Label(p.code.clone()),
+            // a pairing code takes the battery's place (an authorization has no code: a key icon);
+            // gone once the device is paired, unless it still waits for an answer
+            let pairing = b.pairing.as_ref().filter(|p| p.device == d.path && (!d.paired || p.confirm));
+            let trailing = match pairing {
+                Some(p) if p.code.is_empty() => Trailing::Icon("dialog-password-symbolic"),
+                Some(p) => Trailing::Label(p.code.clone()),
                 _ if d.connected && d.battery >= 0.0 => Trailing::Label(format!("{}%", (d.battery * 100.0).round() as i64)),
                 _ => Trailing::None,
             };
@@ -253,7 +258,7 @@ pub fn activate(id: &str) -> bool {
                 bt::answer(true);
                 return true;
             }
-            if d.connecting {
+            if d.connecting || PAIRING.with(|p| p.borrow().contains(&d.path)) {
                 return true;
             }
             if d.connected {
@@ -275,7 +280,9 @@ pub fn activate(id: &str) -> bool {
                 return true;
             }
             let path = d.path.clone();
+            PAIRING.with(|p| p.borrow_mut().push(path.clone()));
             bt::pair(&path, move |ok| {
+                PAIRING.with(|p| p.borrow_mut().retain(|x| *x != d.path));
                 if !ok {
                     return sticky().update(|s| s.retain(|a| *a != d.address));
                 }

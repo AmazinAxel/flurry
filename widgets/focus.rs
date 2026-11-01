@@ -22,6 +22,8 @@ thread_local! {
     static BREAK_TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
     static BREAK_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     static CLOSING_NOTIF: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// the break bar's repaint timer is armed
+    static TICKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn focus_text() -> State<String> {
@@ -109,9 +111,9 @@ pub fn focus_menu() {
     let ec = e.clone();
     input_control(
         "focusMenu",
-        move |v| {
+        move |_| {
             let base = window();
-            let header = search_entry(&base, &ec, v.focused("entry"));
+            let header = search_entry(&base, &ec);
             background_section(&base, header, None, 0.0, 400.0)
         },
         Opts { focus: Some("entry"), entries: vec![EntryBinding { id: "entry", entry: e, on_activate: Some(start), on_key: None }], ..Default::default() },
@@ -156,13 +158,21 @@ pub fn focus_task() -> Rc<Win> {
         }
     });
     w.watch(&break_wait());
-    // animate the 10s break bar on frame callbacks only while it runs
+    // the 10s break bar steps at ~15Hz while it runs, not on every frame
     let fw = Rc::downgrade(&w);
     break_wait().subscribe(move || {
-        if let Some(w) = fw.upgrade() {
-            w.animate(|| active() && BREAK_START.with(|s| s.get()).is_some());
+        if break_wait().peek() && !TICKING.with(|t| t.replace(true)) {
+            tick_bar(fw.clone());
         }
     });
     w
+}
+
+fn tick_bar(w: std::rc::Weak<Win>) {
+    let Some(win) = w.upgrade().filter(|_| active() && BREAK_START.with(|s| s.get()).is_some()) else {
+        return TICKING.with(|t| t.set(false));
+    };
+    win.redraw();
+    runtime::timeout(66, move || tick_bar(w));
 }
 

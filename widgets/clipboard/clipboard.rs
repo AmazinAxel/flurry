@@ -79,9 +79,14 @@ pub fn entry_path(e: &Entry) -> Option<String> {
     if e.mime.starts_with("image/") {
         return Some(entry_file(e.id, &e.mime));
     }
-    let single = e.preview.trim();
-    if single.contains('\n') || single.contains(' ') {
+    if e.preview.trim().contains(' ') {
         return None; // not a path
+    }
+    // the preview is cut at 100 chars: the path itself comes from the entry file
+    let file = if e.len <= 4096 { std::fs::read_to_string(entry_file(e.id, &e.mime)).ok() } else { None };
+    let single = file.as_deref().unwrap_or(&e.preview).trim();
+    if single.contains(char::is_whitespace) {
+        return None;
     }
     let path = match single.strip_prefix("file:") {
         Some(rest) => percent_decode(&format!("/{}", rest.trim_start_matches('/'))),
@@ -100,17 +105,50 @@ fn device_scale() -> f32 {
     crate::ui::wayland::outputs().iter().map(|o| o.scale).max().unwrap_or(1).max(1) as f32
 }
 
-/// A child's whole stdout, binary-safe (blocking: worker threads only).
-fn read_output(argv: &[&str]) -> Option<Vec<u8>> {
+/// A child's whole stdout, binary-safe; killed past `ms` (blocking: worker threads only).
+fn read_output(argv: &[&str], ms: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
     let (prog, args) = argv.split_first()?;
-    let out = Command::new(prog).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then_some(out.stdout)
+    let mut child = Command::new(prog).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let (mut buf, mut chunk) = (Vec::new(), vec![0u8; 1 << 16]);
+    // bounded by the deadline: a poll with no time left returns 0
+    let finished = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+        let mut pfd = libc::pollfd { fd: out.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        match unsafe { libc::poll(&mut pfd, 1, left) } {
+            0 => break false,
+            r if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+            r if r < 0 => break false,
+            _ => {}
+        }
+        match out.read(&mut chunk) {
+            Ok(0) => break true,
+            Ok(n) if buf.len() + n <= MAX_THUMB_SOURCE => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            _ => break false,
+        }
+    };
+    if !finished {
+        let _ = child.kill();
+    }
+    let ok = child.wait().is_ok_and(|s| s.success());
+    (finished && ok).then_some(buf)
+}
+
+const MAX_THUMB_SOURCE: usize = 64 << 20;
+
+/// A thumbnail's size in device pixels: fits MAX_W x MAX_H logical pixels, never upscaled.
+fn thumb_size(w: f32, h: f32, k: f32) -> (u32, u32, f32) {
+    let s = (MAX_W * k / w).min(MAX_H * k / h).min(k);
+    ((w * s).round().max(1.0) as u32, (h * s).round().max(1.0) as u32, s)
 }
 
 fn load_scaled(bytes: &[u8], k: f32) -> Option<Pixmap> {
     let src = image::decode(bytes)?;
-    let s = (MAX_W * k / src.width() as f32).min(MAX_H * k / src.height() as f32).min(k);
-    let (w, h) = ((src.width() as f32 * s).round().max(1.0) as u32, (src.height() as f32 * s).round().max(1.0) as u32);
+    let (w, h, s) = thumb_size(src.width() as f32, src.height() as f32, k);
     let mut out = Pixmap::new(w, h)?;
     let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
     out.draw_pixmap(0, 0, src.as_ref(), &paint, tiny_skia::Transform::from_scale(s, s), None);
@@ -147,9 +185,14 @@ fn request_thumb(item: &Item) {
         let (id, video, src) = (item.id, item.video, item.path.clone().unwrap_or_default());
         // decoding a screenshot takes tens of ms: off the loop
         let pix = runtime::blocking(move || {
+            // regular files only: no fifos or devices to hang on, no symlinks out of the history
+            if !std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
+                return None;
+            }
             let bytes = if video {
                 let scale = format!("scale=w={}:h={}:force_original_aspect_ratio=decrease", MAX_W * k, MAX_H * k);
-                read_output(&["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"])
+                let argv = ["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"];
+                read_output(&argv, 5000)
             } else {
                 std::fs::read(&src).ok()
             };
@@ -169,8 +212,8 @@ fn request_thumb(item: &Item) {
 }
 
 /// Lazily, while the dialog is up: the newest media rows get thumbnails; older ones show their
-/// description. Rows stay hidden while loading (requesting from the row builder never fired:
-/// hidden rows are never built).
+/// description. Image rows hold their thumbnail's size while loading; video rows (size unknown)
+/// stay hidden (requesting from the row builder never fired: hidden rows are never built).
 fn request_thumbs() {
     if streaming_mode().peek() || !window::get("clipboard").is_some_and(|w| w.visible()) {
         return;
@@ -191,6 +234,18 @@ fn describe(item: &Item) -> String {
     }
 }
 
+/// An empty box of the image thumbnail's size, from the stored WxH.
+fn placeholder(base: &Style, item: &Item) -> Option<Node> {
+    let (w, h) = item.image.as_deref()?.split_once('x')?;
+    let (w, h): (f32, f32) = (w.parse().ok()?, h.parse().ok()?);
+    if w < 1.0 || h < 1.0 {
+        return None;
+    }
+    let k = device_scale();
+    let (tw, th, _) = thumb_size(w, h, k);
+    Some(Node::vbox(base.inherit(), 0.0, vec![]).size(tw as f32 / k, th as f32 / k).align(Align::Center, Align::Center))
+}
+
 fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
     if streaming_mode().peek() {
         return Some(Node::label(row.inherit(), describe(item)).xalign(0.0));
@@ -209,8 +264,8 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
                 }
                 Some(Node::overlay(s, kids).size(w, h).align(Align::Center, Align::Center))
             }
-            // hidden while loading (visible=false rows are filtered out)
-            Some(Thumb::Loading) => None,
+            // images: an empty box of the thumbnail's size, so nothing moves when it lands
+            Some(Thumb::Loading) => Some(placeholder(base, item).unwrap_or_else(|| Node::label(row.inherit(), describe(item)).xalign(0.0))),
             Some(Thumb::Failed) | None => Some(Node::label(row.inherit(), describe(item)).xalign(0.0)),
         };
     }
@@ -231,7 +286,7 @@ fn visible_rows() -> Vec<Item> {
         ITEMS.with(|i| {
             i.borrow()
                 .iter()
-                .filter(|i| streaming || (i.image.is_none() && !i.video) || !matches!(t.get(&i.id), Some(Thumb::Loading)))
+                .filter(|i| streaming || !i.video || !matches!(t.get(&i.id), Some(Thumb::Loading)))
                 .filter(|i| q.is_empty() || i.search.contains(&q))
                 .cloned()
                 .collect()
@@ -335,7 +390,7 @@ pub fn clipboard() {
         }
     }));
     let ec = e.clone();
-    let build = move |v: &window::View| {
+    let build = move |_: &window::View| {
         let base = window();
         let rows = visible_rows();
         let sel = SELECTED.with(Cell::get);
@@ -363,7 +418,7 @@ pub fn clipboard() {
         // card's padding, so the rows end as far from the border as they do at the sides
         let list = Node::vbox(Style { padding: Sides::trbl(SPACE_M, 0.0, BORDER, 0.0), ..base.inherit() }, 0.0, nodes);
         let scroll = Node::scroll(Style { margin: Sides::trbl(0.0, 0.0, -BORDER, 0.0), ..base.inherit() }, 460.0, center, list).show(count > 0);
-        let header = search_entry(&base, &ec, v.focused("entry"));
+        let header = search_entry(&base, &ec);
         background_section(&base, header, Some(scroll), 700.0, 500.0)
     };
     let ctrl = |k: Keysym, f: fn()| -> (Keysym, crate::lib::inputControl::Action) { (k, Rc::new(f)) };
@@ -417,7 +472,7 @@ mod tests {
 
     #[test]
     fn finds_entry_paths() {
-        let e = |mime: &str, preview: &str| entry_path(&Entry { id: 7, mime: mime.into(), preview: preview.into() });
+        let e = |mime: &str, preview: &str| entry_path(&Entry { id: 7, mime: mime.into(), len: 1 << 20, preview: preview.into() });
         assert_eq!(e("image/jpeg", "1x1"), Some(entry_file(7, "image/jpeg")));
         assert_eq!(e("text/uri-list", "file:///home/a/x%20y.mp4").as_deref(), Some("/home/a/x y.mp4"));
         assert_eq!(e("text/plain", "/tmp/a b"), None);

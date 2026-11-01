@@ -120,12 +120,14 @@ pub fn subscribe(events: &[&str], cb: impl Fn(&Json) + 'static) {
         let mut chunk = [0u8; 65536];
         loop {
             match s.borrow_mut().read(&mut chunk) {
-                Ok(0) => {
+                Ok(n) if n > 0 => buf.borrow_mut().extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // EOF or a reset socket: poll() would report it forever
+                _ => {
                     runtime::unwatch(fd);
                     return;
                 }
-                Ok(n) => buf.borrow_mut().extend_from_slice(&chunk[..n]),
-                Err(_) => break,
             }
         }
         while let Some((kind, body)) = decode(&mut buf.borrow_mut()) {

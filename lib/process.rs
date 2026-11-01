@@ -98,15 +98,43 @@ pub async fn output(argv: &[&str], stdin: Option<&[u8]>) -> Option<Output> {
         write_stdin(si, data);
     }
     let out = Rc::new(RefCell::new((Vec::new(), Vec::new())));
-    let (tx_o, rx_o) = runtime::oneshot::<()>();
-    let (tx_e, rx_e) = runtime::oneshot::<()>();
+    let (tx, rx) = runtime::oneshot::<()>();
+    let tx = Rc::new(tx);
+    // (stdout, stderr) still open; tx fires once both hit EOF
+    let open = Rc::new(Cell::new((true, true)));
+    let eof = |stdout: bool| {
+        let (open, tx) = (open.clone(), tx.clone());
+        move || {
+            let (o, e) = open.get();
+            let now = if stdout { (false, e) } else { (o, false) };
+            open.set(now);
+            if now == (false, false) {
+                tx.send(());
+            }
+        }
+    };
+    let (so, se): (OwnedFd, OwnedFd) = (child.stdout.take()?.into(), child.stderr.take()?.into());
+    let (so_raw, se_raw) = (so.as_raw_fd(), se.as_raw_fd());
     let o = out.clone();
-    read_stream(child.stdout.take()?.into(), move |b| o.borrow_mut().0.extend_from_slice(b), move || tx_o.send(()));
+    read_stream(so, move |b| o.borrow_mut().0.extend_from_slice(b), eof(true));
     let o = out.clone();
-    read_stream(child.stderr.take()?.into(), move |b| o.borrow_mut().1.extend_from_slice(b), move || tx_e.send(()));
+    read_stream(se, move |b| o.borrow_mut().1.extend_from_slice(b), eof(false));
     let code = wait(child).await.unwrap_or(-1);
-    rx_o.await;
-    rx_e.await;
+    // a grandchild can hold the pipes open long after: stop reading shortly after the child exits
+    let t = {
+        let tx = tx.clone();
+        runtime::timeout(200, move || tx.send(()))
+    };
+    rx.await;
+    t.cancel();
+    // unwatching closes a still-open pipe (an EOF'd one is closed already, its number maybe reused)
+    let (o, e) = open.get();
+    if o {
+        runtime::unwatch(so_raw);
+    }
+    if e {
+        runtime::unwatch(se_raw);
+    }
     let (so, se) = std::mem::take(&mut *out.borrow_mut());
     Some(Output { code, stdout: String::from_utf8_lossy(&so).into_owned(), stderr: String::from_utf8_lossy(&se).into_owned() })
 }
@@ -114,8 +142,14 @@ pub async fn output(argv: &[&str], stdin: Option<&[u8]>) -> Option<Output> {
 /// execAsync: stdout (trailing newline trimmed) on success, stderr on failure.
 pub async fn exec(argv: &[&str]) -> Result<String, String> {
     match output(argv, None).await {
-        Some(o) if o.code == 0 => Ok(o.stdout.trim_end_matches('\n').to_string()),
-        Some(o) => Err(o.stderr.trim_end().to_string()),
+        Some(mut o) if o.code == 0 => {
+            o.stdout.truncate(o.stdout.trim_end_matches('\n').len());
+            Ok(o.stdout)
+        }
+        Some(mut o) => {
+            o.stderr.truncate(o.stderr.trim_end().len());
+            Err(o.stderr)
+        }
         None => Err(format!("failed to spawn {}", argv.first().unwrap_or(&""))),
     }
 }
@@ -198,10 +232,15 @@ pub fn spawn_lines(
 ) -> Option<Proc> {
     let mut c = command(argv)?;
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    // long-lived helpers (gpu-screen-recorder, ffmpeg) must not outlive the shell
+    // long-lived helpers (gpu-screen-recorder, ffmpeg) must not outlive the shell; a shell that
+    // died before prctl ran would never deliver the signal, so the child checks it's still ours
+    let parent = unsafe { libc::getpid() };
     unsafe {
-        std::os::unix::process::CommandExt::pre_exec(&mut c, || {
+        std::os::unix::process::CommandExt::pre_exec(&mut c, move || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
             Ok(())
         });
     }

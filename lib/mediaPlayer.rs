@@ -45,7 +45,8 @@ struct Conn {
     buf: Vec<u8>,
 }
 
-/// MPD_HOST: `[password@]host`, host being a name, an IPv6 address (bracketed or not) or a socket path.
+/// MPD_HOST: `[password@]host`, host being a name, an IPv6 address (bracketed or not), a socket path
+/// or `@name` (abstract socket).
 fn parse_host(h: &str) -> (Option<&str>, &str) {
     match h.split_once('@') {
         Some((pw, host)) if !pw.is_empty() && !host.is_empty() => (Some(pw), host),
@@ -66,6 +67,9 @@ async fn open() -> Option<(File, Option<String>)> {
         let (pw, host) = parse_host(&env);
         let fd: OwnedFd = if host.starts_with('/') {
             UnixStream::connect(host).ok()?.into()
+        } else if let Some(name) = host.strip_prefix('@') {
+            use std::os::linux::net::SocketAddrExt;
+            UnixStream::connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name).ok()?).ok()?.into()
         } else {
             let addr = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
             let s = addr.to_socket_addrs().ok()?.find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())?;
@@ -258,6 +262,8 @@ mod tests {
         assert_eq!(parse_host("localhost"), (None, "localhost"));
         assert_eq!(parse_host("pw@[::1]"), (Some("pw"), "[::1]"));
         assert_eq!(parse_host("/run/mpd/socket"), (None, "/run/mpd/socket"));
+        assert_eq!(parse_host("@mpd"), (None, "@mpd"));
+        assert_eq!(parse_host("pw@@mpd"), (Some("pw"), "@mpd"));
         assert_eq!(quote(r#"a"b\c"#), r#""a\"b\\c""#);
     }
 }

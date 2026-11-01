@@ -16,6 +16,8 @@ pub struct App {
 
 thread_local! {
     static APPS: RefCell<Vec<App>> = const { RefCell::new(Vec::new()) };
+    /// the app dirs (resolved) and their mtimes at the last scan
+    static STAMPS: RefCell<Vec<(PathBuf, Option<std::time::SystemTime>)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn data_dirs() -> Vec<PathBuf> {
@@ -48,7 +50,7 @@ fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, seen: &mut Ha
     }
 }
 
-fn in_path(exe: &str) -> bool {
+pub fn in_path(exe: &str) -> bool {
     if exe.contains('/') {
         return Path::new(exe).exists();
     }
@@ -74,7 +76,8 @@ fn parse(id: &str, text: &str, desktops: &[String]) -> Option<App> {
     }
     let list = |k: &str| kv.get(k).map(|v| v.split(';').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>()).unwrap_or_default();
     let yes = |k: &str| kv.get(k).is_some_and(|v| *v == "true");
-    if kv.get("Type").is_some_and(|t| *t != "Application") || yes("Hidden") || yes("NoDisplay") {
+    // terminal apps would start without a terminal
+    if kv.get("Type").is_some_and(|t| *t != "Application") || yes("Hidden") || yes("NoDisplay") || yes("Terminal") {
         return None;
     }
     if let Some(t) = kv.get("TryExec")
@@ -102,10 +105,25 @@ fn parse(id: &str, text: &str, desktops: &[String]) -> Option<App> {
 /// Rescans the desktop entries on a worker thread (hundreds of file reads).
 pub fn reload() {
     crate::ui::runtime::spawn(async {
-        if let Some(apps) = crate::ui::runtime::blocking(scan).await {
+        if let Some((apps, stamps)) = crate::ui::runtime::blocking(|| (scan(), stamps())).await {
             APPS.with(|a| *a.borrow_mut() = apps);
+            STAMPS.with(|s| *s.borrow_mut() = stamps);
         }
     });
+}
+
+/// Rescans only if an app dir changed (installed/removed entries, a switched profile), off the loop.
+pub fn reload_if_changed() {
+    crate::ui::runtime::spawn(async {
+        let Some(now) = crate::ui::runtime::blocking(stamps).await else { return };
+        if STAMPS.with(|s| *s.borrow() != now) {
+            reload();
+        }
+    });
+}
+
+fn stamps() -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    app_dirs().into_iter().map(|d| (std::fs::canonicalize(&d).unwrap_or(d.clone()), std::fs::metadata(&d).and_then(|m| m.modified()).ok())).collect()
 }
 
 fn scan() -> Vec<App> {
@@ -135,51 +153,61 @@ fn fuzzy_match_string(pattern: &[u8], s: &[u8]) -> i32 {
     if s.len() < pattern.len() {
         return not_found;
     }
-    match recurse(pattern, s, 100, true) {
-        Some(score) => score - (s.len() - pattern.len()) as i32,
+    match best_match(pattern, s) {
+        Some(score) => 100 + score - (s.len() - pattern.len()) as i32,
         None => not_found,
     }
 }
 
-fn recurse(pattern: &[u8], s: &[u8], score: i32, first: bool) -> Option<i32> {
-    if pattern.is_empty() {
-        return Some(score);
-    }
-    let search = pattern[0].to_ascii_lowercase();
-    let mut best: Option<i32> = None;
-    let mut offset = 0;
-    while let Some(i) = s[offset..].iter().position(|c| c.to_ascii_lowercase() == search) {
-        offset += i;
-        let found = recurse(&pattern[1..], &s[offset + 1..], compute(offset, first, s, offset), false);
-        let Some(sub) = found else { break };
-        best = Some(best.map_or(sub, |b| b.max(sub)));
-        offset += 1;
-    }
-    best.map(|b| score + b)
-}
-
-fn compute(jump: usize, first: bool, m: &[u8], idx: usize) -> i32 {
+/// Character boundary bonus: lower->Upper, or an alphanumeric after anything else.
+fn bonus(cur: u8, prev: u8) -> i32 {
     let mut score = 0;
-    if !first && jump == 0 {
-        score += 15;
+    if cur.is_ascii_uppercase() && prev.is_ascii_lowercase() {
+        score += 30;
     }
-    if !first || jump > 0 {
-        let cur = m[idx];
-        let prev = if idx > 0 { m[idx - 1] } else { 0 };
-        if cur.is_ascii_uppercase() && prev.is_ascii_lowercase() {
-            score += 30;
-        }
-        if cur.is_ascii_alphanumeric() && !prev.is_ascii_alphanumeric() {
-            score += 30;
-        }
-    }
-    if first && jump == 0 {
-        score += 15;
-    }
-    if first {
-        score += (-5 * jump as i32).max(-15);
+    if cur.is_ascii_alphanumeric() && !prev.is_ascii_alphanumeric() {
+        score += 30;
     }
     score
+}
+
+fn max_opt(a: Option<i32>, b: Option<i32>) -> Option<i32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The best sum of per-character scores over every way of matching `pattern` in order (the
+/// GNOME Shell recursive matcher, as an O(n·m) DP). After the first character, a match right
+/// where the previous one left off gets +15, and its boundary bonus sees no previous character.
+fn best_match(pattern: &[u8], s: &[u8]) -> Option<i32> {
+    let n = s.len();
+    let eq = |c: u8, p: u8| c.eq_ignore_ascii_case(&p);
+    let prev = |j: usize| if j > 0 { s[j - 1] } else { 0 };
+    // next[st]: best score of the rest of the pattern within s[st..]
+    let mut next: Vec<Option<i32>> = vec![Some(0); n + 1];
+    for &p in pattern[1..].iter().rev() {
+        let mut cur = vec![None; n + 1];
+        // best over matches at j > st (a jump: the real previous character counts)
+        let mut later: Option<i32> = None;
+        for st in (0..n).rev() {
+            let rest = if eq(s[st], p) { next[st + 1] } else { None };
+            cur[st] = max_opt(rest.map(|v| v + 15 + bonus(s[st], 0)), later);
+            later = max_opt(later, rest.map(|v| v + bonus(s[st], prev(st))));
+        }
+        next = cur;
+    }
+    let mut best = None;
+    for j in 0..n {
+        if eq(s[j], pattern[0])
+            && let Some(v) = next[j + 1]
+        {
+            let c = if j > 0 { bonus(s[j], s[j - 1]) } else { 15 };
+            best = max_opt(best, Some(v + c + (-5 * j as i32).max(-15)));
+        }
+    }
+    best
 }
 
 fn fuzzy(term: &str, s: &str) -> i32 {
@@ -281,6 +309,8 @@ pub fn exec_argv(exec: &str) -> Vec<String> {
 
 /// `argv` as one `sh -c` line that sway's command parser passes through untouched: double quotes
 /// keep `,` `;` and spaces inside one arg for both, and `\\` `"` `$` `` ` `` are backslash-escaped.
+/// Sway skips variable replacement only for a `$` after a single backslash, so a `\\` right before
+/// a `$` ends the quoted run (`\\""\$`).
 pub fn shell_line(argv: &[String]) -> String {
     let mut line = String::new();
     for a in argv {
@@ -289,6 +319,9 @@ pub fn shell_line(argv: &[String]) -> String {
         }
         line.push('"');
         for c in a.chars() {
+            if c == '$' && line.ends_with("\\\\") {
+                line.push_str("\"\"");
+            }
             if matches!(c, '\\' | '"' | '$' | '`') {
                 line.push('\\');
             }
@@ -300,9 +333,11 @@ pub fn shell_line(argv: &[String]) -> String {
 }
 
 /// Starts `argv` as sway's child, outside flurry's systemd cgroup (a shell restart never takes it down).
+/// `exec exec`: sway strips the quotes of a lone quoted argument (so always 2+), and the app replaces
+/// the shell. A newline would end the sway command: such an argv isn't run.
 pub fn launch(argv: &[String]) {
-    if !argv.is_empty() {
-        crate::lib::sway::command(&format!("exec {}", shell_line(argv)));
+    if !argv.is_empty() && !argv.iter().any(|a| a.contains(['\n', '\r'])) {
+        crate::lib::sway::command(&format!("exec exec {}", shell_line(argv)));
     }
 }
 
@@ -315,6 +350,40 @@ mod tests {
         assert!(fuzzy("fo", "Foot") > fuzzy("fo", "Info Tool"));
         assert_eq!(fuzzy("zz", "Foot"), -10);
         assert_eq!(fuzzy("", "x"), 100);
+    }
+
+    /// the original recursive matcher: the DP must score exactly like it
+    fn recurse(pattern: &[u8], s: &[u8], score: i32, first: bool) -> Option<i32> {
+        if pattern.is_empty() {
+            return Some(score);
+        }
+        let mut best: Option<i32> = None;
+        let mut offset = 0;
+        while let Some(i) = s[offset..].iter().position(|c| c.eq_ignore_ascii_case(&pattern[0])) {
+            offset += i;
+            let jump = if first { (-5 * offset as i32).max(-15) } else { 0 };
+            let c = match (first, offset) {
+                (true, 0) => 15,
+                (false, 0) => 15 + bonus(s[0], 0),
+                _ => bonus(s[offset], s[offset - 1]),
+            } + jump;
+            let Some(sub) = recurse(&pattern[1..], &s[offset + 1..], c, false) else { break };
+            best = max_opt(best, Some(sub));
+            offset += 1;
+        }
+        best.map(|b| score + b)
+    }
+
+    #[test]
+    fn dp_matches_recursive_scores() {
+        let words = ["Foot", "Info Tool", "fooBar foo", "GNOME Terminal", "aaaa", "a-b_c d", "xFxOxO", "Firefox Web Browser", "f"];
+        let pats = ["f", "fo", "foo", "aa", "ter", "bc", "fx", "ob", "zz", "FOO", "web"];
+        for w in words {
+            for p in pats {
+                let want = if w.len() < p.len() { None } else { recurse(p.as_bytes(), w.as_bytes(), 0, true) };
+                assert_eq!(best_match(p.as_bytes(), w.as_bytes()).filter(|_| w.len() >= p.len()), want, "{p} in {w}");
+            }
+        }
     }
 
     #[test]
@@ -334,6 +403,7 @@ mod tests {
         assert_eq!(v(r#""a\sb" c\\\\d"#), ["a b", r"c\d"]);
         assert_eq!(v(r#"x """#), ["x", ""]);
         assert_eq!(shell_line(&["a b,c;d".into(), r#"$x"\`"#.into()]), r#""a b,c;d" "\$x\"\\\`""#);
+        assert_eq!(shell_line(&[r"a\$b".into()]), r#""a\\""\$b""#);
     }
 
     #[test]

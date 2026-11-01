@@ -20,6 +20,8 @@ pub struct Device {
     pub trusted: bool,
     pub connected: bool,
     pub connecting: bool,
+    /// a Pair call is in flight (a second one is ignored)
+    pub pairing: bool,
     /// Battery1.Percentage / 100, -1 when absent
     pub battery: f64,
 }
@@ -35,6 +37,7 @@ pub struct Adapter {
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Pairing {
     pub device: String,
+    /// empty for RequestAuthorization (nothing to compare: the row shows an icon instead)
     pub code: String,
     pub confirm: bool,
 }
@@ -132,9 +135,20 @@ fn apply(path: &str, iface: &str, p: &PropMap) {
             if cur.as_ref() == Some(&d) {
                 return;
             }
-            bt().update(|b| match b.devices.iter_mut().find(|x| x.path == path) {
-                Some(slot) => *slot = d,
-                None => b.devices.push(d),
+            // paired: the code (or an unanswered confirmation) has nothing left to do
+            let now_paired = d.paired && !cur.as_ref().is_some_and(|c| c.paired);
+            let clear = now_paired && bt().with(|b| b.pairing.as_ref().is_some_and(|x| x.device == path));
+            if clear {
+                PENDING.with(|p| p.borrow_mut().take());
+            }
+            bt().update(|b| {
+                match b.devices.iter_mut().find(|x| x.path == path) {
+                    Some(slot) => *slot = d,
+                    None => b.devices.push(d),
+                }
+                if clear {
+                    b.pairing = None;
+                }
             });
         }
         _ => {}
@@ -219,24 +233,24 @@ pub fn start() {
 }
 
 fn call(path: &str, iface: &str, member: &str, done: impl FnOnce(bool) + 'static) {
-    let Some(bus) = dbus::system() else { return };
+    let Some(bus) = dbus::system() else { return done(false) };
     bus.call_cb(method(BLUEZ, path, iface, member), move |r| done(r.is_ok()));
 }
 
-fn set_connecting(path: &str, v: bool) {
+fn set_flag(path: &str, f: impl FnOnce(&mut Device)) {
     let path = path.to_string();
     bt().update(|b| {
         if let Some(d) = b.devices.iter_mut().find(|d| d.path == path) {
-            d.connecting = v;
+            f(d);
         }
     });
 }
 
 pub fn connect(path: &str, done: impl FnOnce(bool) + 'static) {
-    set_connecting(path, true);
+    set_flag(path, |d| d.connecting = true);
     let p = path.to_string();
     call(path, "org.bluez.Device1", "Connect", move |ok| {
-        set_connecting(&p, false);
+        set_flag(&p, |d| d.connecting = false);
         done(ok);
     });
 }
@@ -245,10 +259,16 @@ pub fn disconnect(path: &str) {
     call(path, "org.bluez.Device1", "Disconnect", |_| {});
 }
 
-/// `done` gets whether pairing succeeded; the code shown for it goes either way.
+/// `done` gets whether pairing succeeded; the code shown for it goes either way. Ignored (no `done`)
+/// while a Pair call for the device is in flight.
 pub fn pair(path: &str, done: impl FnOnce(bool) + 'static) {
+    if bt().with(|b| b.devices.iter().any(|d| d.path == path && d.pairing)) {
+        return;
+    }
+    set_flag(path, |d| d.pairing = true);
     let p = path.to_string();
     call(path, "org.bluez.Device1", "Pair", move |ok| {
+        set_flag(&p, |d| d.pairing = false);
         if bt().with(|b| b.pairing.as_ref().is_some_and(|x| x.device == p)) {
             answer(false);
             bt().update(|b| b.pairing = None);
@@ -288,10 +308,19 @@ pub fn toggle_power() {
 const AGENT: &str = "org.bluez.Agent1";
 const AGENT_PATH: &str = "/org/flurry/BluezAgent";
 
-fn random_code() -> u32 {
-    let mut x = 0u32;
-    unsafe { libc::getrandom((&raw mut x).cast(), 4, 0) };
-    x % 1_000_000
+/// Uniform in 0..1_000_000; None if the kernel gives no randomness.
+fn random_code() -> Option<u32> {
+    // samples at or above the last whole multiple of 10^6 would favour the low codes: drawn again
+    const LIMIT: u32 = u32::MAX - u32::MAX % 1_000_000;
+    // EINTR, a short read or a rejected sample retries; a rejection is ~0.02% likely, so 16 is plenty
+    for _ in 0..16 {
+        let mut x = 0u32;
+        let n = unsafe { libc::getrandom((&raw mut x).cast(), 4, 0) };
+        if n == 4 && x < LIMIT {
+            return Some(x % 1_000_000);
+        }
+    }
+    None
 }
 
 fn show(device: &str, code: String, confirm: bool) {
@@ -327,7 +356,7 @@ fn defer(m: &Message, device: &str, code: String) -> Option<Message> {
     // replies built now: they need the call's serial; set before showing, which may already reject
     PENDING.with(|p| *p.borrow_mut() = Some((m.method_return(), rejected(m))));
     show(device, code, true);
-    None
+    dbus::deferred()
 }
 
 fn export_agent(bus: &Rc<dbus::Bus>) {
@@ -346,7 +375,8 @@ fn export_agent(bus: &Rc<dbus::Bus>) {
         }),
         ("RequestPinCode", |m| {
             let dev: dbus::Path = m.read1().ok()?;
-            let code = format!("{:06}", random_code());
+            let Some(code) = random_code() else { return Some(rejected(m)) };
+            let code = format!("{code:06}");
             show(&dev, code.clone(), false);
             Some(m.method_return().append1(code))
         }),
@@ -355,12 +385,8 @@ fn export_agent(bus: &Rc<dbus::Bus>) {
             show(&dev, code.into(), false);
             Some(m.method_return())
         }),
-        ("RequestPasskey", |m| {
-            let dev: dbus::Path = m.read1().ok()?;
-            let key = random_code();
-            show(&dev, format!("{key:06}"), false);
-            Some(m.method_return().append1(key))
-        }),
+        // the remote shows a passkey to type here: there's no field for it
+        ("RequestPasskey", |m| Some(rejected(m))),
         ("DisplayPasskey", |m| {
             let (dev, key): (dbus::Path, u32) = m.read2().ok()?;
             show(&dev, format!("{key:06}"), false);

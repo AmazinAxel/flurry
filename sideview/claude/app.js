@@ -4,11 +4,20 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   var log = document.getElementById('log'), box = document.getElementById('box'), filesEl = document.getElementById('files');
   // think: the latest non-empty line of the thinking summary; thinking: the line still arriving
   var files = [], reply = null, text = '', think = '', thinking = '', stopped = false, busy = false, queued = false, painted = 0;
+  // the streaming reply's rendered blocks: { raw, nodes }, re-rendered from the first that changed
+  var blocks = [];
 
-  // $$..$$ / \[..\] blocks and $..$ / \(..\) inline, rendered by KaTeX; marked keeps code spans intact
+  // $$..$$ / \[..\] blocks and $..$ / \(..\) inline, rendered by KaTeX; marked keeps code spans intact.
+  // A streaming reply renders again and again: each formula once
+  var texCache = new Map();
   function tex(src, display) {
-    try { return svgToImg(katex.renderToString(src, { displayMode: display, throwOnError: false, output: 'html' })); }
-    catch (e) { return esc(src); }
+    var key = (display ? 'D' : 'I') + src, html = texCache.get(key);
+    if (html !== undefined) return html;
+    try { html = svgToImg(katex.renderToString(src, { displayMode: display, throwOnError: false, strict: 'ignore', output: 'html' })); }
+    catch (e) { html = esc(src); }
+    if (texCache.size >= 500) texCache.clear();
+    texCache.set(key, html);
+    return html;
   }
   // Servo paints SVG images but not inline <svg>, which KaTeX uses for radicals, wide accents and
   // stretchy arrows: turn each into an <img> of the same box, filled with the text color
@@ -80,6 +89,23 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
     });
   }
 
+  // the reply's markdown, rendered again only from the first block that changed (while streaming,
+  // usually just the last one)
+  function render() {
+    var tokens = marked.lexer(text), k = 0;
+    while (k < blocks.length && k < tokens.length && blocks[k].raw === tokens[k].raw) k++;
+    blocks.splice(k).forEach(function (b) { b.nodes.forEach(function (n) { reply.removeChild(n); }); });
+    var tmp = document.createElement('div'), added = [];
+    for (var i = k; i < tokens.length; i++) {
+      var one = [tokens[i]]; one.links = tokens.links;
+      tmp.innerHTML = marked.parser(one); markers(tmp);
+      var nodes = Array.prototype.slice.call(tmp.childNodes);
+      nodes.forEach(function (n) { reply.appendChild(n); if (n.querySelectorAll) added.push(n); });
+      blocks.push({ raw: tokens[i].raw, nodes: nodes });
+    }
+    added.forEach(sharpen);
+  }
+
   // re-render the streaming reply at most once per frame
   function paint() {
     queued = false; painted = Date.now();
@@ -87,12 +113,15 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
     // until the answer starts, the latest line of the thinking summary stands in for it
     var s = text ? '' : status();
     if (!text && !s) return; // no empty bubble before there is something to show
-    if (!reply) reply = add('claude');
-    if (text) { reply.innerHTML = marked.parse(text); markers(reply); sharpen(reply); }
+    if (!reply) { reply = add('claude'); blocks = []; }
+    if (text) {
+      if (!blocks.length && reply.firstChild && reply.firstChild.className === 'think') reply.innerHTML = '';
+      render();
+    }
     else { reply.innerHTML = ''; var t = document.createElement('div'); t.className = 'think'; t.textContent = s; reply.appendChild(t); }
     if (follow) bottom();
   }
-  // a long reply re-renders at most 10 times a second (each render parses all of it)
+  // a long reply re-renders at most 10 times a second (each render lexes all of it)
   function schedule() {
     if (queued) return;
     queued = true;
@@ -116,7 +145,7 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
 
   function reset() {
     console.log('\u0001claude:new');
-    log.innerHTML = ''; reply = null; text = ''; think = ''; thinking = ''; busy = false; files = []; filesEl.innerHTML = ''; box.value = ''; grow();
+    log.innerHTML = ''; texCache.clear(); reply = null; text = ''; think = ''; thinking = ''; busy = false; files = []; filesEl.innerHTML = ''; box.value = ''; grow();
   }
 
   // last line of the thinking summary: "what Claude is doing now"
@@ -138,7 +167,7 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
       var e = document.createElement('p'); e.textContent = err; reply.appendChild(e); if (follow) bottom();
     }
     // a reply stopped during thinking keeps no thinking line
-    if (reply && !text && !err) log.removeChild(reply);
+    if (reply && !text && (!err || stopped)) log.removeChild(reply);
     reply = null;
   }
 

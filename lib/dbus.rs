@@ -15,10 +15,26 @@ use crate::ui::runtime;
 
 type Handler = Rc<dyn Fn(&Message)>;
 type MethodHandler = Rc<dyn Fn(&Message) -> Option<Message>>;
+type ReplyCb = Box<dyn FnOnce(Result<Message, String>)>;
+
+/// a call unanswered this long gets Err (libdbus' default reply timeout)
+const REPLY_TIMEOUT_MS: u64 = 25_000;
+
+thread_local! {
+    static DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returned by an exported method that answers later (it keeps the reply built from the call);
+/// any other None gets InvalidArgs.
+pub fn deferred() -> Option<Message> {
+    DEFERRED.with(|d| d.set(true));
+    None
+}
 
 pub struct Bus {
     ch: Channel,
-    replies: RefCell<HashMap<u32, Box<dyn FnOnce(Result<Message, String>)>>>,
+    /// pending calls by serial, each with its timeout
+    replies: Rc<RefCell<HashMap<u32, (ReplyCb, runtime::Timer)>>>,
     signals: RefCell<Vec<(SignalFilter, Handler)>>,
     methods: RefCell<HashMap<(String, String), MethodHandler>>,
     /// well-known name -> unique owner ("" while unowned), for names used as a filter sender
@@ -97,7 +113,7 @@ fn get(slot: &'static std::thread::LocalKey<RefCell<Option<Rc<Bus>>>>, kind: Bus
     ch.set_watch_enabled(true);
     let bus = Rc::new(Bus {
         ch,
-        replies: RefCell::default(),
+        replies: Rc::default(),
         signals: RefCell::default(),
         methods: RefCell::default(),
         owners: Rc::default(),
@@ -127,6 +143,12 @@ impl Bus {
         if self.ch.read_write(Some(Duration::ZERO)).is_err() {
             // bus gone (logout): stop watching or poll() would spin on the hung-up fd
             runtime::unwatch(self.ch.watch().fd);
+            // no reply will come
+            let pending: Vec<_> = self.replies.borrow_mut().drain().map(|(_, v)| v).collect();
+            for (cb, t) in pending {
+                t.cancel();
+                cb(Err("disconnected".into()));
+            }
         }
         self.dispatch();
     }
@@ -136,7 +158,8 @@ impl Bus {
             match msg.msg_type() {
                 MessageType::MethodReturn | MessageType::Error => {
                     let Some(serial) = msg.get_reply_serial() else { continue };
-                    let Some(cb) = self.replies.borrow_mut().remove(&serial) else { continue };
+                    let Some((cb, t)) = self.replies.borrow_mut().remove(&serial) else { continue };
+                    t.cancel();
                     if msg.msg_type() == MessageType::Error {
                         let err = msg.read1::<&str>().map(String::from).unwrap_or_default();
                         let name = msg.as_result().err().and_then(|e| e.name().map(String::from)).unwrap_or_default();
@@ -172,7 +195,18 @@ impl Bus {
                     );
                     let handler = self.methods.borrow().get(&key).cloned();
                     let reply = match handler {
-                        Some(h) => h(&msg),
+                        Some(h) => {
+                            DEFERRED.with(|d| d.set(false));
+                            let r = h(&msg);
+                            match r {
+                                None if !DEFERRED.with(|d| d.replace(false)) => Some(Message::error(
+                                    &msg,
+                                    &"org.freedesktop.DBus.Error.InvalidArgs".into(),
+                                    c"invalid arguments",
+                                )),
+                                r => r,
+                            }
+                        }
                         None => Some(Message::error(
                             &msg,
                             &"org.freedesktop.DBus.Error.UnknownMethod".into(),
@@ -193,7 +227,14 @@ impl Bus {
     pub fn call_cb(&self, msg: Message, cb: impl FnOnce(Result<Message, String>) + 'static) {
         match self.ch.send(msg) {
             Ok(serial) => {
-                self.replies.borrow_mut().insert(serial, Box::new(cb));
+                let replies = Rc::downgrade(&self.replies);
+                let t = runtime::timeout(REPLY_TIMEOUT_MS, move || {
+                    let entry = replies.upgrade().and_then(|r| r.borrow_mut().remove(&serial));
+                    if let Some((cb, _)) = entry {
+                        cb(Err("timeout".into()));
+                    }
+                });
+                self.replies.borrow_mut().insert(serial, (Box::new(cb), t));
             }
             Err(()) => cb(Err("send failed".into())),
         }
@@ -284,9 +325,11 @@ impl Bus {
         });
     }
 
-    pub fn request_name(&self, name: &str) {
+    /// `done` gets whether flurry owns `name` (primary or already owner).
+    pub fn request_name(&self, name: &str, done: impl FnOnce(bool) + 'static) {
         // DO_NOT_QUEUE | REPLACE_EXISTING
-        self.send(method("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName").append2(name, 6u32));
+        let msg = method(DBUS, "/org/freedesktop/DBus", DBUS, "RequestName").append2(name, 6u32);
+        self.call_cb(msg, move |r| done(matches!(r.ok().and_then(|m| m.read1::<u32>().ok()), Some(1 | 4))));
     }
 
     pub fn export(&self, interface: &str, member: &str, h: impl Fn(&Message) -> Option<Message> + 'static) {

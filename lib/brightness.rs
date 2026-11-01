@@ -8,12 +8,12 @@ use crate::ui::runtime;
 const DIR: &str = "/sys/class/backlight";
 
 thread_local! {
-    /// raw (direct panel control) > platform > firmware, like the kernel's own preference; then by name
+    /// firmware > platform > raw, as the kernel's sysfs-class-backlight ABI doc tells userspace; then by name
     static SCREEN: String = {
         let rank = |n: &str| match std::fs::read_to_string(format!("{DIR}/{n}/type")).as_deref().map(str::trim) {
-            Ok("raw") => 0,
+            Ok("firmware") => 0,
             Ok("platform") => 1,
-            Ok("firmware") => 2,
+            Ok("raw") => 2,
             _ => 3,
         };
         let names = std::fs::read_dir(DIR).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>()).unwrap_or_default();
@@ -59,15 +59,21 @@ pub fn set_brightness(percent: f64) {
 /// so this wakes only for brightness changes, not for every kernel uevent.
 pub fn monitor() {
     let Ok(file) = std::fs::File::open(format!("{DIR}/{}/actual_brightness", screen())) else { return };
-    // reading re-arms the notification
+    // reading re-arms the notification; false once it fails (device gone)
+    let fd = file.as_raw_fd();
     let rearm = move || {
         let mut b = [0u8; 16];
-        unsafe { libc::pread(file.as_raw_fd(), b.as_mut_ptr().cast(), b.len(), 0) };
-        file.as_raw_fd()
+        unsafe { libc::pread(file.as_raw_fd(), b.as_mut_ptr().cast(), b.len(), 0) >= 0 }
     };
-    let fd = rearm();
+    if !rearm() {
+        return;
+    }
     runtime::watch_pri(fd, move || {
-        rearm();
+        if !rearm() {
+            // an unread sysfs notification would wake poll() forever
+            runtime::unwatch(fd);
+            return;
+        }
         brightness().set(read(&path()) as f64 / max().max(1) as f64);
     });
 }

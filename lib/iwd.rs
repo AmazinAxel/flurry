@@ -1,7 +1,9 @@
 // iwd over DBus (lib/iwd.ts): the station's live state shared by the Wi-Fi menu and the status
-// icon, and a passphrase agent so secrets never go through argv.
+// icon, and a passphrase agent so secrets never go through argv. The object tree and the ordered
+// network list stay cached and live (menu open or not), so the menu builds from them without a call.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::lib::dbus::{self, ManagedObjects, Message, PropMap, SignalFilter, method, prop_bool, prop_str};
@@ -13,6 +15,7 @@ pub const IWD: &str = "net.connman.iwd";
 pub const DEVICE: &str = "net.connman.iwd.Device";
 pub const STATION: &str = "net.connman.iwd.Station";
 pub const NETWORK: &str = "net.connman.iwd.Network";
+const KNOWN_NETWORK: &str = "net.connman.iwd.KnownNetwork";
 const AGENT: &str = "net.connman.iwd.Agent";
 const AGENT_PATH: &str = "/org/flurry/IwdAgent";
 
@@ -24,6 +27,11 @@ thread_local! {
     static STATE: State<String> = State::new(String::new());
     static SCANNING: State<bool> = State::new(false);
     static GEN: Cell<u32> = const { Cell::new(0) };
+    /// last GetManagedObjects, kept current by PropertiesChanged; empty without iwd
+    static OBJECTS: RefCell<ManagedObjects> = RefCell::default();
+    /// the station's GetOrderedNetworks: (network path, signal in 100*dBm), best first; empty
+    /// without a powered station
+    static ORDERED: RefCell<Vec<(String, i16)>> = const { RefCell::new(Vec::new()) };
     static LISTENERS: RefCell<Vec<Rc<dyn Fn()>>> = RefCell::default();
     /// (network path, passphrase) handed to the agent for the Connect in flight
     static SECRET: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
@@ -44,7 +52,17 @@ pub fn scanning() -> State<bool> {
     SCANNING.with(Clone::clone)
 }
 
-/// `f` runs after any iwd change (signals, iwd appearing or vanishing).
+/// The cached object tree.
+pub fn with_objects<R>(f: impl FnOnce(&ManagedObjects) -> R) -> R {
+    OBJECTS.with(|o| f(&o.borrow()))
+}
+/// The cached ordered networks: (network path, signal in 100*dBm), best first.
+pub fn ordered() -> Vec<(String, i16)> {
+    ORDERED.with(|o| o.borrow().clone())
+}
+
+/// `f` runs after any iwd change (signals, a refresh landing, iwd appearing or vanishing); the
+/// caches are current by then.
 pub fn on_change(f: impl Fn() + 'static) {
     LISTENERS.with(|l| l.borrow_mut().push(Rc::new(f)));
 }
@@ -61,22 +79,49 @@ pub async fn call(path: &str, iface: &str, member: &str, build: impl FnOnce(Mess
 }
 
 fn clear() {
+    OBJECTS.with(|o| o.borrow_mut().clear());
+    ORDERED.with(|o| o.borrow_mut().clear());
     STATION_PATH.with(|s| s.borrow_mut().clear());
     powered().set(false);
     state().set(String::new());
     scanning().set(false);
 }
 
-/// Re-reads the object tree and the station's state; None if it failed or a newer read started.
-pub async fn refresh() -> Option<ManagedObjects> {
+/// Re-reads the object tree, the station's state and its ordered networks into the caches, then
+/// runs the on_change listeners; false if it failed or a newer read started (that one notifies).
+pub async fn refresh() -> bool {
     let generation = GEN.with(|g| {
         g.set(g.get() + 1);
         g.get()
     });
-    let objects: ManagedObjects = call("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", |m| m).await.ok()?.read1().ok()?;
-    if generation != GEN.with(Cell::get) {
-        return None;
+    let current = || generation == GEN.with(Cell::get);
+    let Some(objects) = call("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", |m| m).await.ok().and_then(|m| m.read1::<ManagedObjects>().ok()) else {
+        return false;
+    };
+    if !current() {
+        return false;
     }
+    apply_objects(&objects);
+    // stored now: PropertiesChanged while the list is read merges into this tree
+    OBJECTS.with(|o| *o.borrow_mut() = objects);
+    let station = station();
+    let ordered = if powered().peek() && !station.is_empty() {
+        let Ok(reply) = call(&station, STATION, "GetOrderedNetworks", |m| m).await else { return false };
+        let Ok(list) = reply.read1::<Vec<(dbus::Path<'static>, i16)>>() else { return false };
+        if !current() {
+            return false;
+        }
+        list.into_iter().map(|(p, s)| (p.to_string(), s)).collect()
+    } else {
+        vec![]
+    };
+    ORDERED.with(|o| *o.borrow_mut() = ordered);
+    changed();
+    true
+}
+
+/// Station path, power, state and scanning from a fresh tree.
+fn apply_objects(objects: &ManagedObjects) {
     let mut stations: Vec<_> = objects.iter().filter(|(_, i)| i.contains_key(STATION)).collect();
     stations.sort_by(|a, b| a.0.cmp(b.0));
     match stations.first() {
@@ -90,13 +135,12 @@ pub async fn refresh() -> Option<ManagedObjects> {
         None => {
             // a powered-off device has no Station interface
             let dev = objects.iter().filter(|(_, i)| i.contains_key(DEVICE)).min_by(|a, b| a.0.cmp(b.0));
-            clear();
-            if let Some((_, i)) = dev {
-                powered().set(prop_bool(&i[DEVICE], "Powered").unwrap_or(false));
-            }
+            STATION_PATH.with(|s| s.borrow_mut().clear());
+            state().set(String::new());
+            scanning().set(false);
+            powered().set(dev.and_then(|(_, i)| prop_bool(&i[DEVICE], "Powered")).unwrap_or(false));
         }
     }
-    Some(objects)
 }
 
 /// Device path for power toggling: the station's, else the first device.
@@ -105,12 +149,14 @@ pub async fn device() -> Option<String> {
     if !s.is_empty() {
         return Some(s);
     }
-    let objects = refresh().await?;
+    if !refresh().await {
+        return None;
+    }
     let s = station();
     if !s.is_empty() {
         return Some(s);
     }
-    objects.iter().filter(|(_, i)| i.contains_key(DEVICE)).map(|(p, _)| p.to_string()).min()
+    with_objects(|o| o.iter().filter(|(_, i)| i.contains_key(DEVICE)).map(|(p, _)| p.to_string()).min())
 }
 
 fn queue_refresh() {
@@ -124,30 +170,47 @@ fn queue_refresh() {
         Q.with(|q| q.set(false));
         runtime::spawn(async {
             refresh().await;
-            changed();
         });
     });
 }
 
-fn on_properties(path: &str, iface: &str, p: &PropMap) {
+fn on_properties(path: &str, iface: &str, p: PropMap) {
+    if ![STATION, DEVICE, NETWORK].contains(&iface) {
+        // e.g. per-BSS objects, updated all through a scan
+        return;
+    }
     if STATION_PATH.with(|s| *s.borrow() == path) {
         if iface == STATION {
-            if let Some(v) = prop_str(p, "State") {
+            if let Some(v) = prop_str(&p, "State") {
                 state().set(v);
             }
-            if let Some(v) = prop_bool(p, "Scanning") {
+            if let Some(v) = prop_bool(&p, "Scanning") {
                 scanning().set(v);
+                // a finished scan reorders the networks and updates their signal
+                if !v {
+                    queue_refresh();
+                }
             }
         } else if iface == DEVICE
-            && let Some(v) = prop_bool(p, "Powered")
+            && let Some(v) = prop_bool(&p, "Powered")
         {
             powered().set(v);
         }
-    } else if iface == DEVICE && prop_bool(p, "Powered").is_some() {
+    } else if iface == DEVICE && prop_bool(&p, "Powered").is_some() {
         // a device without a station powering on
         queue_refresh();
     }
+    OBJECTS.with(|o| {
+        if let Some(props) = o.borrow_mut().get_mut(&dbus::Path::from(path.to_string())).and_then(|i| i.get_mut(iface)) {
+            props.extend(p);
+        }
+    });
     changed();
+}
+
+/// Only these objects appearing or going change what the menu or the icon show.
+fn relevant(ifaces: &[&str]) -> bool {
+    ifaces.iter().any(|i| [STATION, DEVICE, NETWORK, KNOWN_NETWORK].contains(i))
 }
 
 fn from_iwd(bus: &dbus::Bus, m: &Message) -> bool {
@@ -217,11 +280,17 @@ pub fn start() {
         SignalFilter { sender: Some(IWD.into()), interface: Some("org.freedesktop.DBus.Properties".into()), member: Some("PropertiesChanged".into()), ..Default::default() },
         |m| {
             if let (Some(path), Ok((iface, changed))) = (m.path(), m.read2::<&str, PropMap>()) {
-                on_properties(&path, iface, &changed);
+                on_properties(&path, iface, changed);
             }
         },
     );
-    bus.subscribe(SignalFilter { sender: Some(IWD.into()), interface: Some("org.freedesktop.DBus.ObjectManager".into()), ..Default::default() }, |_| queue_refresh());
+    bus.subscribe(SignalFilter { sender: Some(IWD.into()), interface: Some("org.freedesktop.DBus.ObjectManager".into()), ..Default::default() }, |m| {
+        let added = m.read2::<dbus::Path, HashMap<String, PropMap>>().ok().map(|(_, i)| i.into_keys().collect::<Vec<_>>());
+        let ifaces = added.or_else(|| m.read2::<dbus::Path, Vec<String>>().ok().map(|(_, i)| i)).unwrap_or_default();
+        if relevant(&ifaces.iter().map(String::as_str).collect::<Vec<_>>()) {
+            queue_refresh();
+        }
+    });
     export_agent(&bus);
     let b = Rc::downgrade(&bus);
     bus.watch_name(

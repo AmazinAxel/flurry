@@ -25,6 +25,8 @@ pub struct Entry {
     pub on_change: Option<Rc<dyn Fn(&str)>>,
     /// Horizontal scroll so the caret stays visible
     scroll: f32,
+    /// the text area's width when last painted (scroll is settled at build time against it)
+    view_w: f32,
 }
 
 pub type EntryRef = Rc<RefCell<Entry>>;
@@ -134,7 +136,10 @@ impl Entry {
         let mut s: String = s.chars().filter(|c| !c.is_control()).collect();
         if let Some(max) = self.max_len {
             let room = max.saturating_sub(self.text.chars().count());
-            s = s.chars().take(room).collect();
+            // in place: a copy would leave the cut part of a secret unwiped
+            if let Some((i, _)) = s.char_indices().nth(room) {
+                s.truncate(i);
+            }
         }
         self.reserve(s.len());
         self.text.insert_str(self.cursor, &s);
@@ -234,8 +239,7 @@ impl Entry {
                 true
             }
             _ if !ev.ctrl && !ev.alt && !ev.text.is_empty() => {
-                let t = ev.text.clone();
-                e.insert(&t);
+                e.insert(&ev.text);
                 true
             }
             _ => false,
@@ -257,6 +261,17 @@ impl Entry {
         let chars = self.text[..byte].chars().count();
         chars * self.invisible_char.map(char::len_utf8).unwrap_or(0)
     }
+
+    /// Scroll that keeps the caret (at `caret_x`) inside a `width` wide area, from the current one.
+    fn scroll_for(&self, caret_x: f32, width: f32) -> f32 {
+        if caret_x - self.scroll > width - 1.0 {
+            caret_x - width + 1.0
+        } else if caret_x < self.scroll {
+            caret_x
+        } else {
+            self.scroll
+        }
+    }
 }
 
 pub struct Look {
@@ -269,8 +284,14 @@ pub struct Look {
 
 /// The text area as a node (GTK's `text` node inside `entry`), filling its allocation.
 pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
+    let font = style.font.clone();
     let key = {
-        let e = this.borrow();
+        let mut e = this.borrow_mut();
+        // settled here, not while painting: the key below has to cover it
+        if e.view_w > 0.0 {
+            let caret_x = text::width_uncached(&e.display()[..e.display_index(e.cursor)], &font);
+            e.scroll = e.scroll_for(caret_x, e.view_w);
+        }
         let colors = [look.color, look.placeholder, look.selection_bg, look.selection_fg].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits));
         // what's displayed, never a secret: a password is keyed by its length only
         let text = (!e.password).then_some(e.text.as_str());
@@ -278,23 +299,21 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         Some(super::node::hash(&(text, len, e.cursor, e.anchor, e.password, e.invisible_char, &e.placeholder, e.scroll.to_bits(), look.caret, colors)))
     };
     let this = this.clone();
-    let font = style.font.clone();
     let shadows = style.text_shadow.clone();
     let height = text::layout("Ag", &font, None, Wrap::None, false).height();
     let paint = Rc::new(move |pm: &mut PixmapMut, r: Rect, ts: Transform| {
         let mut e = this.borrow_mut();
+        // the build settles the scroll for this width; a new width keeps the caret visible below
+        e.view_w = r.width();
         let shown = e.display();
-        let (text_s, color) = if e.text.is_empty() { (e.placeholder.clone(), look.placeholder) } else { (shown.clone(), look.color) };
-        let layout = text::layout(&text_s, &font, None, Wrap::None, false);
-        let x_at = |byte: usize| text::layout(&shown[..byte.min(shown.len())], &font, None, Wrap::None, false).width();
+        let (text_s, color) = if e.text.is_empty() { (e.placeholder.as_str(), look.placeholder) } else { (shown.as_str(), look.color) };
+        let layout = text::layout(text_s, &font, None, Wrap::None, false);
+        // prefixes measured once each, uncached (they are throwaway)
+        let x_at = |byte: usize| text::width_uncached(&shown[..byte.min(shown.len())], &font);
+        let (a, b) = e.selection();
         let caret_x = x_at(e.display_index(e.cursor));
-        // keep the caret inside the visible area
-        if caret_x - e.scroll > r.width() - 1.0 {
-            e.scroll = caret_x - r.width() + 1.0;
-        } else if caret_x < e.scroll {
-            e.scroll = caret_x;
-        }
-        let x = r.x() - e.scroll;
+        let sel = (a != b && !shown.is_empty()).then(|| if e.cursor == b { (x_at(e.display_index(a)), caret_x) } else { (caret_x, x_at(e.display_index(b))) });
+        let x = r.x() - e.scroll_for(caret_x, r.width());
         let y = r.y() + ((r.height() - layout.height()) / 2.0).floor();
         let clip = r;
         // paint into a layer bounded horizontally to the text area (vertical slack for descenders)
@@ -315,17 +334,14 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         let outer = pm;
         let pm = &mut area.as_mut();
         let ts = ts.post_translate(-lx, -ly);
-        let (a, b) = e.selection();
-        if a != b && !shown.is_empty() {
-            let (sa, sb) = (x_at(e.display_index(a)), x_at(e.display_index(b)));
-            if let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height()).and_then(|s| s.intersect(&clip)) {
-                fill_rect(pm, sel, look.selection_bg, ts);
-            }
+        if let Some((sa, sb)) = sel
+            && let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height()).and_then(|s| s.intersect(&clip))
+        {
+            fill_rect(pm, sel, look.selection_bg, ts);
         }
         text::draw(pm, &layout, x, y, color, ts);
-        if a != b && !shown.is_empty() {
+        if let Some((sa, sb)) = sel {
             // selected glyphs in the selection color, clipped to the selection
-            let (sa, sb) = (x_at(e.display_index(a)), x_at(e.display_index(b)));
             if let Some(sel) = Rect::from_xywh(x + sa, y, sb - sa, layout.height()).and_then(|s| s.intersect(&clip))
                 && let Some((mut layer, (ox, oy))) = super::node::clip_layer(sel, ts)
             {

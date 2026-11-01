@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use tiny_skia::{Color, PixmapMut, Transform};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_keyboard, wl_output,
-    wl_pointer, wl_region, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_subcompositor, wl_subsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, backend::ObjectId, delegate_noop};
 use wayland_protocols::ext::session_lock::v1::client::{ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1};
@@ -44,6 +44,12 @@ pub struct Output {
     pub done: bool,
 }
 
+impl Output {
+    fn new(wl: wl_output::WlOutput) -> Output {
+        Output { wl, name: String::new(), scale: 1, done: false }
+    }
+}
+
 struct Ctx {
     conn: Connection,
     qh: QueueHandle<Wl>,
@@ -55,10 +61,6 @@ struct Ctx {
     viewporter: wp_viewporter::WpViewporter,
     single_pixel: wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
     cursor_shape: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
-    _data_device: Option<wl_data_device::WlDataDevice>,
-    selection: Option<(wl_data_offer::WlDataOffer, Vec<String>)>,
-    /// offers whose mime types are still arriving, or that never became the selection (dnd)
-    offers: HashMap<ObjectId, (wl_data_offer::WlDataOffer, Vec<String>)>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     cursor_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
@@ -154,8 +156,7 @@ pub fn connect() -> bool {
     ) else {
         return false;
     };
-    let ddm: Option<wl_data_device_manager::WlDataDeviceManager> = globals.bind(&qh, 3..=3, ()).ok();
-    let c0 = Ctx {
+    let mut c0 = Ctx {
         compositor,
         subcompositor,
         shm,
@@ -164,9 +165,6 @@ pub fn connect() -> bool {
         viewporter,
         single_pixel,
         cursor_shape: globals.bind(&qh, 1..=1, ()).ok(),
-        _data_device: ddm.as_ref().map(|d| d.get_data_device(&seat, &qh, ())),
-        selection: None,
-        offers: HashMap::new(),
         keyboard: None,
         pointer: None,
         cursor_device: None,
@@ -181,7 +179,8 @@ pub fn connect() -> bool {
     };
     globals.contents().with_list(|list| {
         for g in list.iter().filter(|g| g.interface == "wl_output") {
-            let _: wl_output::WlOutput = globals.registry().bind(g.name, g.version.min(4), &qh, g.name);
+            let wl: wl_output::WlOutput = globals.registry().bind(g.name, g.version.min(4), &qh, g.name);
+            c0.outputs.push(Output::new(wl));
         }
     });
     bind_data_control(&globals, &qh, &seat);
@@ -250,7 +249,7 @@ fn handle(ev: Ev) {
         Ev::Configure(id, w, h) => {
             if let Some(s) = surface(&id) {
                 // sway re-sends unchanged configures to every layer when one maps: nothing to redraw
-                let shown = s.configured.replace(true) && !s.buffers.borrow().is_empty();
+                let shown = s.configured.replace(true) && (!s.buffers.borrow().is_empty() || s.shows_image());
                 let unchanged = w == 0 || h == 0 || s.size.get() == (w, h);
                 if w > 0 && h > 0 {
                     s.size.set((w, h));
@@ -415,7 +414,7 @@ enum Role {
     None,
 }
 
-pub type BuildFn = Rc<dyn Fn(f32, f32) -> Node>;
+pub type BuildFn = Rc<dyn Fn() -> Node>;
 
 struct Buffer {
     wl: wl_buffer::WlBuffer,
@@ -453,7 +452,7 @@ pub struct Inner {
     remapped: Cell<bool>,
     /// unmaps whose sync hasn't come back: configures before then are for the old mapping
     stale: Cell<u32>,
-    build: RefCell<Option<BuildFn>>,
+    build: BuildFn,
     on_key: RefCell<Option<Rc<dyn Fn(&KeyEvent)>>>,
     on_pointer: RefCell<Option<Rc<dyn Fn(PointerEvent)>>>,
     after_render: RefCell<Option<Rc<dyn Fn(&Node)>>>,
@@ -474,8 +473,10 @@ pub struct Inner {
     damage: RefCell<Damage>,
     /// the output a lock surface is on: it dies with it
     output: Option<wl_output::WlOutput>,
-    /// the tree the initial commit was sized from, at that size: the configure's render paints it
-    prebuilt: RefCell<Option<((u32, u32), Node)>>,
+    /// the tree the initial commit was sized from: the configure's render paints it
+    prebuilt: RefCell<Option<Node>>,
+    /// the layer size last asked for (0: stretched/fixed axis); asked again only when it changes
+    requested: Cell<Option<(u32, u32)>>,
 }
 
 /// Buffer pixel rect: x, y, w, h.
@@ -673,7 +674,7 @@ impl Surface {
                 redraw_queued: Cell::new(false),
                 remapped: Cell::new(false),
                 stale: Cell::new(0),
-                build: RefCell::new(Some(build)),
+                build,
                 on_key: RefCell::default(),
                 on_pointer: RefCell::default(),
                 after_render: RefCell::default(),
@@ -689,6 +690,7 @@ impl Surface {
                 damage: RefCell::default(),
                 output: None,
                 prebuilt: RefCell::default(),
+                requested: Cell::new(None),
             }
         });
         let s = Rc::new(s);
@@ -846,45 +848,60 @@ impl Inner {
         });
     }
 
-    /// Sizes non-stretched axes from the content's natural size (GTK layer windows do the same).
+    /// An image surface (wallpaper): shown without buffers of its own.
+    fn shows_image(&self) -> bool {
+        self.content.is_none() && self.image.borrow().is_some()
+    }
+
+    /// Asks for the layer size the content's natural size gives its non-stretched axes (GTK layer
+    /// windows do the same); built from scratch without `built`, and that tree kept for the render.
     fn apply_content_size(&self, built: Option<&Node>) {
-        let Role::Layer(layer) = &*self.role.borrow() else { return };
+        let owned = match built {
+            Some(_) => None,
+            None => Some((self.build)()),
+        };
+        let Some(node) = built.or(owned.as_ref()) else { return };
+        if let Some(want) = self.content_size(node) {
+            self.request_size(want);
+        }
+        // a re-show's configure paints this tree instead of building another
+        if let Some(n) = owned {
+            *self.prebuilt.borrow_mut() = Some(n);
+        }
+    }
+
+    /// The layer size `node` wants (0 on stretched axes); None when nothing is from content.
+    fn content_size(&self, node: &Node) -> Option<(u32, u32)> {
+        if !matches!(*self.role.borrow(), Role::Layer(_)) {
+            return None;
+        }
         let a = self.spec_anchor;
         let stretch_w = a.contains(Anchor::Left) && a.contains(Anchor::Right);
         let stretch_h = a.contains(Anchor::Top) && a.contains(Anchor::Bottom);
         if (stretch_w || self.fixed.0 > 0) && (stretch_h || self.fixed.1 > 0) {
-            return;
+            return None;
         }
-        let (cw, ch) = self.size.get();
-        let owned = match built {
-            Some(_) => None,
-            None => {
-                let Some(build) = self.build.borrow().clone() else { return };
-                Some(build(cw as f32, ch as f32))
-            }
-        };
-        let Some(node) = built.or(owned.as_ref()) else { return };
         let (_, nw) = node.measure_w();
         let nw = nw + node.style.margin.h();
         let w = if stretch_w { 0 } else if self.fixed.0 > 0 { self.fixed.0 } else { nw.ceil().max(1.0) as u32 };
-        let width_for_h = if stretch_w { cw as f32 } else { w as f32 };
+        let width_for_h = if stretch_w { self.size.get().0 as f32 } else { w as f32 };
         let (_, nh) = node.measure_h(width_for_h - node.style.margin.h());
         let nh = nh + node.style.margin.v();
         let h = if stretch_h { 0 } else if self.fixed.1 > 0 { self.fixed.1 } else { nh.ceil().max(1.0) as u32 };
+        Some((w, h))
+    }
+
+    fn request_size(&self, (w, h): (u32, u32)) {
+        let Role::Layer(layer) = &*self.role.borrow() else { return };
         layer.set_size(w, h);
         if self.exclusive > 0 {
+            let a = self.spec_anchor;
             let zone = if a.contains(Anchor::Left) ^ a.contains(Anchor::Right) { w } else { h };
             layer.set_exclusive_zone(zone as i32);
         }
         let (old_w, old_h) = self.size.get();
-        let new = (if w == 0 { old_w } else { w }, if h == 0 { old_h } else { h });
-        if new != (old_w, old_h) {
-            self.size.set(new);
-        }
-        // a re-show's configure (same size) paints this tree instead of building another
-        if let Some(n) = owned {
-            *self.prebuilt.borrow_mut() = Some(((cw, ch), n));
-        }
+        self.size.set((if w == 0 { old_w } else { w }, if h == 0 { old_h } else { h }));
+        self.requested.set(Some((w, h)));
     }
 
     fn render(self: &Rc<Self>) {
@@ -902,19 +919,21 @@ impl Inner {
             self.attach_image(&img);
             return;
         }
-        let Some(build) = self.build.borrow().clone() else { return };
         let before = self.size.get();
         // one build per render: the same tree sizes the layer and gets painted
-        let mut node = match self.prebuilt.take() {
-            Some((size, n)) if size == before => n,
-            _ => build(before.0 as f32, before.1 as f32),
-        };
-        self.apply_content_size(Some(&node));
-        if self.size.get() != before && matches!(*self.role.borrow(), Role::Layer(_)) {
-            // wait for the configure with the new size (which then always renders)
-            self.configured.set(false);
-            self.wl.commit();
-            return;
+        let mut node = self.prebuilt.take().unwrap_or_else(|| (self.build)());
+        // asked once per change: a compositor that configures another size gets painted at that
+        // size rather than asked again forever
+        if let Some(want) = self.content_size(&node)
+            && self.requested.get() != Some(want)
+        {
+            self.request_size(want);
+            if self.size.get() != before {
+                // wait for the configure with the new size (which then always renders)
+                self.configured.set(false);
+                self.wl.commit();
+                return;
+            }
         }
         let (w, h) = self.size.get();
         let scale = self.scale.get().max(1);
@@ -966,6 +985,9 @@ impl Inner {
             old.extend(c);
             old
         }));
+        // repainting most of it piecewise costs more (and a scratch that big) than painting it all
+        let area = |r: &Vec<PxRect>| r.iter().map(|&(_, _, w, h)| w as u64 * h as u64).sum::<u64>();
+        let repaint = repaint.filter(|r| area(r) * 2 <= pw as u64 * ph as u64);
         match &repaint {
             None => {
                 let Some(mut pm) = PixmapMut::from_bytes(dst, pw, ph) else {
@@ -989,6 +1011,9 @@ impl Inner {
                         let at = ((y as usize + i) * pw as usize + x as usize) * 4;
                         dst[at..at + row].copy_from_slice(src);
                     }
+                }
+                if scratch.capacity() > 1 << 20 {
+                    scratch = Vec::new();
                 }
                 SCRATCH.set(scratch);
             }
@@ -1214,7 +1239,11 @@ pub fn is_locking() -> bool {
 
 /// A lock surface showing `image` (black without one) under a vertical `gradient`, with the built
 /// content in a subsurface clipped to what it paints: no full-screen repaint per keypress.
-pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn, image: Option<Rc<ShmImage>>, gradient: (Color, Color)) -> Option<Surface> {
+pub fn lock_surface(
+    output: &wl_output::WlOutput, build: Rc<dyn Fn(f32, f32) -> Node>, image: Option<Rc<ShmImage>>, gradient: (Color, Color),
+) -> Option<Surface> {
+    // the size arguments are unused (the tree is laid out at the configured size)
+    let build: BuildFn = Rc::new(move || build(0.0, 0.0));
     let inner = ctx(|c| {
         let lock = c.lock.as_ref()?;
         let wl = c.compositor.create_surface(&c.qh, ());
@@ -1257,7 +1286,7 @@ pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn, image: Option<
             redraw_queued: Cell::new(false),
             remapped: Cell::new(false),
             stale: Cell::new(0),
-            build: RefCell::new(Some(build)),
+            build,
             on_key: RefCell::default(),
             on_pointer: RefCell::default(),
             after_render: RefCell::default(),
@@ -1273,6 +1302,7 @@ pub fn lock_surface(output: &wl_output::WlOutput, build: BuildFn, image: Option<
             damage: RefCell::default(),
             output: Some(output.clone()),
             prebuilt: RefCell::default(),
+            requested: Cell::new(None),
         })
     })?;
     let s = Rc::new(inner);
@@ -1297,18 +1327,36 @@ pub fn unlock() {
 // ---------------------------------------------------------------- clipboard
 
 /// Reads the clipboard's first line as text (Ctrl+V into entries), at most 64 KiB; nothing if the
-/// owner doesn't finish within 2 s.
+/// owner doesn't finish within 2 s. Through data-control, so no keyboard focus is needed.
 pub fn paste(cb: impl FnOnce(String) + 'static) {
-    let Some((offer, mimes)) = ctx(|c| c.selection.clone()) else { return };
+    let Some((offer, mimes)) = DC.with(|d| d.borrow().selection.clone()) else { return };
     let Some(mime) = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"].into_iter().find(|m| mimes.iter().any(|x| x == m)) else {
         return;
     };
     let Some(rd) = receive(|wr| offer.receive(mime.into(), wr)) else { return };
     read_pipe(rd, 64 * 1024, true, 2000, move |data| {
         if let Some(d) = data {
-            cb(String::from_utf8_lossy(&d).into_owned());
+            // moved, not copied: the entry wipes the whole buffer; a lossy copy leaves the original
+            match String::from_utf8(d) {
+                Ok(s) => cb(s),
+                Err(e) => {
+                    let mut d = e.into_bytes();
+                    let s = String::from_utf8_lossy(&d).into_owned();
+                    wipe(&mut d);
+                    cb(s);
+                }
+            }
         }
     });
+}
+
+/// Zeroes all of `v`'s buffer (spare capacity too) and empties it: pasted text may be a secret.
+fn wipe(v: &mut Vec<u8>) {
+    let p = v.as_mut_ptr();
+    for i in 0..v.capacity() {
+        unsafe { std::ptr::write_volatile(p.add(i), 0) };
+    }
+    v.clear();
 }
 
 /// A pipe whose write end `send` hands to the selection's owner.
@@ -1324,13 +1372,43 @@ fn receive(send: impl FnOnce(std::os::fd::BorrowedFd)) -> Option<OwnedFd> {
     Some(rd)
 }
 
+/// The read end and callback of a `read_pipe`, until done or given up on.
+type Pending = Rc<RefCell<Option<(OwnedFd, Box<dyn FnOnce(Option<Vec<u8>>)>)>>>;
+
+/// A `read_pipe` in progress.
+struct Reading {
+    raw: std::os::fd::RawFd,
+    pending: Pending,
+    give_up: runtime::Timer,
+}
+
+impl Reading {
+    /// Stops it (if still running): the callback gets None.
+    fn cancel(self) {
+        let taken = self.pending.borrow_mut().take();
+        if let Some((_rd, cb)) = taken {
+            runtime::unwatch(self.raw);
+            self.give_up.cancel();
+            cb(None);
+        }
+    }
+}
+
+/// Wiped when dropped unhanded (a read that failed or was given up on).
+struct Bytes(Vec<u8>);
+
+impl Drop for Bytes {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
 /// Reads `rd` to its end on the loop (`line`: to the first newline). Past `max` bytes a line is cut
 /// there and anything else dropped (None), as is a writer that doesn't finish within `ms`.
-fn read_pipe(rd: OwnedFd, max: usize, line: bool, ms: u64, cb: impl FnOnce(Option<Vec<u8>>) + 'static) {
+fn read_pipe(rd: OwnedFd, max: usize, line: bool, ms: u64, cb: impl FnOnce(Option<Vec<u8>>) + 'static) -> Reading {
+    const CHUNK: usize = 16384;
     let raw = rd.as_raw_fd();
-    // the read end and callback, until done or given up on
-    type Pending = Option<(OwnedFd, Box<dyn FnOnce(Option<Vec<u8>>)>)>;
-    let pending: Rc<RefCell<Pending>> = Rc::new(RefCell::new(Some((rd, Box::new(cb)))));
+    let pending: Pending = Rc::new(RefCell::new(Some((rd, Box::new(cb)))));
     let give_up = {
         let pending = pending.clone();
         runtime::timeout(ms, move || {
@@ -1341,10 +1419,13 @@ fn read_pipe(rd: OwnedFd, max: usize, line: bool, ms: u64, cb: impl FnOnce(Optio
             }
         })
     };
-    let data = RefCell::new(Vec::new());
+    // room for a whole small read up front: no reallocation leaves copies behind
+    let data = RefCell::new(Bytes(Vec::with_capacity(max.min(64 * 1024) + CHUNK)));
+    let p = pending.clone();
     runtime::watch(raw, move || {
         let mut data = data.borrow_mut();
-        let mut buf = [0u8; 16384];
+        let data = &mut data.0;
+        let mut buf = [0u8; CHUNK];
         let ok = loop {
             let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
@@ -1360,23 +1441,30 @@ fn read_pipe(rd: OwnedFd, max: usize, line: bool, ms: u64, cb: impl FnOnce(Optio
                 continue;
             }
             if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                buf.iter_mut().for_each(|b| unsafe { std::ptr::write_volatile(b, 0) });
                 return;
             }
             break n == 0;
         };
+        buf.iter_mut().for_each(|b| unsafe { std::ptr::write_volatile(b, 0) });
         give_up.cancel();
         runtime::unwatch(raw);
-        let Some((_rd, cb)) = pending.borrow_mut().take() else { return };
-        cb(ok.then(|| std::mem::take(&mut *data)));
+        let Some((_rd, cb)) = p.borrow_mut().take() else { return };
+        cb(ok.then(|| std::mem::take(data)));
     });
+    Reading { raw, pending, give_up }
 }
 
 // ---------------------------------------------------------------- data control
-// wlr-data-control sees every selection, focused or not, and owns one without a surface: the
-// clipboard history and copying. Without it (another compositor) both quietly do nothing.
+// wlr-data-control sees every selection, focused or not, and owns one without a surface: pasting,
+// the clipboard history and copying. Without it (another compositor) they quietly do nothing.
 
 /// What a copy offers: each mime type with its bytes.
 pub type Offers = Arc<Vec<(String, Arc<[u8]>)>>;
+
+/// Offered (with no data) alongside everything `set_selection` offers: a selection listing it is
+/// flurry's own.
+pub const OWN_MIME: &str = "application/x-flurry";
 
 #[derive(Default)]
 struct DataControl {
@@ -1393,6 +1481,10 @@ struct DataControl {
 thread_local! {
     static DC: RefCell<DataControl> = RefCell::default();
     static SELECTION_LISTENER: RefCell<Option<Rc<dyn Fn(Vec<String>)>>> = RefCell::default();
+    /// the one `read_selection` in flight: a newer selection's read replaces it
+    static SELECTION_READ: RefCell<Option<Reading>> = const { RefCell::new(None) };
+    /// `serve`s waiting on a full pipe
+    static SERVING: Cell<usize> = const { Cell::new(0) };
 }
 
 fn bind_data_control(globals: &wayland_client::globals::GlobalList, qh: &QueueHandle<Wl>, seat: &wl_seat::WlSeat) {
@@ -1404,23 +1496,34 @@ fn bind_data_control(globals: &wayland_client::globals::GlobalList, qh: &QueueHa
     });
 }
 
-/// Calls `f` with the mime types of every new selection (flurry's own too), after dispatch.
+/// Calls `f` with the mime types of every new selection (flurry's own too: they list `OWN_MIME`),
+/// after dispatch.
 pub fn on_selection(f: impl Fn(Vec<String>) + 'static) {
     SELECTION_LISTENER.with(|l| *l.borrow_mut() = Some(Rc::new(f)));
 }
 
-/// Reads the current selection as `mime`: None past `max` bytes, or if the owner doesn't finish
-/// within `ms`.
+fn cancel_selection_read() {
+    if let Some(r) = SELECTION_READ.with(|r| r.borrow_mut().take()) {
+        r.cancel();
+    }
+}
+
+/// Reads the current selection as `mime`: None past `max` bytes, if the owner doesn't finish
+/// within `ms`, or once a newer selection comes (one read at a time).
 pub fn read_selection(mime: &str, max: usize, ms: u64, cb: impl FnOnce(Option<Vec<u8>>) + 'static) {
+    cancel_selection_read();
     let offer = DC.with(|d| d.borrow().selection.as_ref().map(|s| s.0.clone()));
     match offer.and_then(|o| receive(|wr| o.receive(mime.into(), wr))) {
-        Some(rd) => read_pipe(rd, max, false, ms, cb),
+        Some(rd) => {
+            let r = read_pipe(rd, max, false, ms, cb);
+            SELECTION_READ.with(|s| *s.borrow_mut() = Some(r));
+        }
         None => cb(None),
     }
 }
 
-/// Owns the clipboard with `offers` until another client takes it over. The token (None without
-/// data-control) empties it again with `clear_selection`.
+/// Owns the clipboard with `offers` (plus `OWN_MIME`) until another client takes it over. The
+/// token (None without data-control) empties it again with `clear_selection`.
 pub fn set_selection(offers: Offers) -> Option<u64> {
     let qh = ctx(|c| c.qh.clone());
     DC.with(|d| {
@@ -1430,6 +1533,7 @@ pub fn set_selection(offers: Offers) -> Option<u64> {
         for (mime, _) in offers.iter() {
             source.offer(mime.clone());
         }
+        source.offer(OWN_MIME.into());
         device.set_selection(Some(&source));
         if let Some((old, _)) = d.source.take() {
             old.destroy();
@@ -1453,8 +1557,11 @@ pub fn clear_selection(token: u64) {
     });
 }
 
-/// Writes `data` to a reader without blocking the loop; a reader that stalls for 10 s is dropped.
+/// Writes `data` to a reader without blocking the loop; a reader that takes nothing for 10 s is
+/// dropped, as is any beyond the first 8 waiting at once.
 fn serve(fd: OwnedFd, data: Arc<[u8]>) {
+    const MAX_WAITING: usize = 8;
+    const STALL_MS: u64 = 10_000;
     let raw = fd.as_raw_fd();
     unsafe { libc::fcntl(raw, libc::F_SETFL, libc::fcntl(raw, libc::F_GETFL) | libc::O_NONBLOCK) };
     // true while the pipe is full
@@ -1471,26 +1578,39 @@ fn serve(fd: OwnedFd, data: Arc<[u8]>) {
         return n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock;
     };
     let pos = Cell::new(0);
-    if !step(&pos) {
+    if !step(&pos) || SERVING.get() >= MAX_WAITING {
         return;
     }
-    let fd = Rc::new(Cell::new(Some(fd)));
-    let give_up = {
-        let fd = fd.clone();
-        runtime::timeout(10_000, move || {
-            if fd.take().is_some() {
-                runtime::unwatch(raw);
-            }
-        })
-    };
-    runtime::watch(raw, move || {
-        if step(&pos) {
-            runtime::poll_out(raw);
-            return;
+    SERVING.set(SERVING.get() + 1);
+    // the fd and its stall timer, until done or given up on
+    let state: Rc<RefCell<Option<(OwnedFd, runtime::Timer)>>> = Rc::new(RefCell::new(None));
+    let finish = move |state: &RefCell<Option<(OwnedFd, runtime::Timer)>>| {
+        let taken = state.borrow_mut().take();
+        if let Some((_fd, t)) = taken {
+            t.cancel();
+            runtime::unwatch(raw);
+            SERVING.set(SERVING.get() - 1);
         }
-        give_up.cancel();
-        runtime::unwatch(raw);
-        fd.take();
+    };
+    let arm = move |state: &Rc<RefCell<Option<(OwnedFd, runtime::Timer)>>>| {
+        let s = state.clone();
+        runtime::timeout(STALL_MS, move || finish(&s))
+    };
+    *state.borrow_mut() = Some((fd, arm(&state)));
+    let st = state.clone();
+    runtime::watch(raw, move || {
+        let before = pos.get();
+        if !step(&pos) {
+            return finish(&st);
+        }
+        // progress: the reader gets another full stall period
+        if pos.get() != before {
+            let t = arm(&st);
+            if let Some((_, old)) = st.borrow_mut().as_mut() {
+                std::mem::replace(old, t).cancel();
+            }
+        }
+        runtime::poll_out(raw);
     });
     runtime::poll_out(raw);
 }
@@ -1516,6 +1636,8 @@ impl Dispatch<dc_device::ZwlrDataControlDeviceV1, ()> for Wl {
                 });
                 if let Some(m) = mimes {
                     runtime::idle(move || {
+                        // a read of the one before is stale now
+                        cancel_selection_read();
                         if let Some(f) = SELECTION_LISTENER.with(|l| l.borrow().clone()) {
                             f(m);
                         }
@@ -1580,7 +1702,8 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Wl {
     fn event(_: &mut Self, reg: &wl_registry::WlRegistry, ev: wl_registry::Event, _: &GlobalListContents, _: &Connection, qh: &QueueHandle<Self>) {
         match ev {
             wl_registry::Event::Global { name, interface, version } if interface == "wl_output" => {
-                let _: wl_output::WlOutput = reg.bind(name, version.min(4), qh, name);
+                let wl: wl_output::WlOutput = reg.bind(name, version.min(4), qh, name);
+                ctx(|c| c.outputs.push(Output::new(wl)));
             }
             wl_registry::Event::GlobalRemove { name } => {
                 let removed = ctx(|c| {
@@ -1600,10 +1723,8 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Wl {
 impl Dispatch<wl_output::WlOutput, u32> for Wl {
     fn event(_: &mut Self, o: &wl_output::WlOutput, ev: wl_output::Event, _: &u32, _: &Connection, _: &QueueHandle<Self>) {
         ctx(|c| {
-            if !c.outputs.iter().any(|x| x.wl == *o) {
-                c.outputs.push(Output { wl: o.clone(), name: String::new(), scale: 1, done: false });
-            }
-            let out = c.outputs.iter_mut().find(|x| x.wl == *o).unwrap();
+            // listed when bound; events still in flight after its GlobalRemove must not bring it back
+            let Some(out) = c.outputs.iter_mut().find(|x| x.wl == *o) else { return };
             match ev {
                 wl_output::Event::Name { name } => out.name = name,
                 wl_output::Event::Scale { factor } => out.scale = factor,
@@ -1626,6 +1747,8 @@ impl Dispatch<wl_seat::WlSeat, ()> for Wl {
                     && let Some(k) = c.keyboard.take()
                 {
                     k.release();
+                    // no Leave comes for a dead keyboard: drop focus and stop a running key repeat
+                    push(Ev::KeyboardLeave);
                 }
                 if !caps.contains(wl_seat::Capability::Pointer) {
                     if let Some(d) = c.cursor_device.take() {
@@ -1859,61 +1982,12 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for Wl {
     fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
-impl Dispatch<wl_data_device::WlDataDevice, ()> for Wl {
-    fn event(_: &mut Self, _: &wl_data_device::WlDataDevice, ev: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        match ev {
-            wl_data_device::Event::DataOffer { id } => ctx(|c| {
-                c.offers.insert(id.id(), (id, vec![]));
-            }),
-            wl_data_device::Event::Selection { id } => ctx(|c| {
-                if let Some((old, _)) = c.selection.take() {
-                    old.destroy();
-                }
-                let mimes = id.as_ref().and_then(|o| c.offers.remove(&o.id())).map(|(_, m)| m).unwrap_or_default();
-                // anything else offered so far (older or drag offers) is dead now
-                for (_, (o, _)) in c.offers.drain() {
-                    o.destroy();
-                }
-                c.selection = id.map(|o| (o, mimes));
-            }),
-            wl_data_device::Event::Leave => ctx(|c| {
-                // the drag offer (flurry takes no drops)
-                for (_, (o, _)) in c.offers.drain() {
-                    o.destroy();
-                }
-            }),
-            _ => {}
-        }
-    }
-
-    wayland_client::event_created_child!(Wl, wl_data_device::WlDataDevice, [
-        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
-    ]);
-}
-
-impl Dispatch<wl_data_offer::WlDataOffer, ()> for Wl {
-    fn event(_: &mut Self, o: &wl_data_offer::WlDataOffer, ev: wl_data_offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let wl_data_offer::Event::Offer { mime_type } = ev {
-            ctx(|c| {
-                if let Some((_, m)) = c.offers.get_mut(&o.id()) {
-                    m.push(mime_type);
-                } else if let Some((sel, m)) = &mut c.selection
-                    && sel == o
-                {
-                    m.push(mime_type);
-                }
-            });
-        }
-    }
-}
-
 delegate_noop!(Wl: ignore wl_compositor::WlCompositor);
 delegate_noop!(Wl: ignore wl_subcompositor::WlSubcompositor);
 delegate_noop!(Wl: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(Wl: ignore wl_shm::WlShm);
 delegate_noop!(Wl: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(Wl: ignore wl_region::WlRegion);
-delegate_noop!(Wl: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(Wl: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(Wl: ignore ext_session_lock_manager_v1::ExtSessionLockManagerV1);
 delegate_noop!(Wl: ignore wp_viewporter::WpViewporter);

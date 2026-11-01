@@ -13,8 +13,6 @@ pub struct Battery {
     /// UPower state: 1 charging, 2 discharging, 3 empty, 4 fully charged, 5 pending charge, 6 pending discharge
     pub state: i64,
     pub present: bool,
-    /// GetAll answered (the status bar decides once whether to show the battery)
-    pub loaded: bool,
 }
 
 impl Battery {
@@ -71,6 +69,5 @@ pub fn start() {
         if let Some(p) = r.ok().and_then(|m| m.read1::<PropMap>().ok()) {
             apply(&p);
         }
-        battery().update(|b| b.loaded = true);
     });
 }

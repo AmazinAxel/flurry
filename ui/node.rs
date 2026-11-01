@@ -152,6 +152,8 @@ pub struct LabelSpec {
     pub max_width_chars: Option<f32>,
     /// line-height multiplier from markup (`<span line_height>`), applied to all lines but the first
     pub line_height: Option<f32>,
+    /// wrapped text past this many lines is cut, the last line ellipsized
+    pub max_lines: Option<usize>,
 }
 
 pub enum Kind {
@@ -194,6 +196,8 @@ pub struct Node {
     measured_w: Cell<Option<(f32, f32)>>,
     measured_h: Cell<Option<(u32, (f32, f32))>>,
     expands: Cell<Option<(bool, bool)>>,
+    /// painted_bounds once laid out (outer None: not computed since the last allocate)
+    bounds: Cell<Option<Option<Rect>>>,
 }
 
 impl Node {
@@ -216,6 +220,7 @@ impl Node {
             measured_w: Cell::new(None),
             measured_h: Cell::new(None),
             expands: Cell::new(None),
+            bounds: Cell::new(None),
         }
     }
     pub fn vbox(style: Style, spacing: f32, children: Vec<Node>) -> Self {
@@ -238,6 +243,7 @@ impl Node {
             ellipsize: false,
             max_width_chars: None,
             line_height: None,
+            max_lines: None,
         };
         Self::new(Kind::Label(spec), style)
     }
@@ -284,6 +290,13 @@ impl Node {
         if let Kind::Label(l) = &mut self.kind {
             l.ellipsize = true;
             l.max_width_chars = Some(1.0);
+        }
+        self
+    }
+    /// A wrapping label shows at most `n` lines, the last one ellipsized when text is cut.
+    pub fn max_lines(mut self, n: usize) -> Self {
+        if let Kind::Label(l) = &mut self.kind {
+            l.max_lines = Some(n);
         }
         self
     }
@@ -523,11 +536,13 @@ impl Node {
             (None, Wrap::None, false)
         };
         // markup line-height factor: every line shrinks/grows, the difference split above/below
-        text::layout_spaced(&l.text, &self.style.font, max, wrap, ellipsize, self.style.line_height, l.line_height)
+        let max_lines = l.max_lines.filter(|_| l.wrap);
+        text::layout_spaced(&l.text, &self.style.font, max, wrap, ellipsize, self.style.line_height, l.line_height, max_lines)
     }
 
     /// Allocates the margin box `(x, y, w, h)`.
     pub fn allocate(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.bounds.set(None);
         let m = self.style.margin;
         let (mut x, mut y, mut w, mut h) = (x + m.left, y + m.top, (w - m.h()).max(0.0), (h - m.v()).max(0.0));
         let (minw, natw) = self.measure_w();
@@ -602,6 +617,9 @@ impl Node {
             return;
         }
         self.rect = Rect::from_xywh(self.rect.x(), self.rect.y() + dy, self.rect.width(), self.rect.height()).unwrap_or(self.rect);
+        if let Some(Some(b)) = self.bounds.get() {
+            self.bounds.set(Some(b.transform(Transform::from_translate(0.0, dy))));
+        }
         for c in &mut self.children {
             c.shift_y(dy);
         }
@@ -625,6 +643,15 @@ impl Node {
         if !self.visible {
             return None;
         }
+        if let Some(b) = self.bounds.get() {
+            return b;
+        }
+        let b = self.painted_bounds_uncached();
+        self.bounds.set(Some(b));
+        b
+    }
+
+    fn painted_bounds_uncached(&self) -> Option<Rect> {
         let s = &self.style;
         let mut out: Option<Rect> = self.self_bounds();
         let mut add = |b: Rect| out = Some(out.map_or(b, |o| union(o, b)));
@@ -734,7 +761,7 @@ impl Node {
         match &self.kind {
             Kind::Label(l) => {
                 shadows(&mut h, &s.text_shadow);
-                (&l.text, l.wrap, l.ellipsize, s.font.family, s.font.weight).hash(&mut h);
+                (&l.text, l.wrap, l.ellipsize, l.max_lines, s.font.family, s.font.weight).hash(&mut h);
                 f(&mut h, &[l.xalign, l.max_width_chars.unwrap_or(-1.0), l.line_height.unwrap_or(-1.0), s.line_height.unwrap_or(-1.0)]);
                 f(&mut h, &[s.font.size]);
             }
@@ -763,9 +790,8 @@ impl Node {
         if !self.visible {
             return;
         }
-        // leaves scrolled out of the target (long lists) cost nothing
-        if self.children.is_empty()
-            && let Some(b) = self.painted_bounds().and_then(|b| b.transform(ts))
+        // subtrees outside the target (scrolled-out rows, other damage rects) cost nothing
+        if let Some(b) = self.painted_bounds().and_then(|b| b.transform(ts))
             && (b.right() < 0.0 || b.bottom() < 0.0 || b.left() > pm.width() as f32 || b.top() > pm.height() as f32)
         {
             return;
@@ -974,8 +1000,10 @@ impl LayerCache {
     }
 }
 
+const SHADOW_BUDGET: usize = 16 << 20;
+
 thread_local! {
-    static SHADOWS: std::cell::RefCell<LayerCache> = std::cell::RefCell::new(LayerCache::new(16 << 20));
+    static SHADOWS: std::cell::RefCell<LayerCache> = std::cell::RefCell::new(LayerCache::new(SHADOW_BUDGET));
 }
 
 /// `layer`'s alpha blurred, then tinted `color` (premultiplied).
@@ -1174,16 +1202,13 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
     let (ox, oy) = (dev.left().floor() - pad, dev.top().floor() - pad);
     let key = hash(&(dev.width().to_bits(), dev.height().to_bits(), (dev.left() - dev.left().floor()).to_bits(), (dev.top() - dev.top().floor()).to_bits(), radius.to_bits()));
     // one entry per window header and monitor: a single slot made every window switch re-blur the
-    // wallpaper (~60ms). Only the current image's: a new wallpaper drops the old one's blurs.
-    thread_local! {
-        static BLURRED: std::cell::RefCell<(u64, LayerCache)> = std::cell::RefCell::new((0, LayerCache::new(128 << 20)));
-    }
+    // wallpaper. Only the current image's: a new wallpaper drops the old one's blurs.
     let cached = BLURRED.with(|b| {
         let mut b = b.borrow_mut();
-        if b.0 != img.key() {
-            *b = (img.key(), LayerCache::new(128 << 20));
+        if b.img != img.key() {
+            *b = Blurred { img: img.key(), ..Blurred::default() };
         }
-        b.1.get(key)
+        b.layers.get(key)
     });
     let layer = match cached {
         Some(l) => l,
@@ -1191,18 +1216,123 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
             let Some(mut layer) = Pixmap::new((dev.width() + pad * 2.0).ceil() as u32 + 1, (dev.height() + pad * 2.0).ceil() as u32 + 1) else {
                 return;
             };
-            let mut clip = tiny_skia::Mask::new(layer.width(), layer.height()).unwrap();
-            clip.fill_path(&PathBuilder::from_rect(c), FillRule::Winding, false, ts.post_translate(-ox, -oy));
-            // about to be blurred: bilinear is indistinguishable and much cheaper than bicubic
-            let smooth = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..paint };
-            layer.draw_pixmap(0, 0, pix, &smooth, t.post_translate(-ox, -oy), Some(&clip));
-            blur(&mut layer, radius * ts.sx);
+            let lts = t.post_translate(-ox, -oy);
+            if !cut_from_blurred(&mut layer, img, lts, dev.transform(Transform::from_translate(-ox, -oy)).unwrap_or(dev), radius * ts.sx) {
+                let mut clip = tiny_skia::Mask::new(layer.width(), layer.height()).unwrap();
+                clip.fill_path(&PathBuilder::from_rect(c), FillRule::Winding, false, ts.post_translate(-ox, -oy));
+                // about to be blurred: bilinear is indistinguishable and much cheaper than bicubic
+                let smooth = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..paint };
+                layer.draw_pixmap(0, 0, pix, &smooth, lts, Some(&clip));
+                blur(&mut layer, radius * ts.sx);
+            }
             let l = Rc::new(layer);
-            BLURRED.with(|b| b.borrow_mut().1.insert(key, l.clone()));
+            BLURRED.with(|b| b.borrow_mut().layers.insert(key, l.clone()));
             l
         }
     };
     blit(pm, Pixmap::as_ref(&layer), ox as i32, oy as i32, 1.0);
+}
+
+/// Bytes of finished wallpaper blurs kept (the headers of a few windows on each output).
+const BLUR_BUDGET: usize = 32 << 20;
+
+/// The current wallpaper's blurs: finished layers by device rect, and the whole image blurred once
+/// per radius (in image pixels) at reduced scale, which every layer is cut from.
+struct Blurred {
+    img: u64,
+    layers: LayerCache,
+    /// (radius bucket, blurred image, image px per blurred px x/y)
+    sources: Vec<(i32, Rc<(Pixmap, f32, f32)>)>,
+}
+
+impl Default for Blurred {
+    fn default() -> Self {
+        Self { img: 0, layers: LayerCache::new(BLUR_BUDGET), sources: vec![] }
+    }
+}
+
+thread_local! {
+    static BLURRED: std::cell::RefCell<Blurred> = std::cell::RefCell::new(Blurred::default());
+}
+
+/// Drops every cached shadow, blur, layout and glyph: for when nothing but the bar is on screen.
+#[allow(dead_code)] // until the window layer calls it
+pub fn trim_caches() {
+    SHADOWS.with(|s| *s.borrow_mut() = LayerCache::new(SHADOW_BUDGET));
+    BLURRED.with(|b| *b.borrow_mut() = Blurred::default());
+    text::trim_caches();
+}
+
+/// Fills `layer` with `img` (placed by `t`, image -> layer px) clipped to `area` and blurred by
+/// `radius` layer px, cut from the image blurred once at reduced scale: blurring commutes with
+/// scaling, so a crop of the shared blur scaled up is the crop blurred (the box's fade-out is
+/// applied as its own blurred edge profile). False when that wouldn't be cheaper (the caller
+/// blurs the layer itself).
+fn cut_from_blurred(layer: &mut Pixmap, img: &Img, t: Transform, area: Rect, radius: f32) -> bool {
+    use super::image::{blur_profile, downscale};
+    if t.kx != 0.0 || t.ky != 0.0 || t.sx <= 0.0 || t.sy <= 0.0 || radius <= 0.0 {
+        return false;
+    }
+    let pix = img.as_ref();
+    let (iw, ih) = (pix.width(), pix.height());
+    // radius in image px, in steps of an eighth of an octave: headers of slightly different sizes share a blur
+    let bucket = ((radius / t.sx).log2() * 8.0).round() as i32;
+    let r_img = 2f32.powf(bucket as f32 / 8.0);
+    // shrunk so the blur is only a few px wide there; never bigger than a couple of layers
+    let k = (r_img / 4.0).floor().max(1.0);
+    let (bw, bh) = (((iw as f32 / k).ceil() as u32).max(1), ((ih as f32 / k).ceil() as u32).max(1));
+    if bw as u64 * bh as u64 > 2 * layer.width() as u64 * layer.height() as u64 {
+        return false;
+    }
+    let found = BLURRED.with(|b| b.borrow().sources.iter().find(|s| s.0 == bucket).map(|s| s.1.clone()));
+    let src = match found {
+        Some(s) => s,
+        None => {
+            let Some(mut small) = Pixmap::new(bw, bh) else { return false };
+            downscale(pix.data(), iw as usize, ih as usize, small.data_mut(), bw as usize, bh as usize);
+            let (fx, fy) = (iw as f32 / bw as f32, ih as f32 / bh as f32);
+            blur(&mut small, r_img / fx.max(fy));
+            let s = Rc::new((small, fx, fy));
+            BLURRED.with(|b| b.borrow_mut().sources.push((bucket, s.clone())));
+            s
+        }
+    };
+    let (small, fx, fy) = (&src.0, src.1, src.2);
+    let (lw, lh) = (layer.width() as usize, layer.height() as usize);
+    let (sw, sh) = (small.width() as usize, small.height() as usize);
+    // the box's own fade-out: its edges blurred along each axis
+    let mx = blur_profile(lw, area.left(), area.right(), radius);
+    let my = blur_profile(lh, area.top(), area.bottom(), radius);
+    // layer px center -> blurred image px center, bilinear taps clamped to the edges
+    let tap = |p: usize, s: f32, off: f32, f: f32, n: usize| {
+        let v = (((p as f32 + 0.5 - off) / s) / f - 0.5).clamp(0.0, (n - 1) as f32);
+        let i = v as usize;
+        (i, (i + 1).min(n - 1), v - i as f32)
+    };
+    let xs: Vec<(usize, usize, f32)> = (0..lw).map(|x| tap(x, t.sx, t.tx, fx, sw)).collect();
+    let src = small.data();
+    let out = layer.data_mut();
+    for (y, &wy) in my.iter().enumerate() {
+        if wy <= 0.0 {
+            continue;
+        }
+        let (y0, y1, ty) = tap(y, t.sy, t.ty, fy, sh);
+        let (r0, r1) = (&src[y0 * sw * 4..(y0 + 1) * sw * 4], &src[y1 * sw * 4..(y1 + 1) * sw * 4]);
+        let row = &mut out[y * lw * 4..(y + 1) * lw * 4];
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let w = wy * mx[x];
+            if w <= 0.0 {
+                continue;
+            }
+            let (a, b, tx) = xs[x];
+            for ch in 0..4 {
+                let top = r0[a * 4 + ch] as f32 + (r0[b * 4 + ch] as f32 - r0[a * 4 + ch] as f32) * tx;
+                let bottom = r1[a * 4 + ch] as f32 + (r1[b * 4 + ch] as f32 - r1[a * 4 + ch] as f32) * tx;
+                px[ch] = ((top + (bottom - top) * ty) * w + 0.5) as u8;
+            }
+        }
+    }
+    true
 }
 
 /// rgba from 0-255 channels and 0-1 alpha.
@@ -1272,3 +1402,4 @@ impl Img {
         }
     }
 }
+

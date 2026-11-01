@@ -76,7 +76,12 @@ pub fn poweroff() {
     power("PowerOff");
 }
 pub fn reboot() {
-    power("Reboot");
+    reboot_cb(|_| {});
+}
+/// Reboot; `done` gets whether logind accepted it (false: still running, e.g. refused by polkit).
+pub fn reboot_cb(done: impl FnOnce(bool) + 'static) {
+    let Some(bus) = dbus::system() else { return done(false) };
+    bus.call_cb(method(NAME, PATH, MANAGER, "Reboot").append1(false), move |r| done(r.is_ok()));
 }
 
 pub fn set_brightness(device: &str, value: u32) {

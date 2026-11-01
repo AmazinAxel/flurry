@@ -38,10 +38,14 @@ const PAM_ERROR_MSG: c_int = 3;
 const PAM_TEXT_INFO: c_int = 4;
 const PAM_CONV_ERR: c_int = 19;
 
+pub const PAM_AUTH_ERR: c_int = 7;
+pub const PAM_MAXTRIES: c_int = 11;
+
 pub enum Event {
     Info,
-    Error(String),
-    Done(bool),
+    Error,
+    /// pam_authenticate's raw return code (0: success); -1 if the worker died without one
+    Done(c_int),
 }
 
 struct ConvData {
@@ -100,53 +104,89 @@ extern "C" fn conv(n: c_int, msgs: *mut *const PamMessage, resp: *mut *mut PamRe
     0
 }
 
-fn user() -> CString {
-    unsafe {
+thread_local! {
+    /// looked up once, on the loop thread (getpwuid isn't thread-safe)
+    static USER: CString = unsafe {
         let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() {
-            return CString::default();
-        }
-        CStr::from_ptr((*pw).pw_name).to_owned()
+        if pw.is_null() { CString::default() } else { CStr::from_ptr((*pw).pw_name).to_owned() }
+    };
+}
+
+fn wipe_bytes(v: &mut Vec<u8>) {
+    let p = v.as_mut_ptr();
+    for i in 0..v.capacity() {
+        unsafe { std::ptr::write_volatile(p.add(i), 0) };
     }
+    v.clear();
+}
+
+/// The password as a C string without leaving unwiped copies behind (no realloc for the nul).
+fn c_password(p: String) -> Option<CString> {
+    let mut v = p.into_bytes();
+    if v.contains(&0) {
+        wipe_bytes(&mut v);
+        return None;
+    }
+    if v.capacity() == v.len() {
+        let mut bigger = Vec::with_capacity(v.len() + 1);
+        bigger.extend_from_slice(&v);
+        wipe_bytes(&mut v);
+        v = bigger;
+    }
+    Some(unsafe { CString::from_vec_unchecked(v) })
 }
 
 /// Runs PAM `service` for the current user; `on_event` receives conversation messages and the result.
 pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(Event) + 'static) {
     let mut fds = [0; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-        on_event(Event::Done(false));
+        on_event(Event::Done(-1));
         return;
     }
     let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let service = CString::new(service).unwrap_or_default();
-    let password = password.and_then(|p| CString::new(p).ok());
+    let password = password.and_then(c_password);
+    let user = USER.with(Clone::clone);
     std::thread::spawn(move || {
         let out = std::fs::File::from(wr);
         let mut data = ConvData { password, answered: false, out };
         let c = PamConv { conv, data: (&raw mut data).cast() };
-        let user = user();
         let mut h = std::ptr::null_mut();
         let mut ret = unsafe { pam_start(service.as_ptr(), user.as_ptr(), &c, &mut h) };
         if ret == 0 {
             ret = unsafe { pam_authenticate(h, 0) };
             unsafe { pam_end(h, ret) };
         }
-        if let Some(p) = data.password.take().and_then(|p| p.into_string().ok()) {
-            let mut p = p;
-            crate::ui::entry::wipe(&mut p);
+        if let Some(p) = data.password.take() {
+            wipe_bytes(&mut p.into_bytes_with_nul());
         }
         let mut out = data.out;
-        report(&mut out, 0, if ret == 0 { "1" } else { "0" });
+        report(&mut out, 0, &ret.to_string());
     });
     let raw = rd.as_raw_fd();
     let file = std::cell::RefCell::new(std::fs::File::from(rd));
     let on_event = Rc::new(on_event);
     let buf = std::cell::RefCell::new(Vec::<u8>::new());
+    let done = std::cell::Cell::new(false);
     runtime::watch(raw, move || {
         let mut chunk = [0u8; 1024];
-        let n = file.borrow_mut().read(&mut chunk).unwrap_or(0);
+        // a signal mid-read: retry a few times, then leave it to the next poll (still readable)
+        let mut read = None;
+        for _ in 0..4 {
+            match file.borrow_mut().read(&mut chunk) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                r => read = Some(r.unwrap_or(0)),
+            }
+            break;
+        }
+        let Some(n) = read else { return };
         if n == 0 {
             runtime::unwatch(raw);
+            // the worker went away without a result: never leave the caller waiting
+            if !done.replace(true) {
+                on_event(Event::Done(-1));
+            }
             return;
         }
         let mut b = buf.borrow_mut();
@@ -159,10 +199,13 @@ pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(E
             let kind = b[0];
             let text = String::from_utf8_lossy(&b[5..5 + len]).into_owned();
             b.drain(..5 + len);
+            if kind == 0 {
+                done.set(true);
+            }
             on_event(match kind {
-                0 => Event::Done(text == "1"),
+                0 => Event::Done(text.parse().unwrap_or(-1)),
                 1 => Event::Info,
-                _ => Event::Error(text),
+                _ => Event::Error,
             });
         }
     });

@@ -25,3 +25,7 @@ jobs:
 
       - name: Test
         run: nix develop -c cargo test
+
+      # package.nix (settings, fonts, wrapper) with a stub sideview instead of Servo
+      - name: Package
+        run: nix build .#checks.x86_64-linux.package

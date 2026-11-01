@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::menuState::{current, focus_menu};
+use crate::lib::menuWindow::watch_in;
 use crate::lib::dbus::{Path, prop_str};
 use crate::lib::deviceMenu::{DeviceMenu, FocusMemory, Trailing, aside_row, device_menu, device_row};
 use crate::lib::iwd::{self, DEVICE, NETWORK, STATION};
@@ -41,21 +42,23 @@ thread_local! {
     static CONNECTED: State<String> = State::new(String::new());
     static CONNECTING: State<String> = State::new(String::new());
     static PENDING: RefCell<String> = const { RefCell::new(String::new()) };
-    static SHOW_ALL: Cell<bool> = const { Cell::new(false) };
-    static GEN: Cell<u32> = const { Cell::new(0) };
+    /// unknown networks listed too (after a scan); the list itself always holds them all
+    static SHOW_ALL: State<bool> = State::new(false);
     static FOCUSED: FocusMemory = const { FocusMemory::new("wifi:") };
     /// network path with the open password entry
     static PASSWORD: RefCell<Option<(String, EntryRef)>> = const { RefCell::new(None) };
 }
 
+/// Redraws the menu window on Wi-Fi changes while the Wi-Fi menu is open.
 pub fn watch(w: &std::rc::Rc<crate::ui::window::Win>) {
-    w.watch(&paths());
-    w.watch(&nets());
-    w.watch(&connected());
-    w.watch(&connecting());
-    w.watch(&iwd::scanning());
-    w.watch(&iwd::powered());
-    w.watch(&streaming_mode());
+    const WIFI: &[&str] = &["wifi"];
+    watch_in(w, &paths(), WIFI);
+    watch_in(w, &nets(), WIFI);
+    watch_in(w, &connected(), WIFI);
+    watch_in(w, &connecting(), WIFI);
+    watch_in(w, &show_all(), WIFI);
+    watch_in(w, &iwd::scanning(), WIFI);
+    watch_in(w, &iwd::powered(), WIFI);
 }
 
 fn paths() -> State<Vec<String>> {
@@ -69,6 +72,20 @@ fn connected() -> State<String> {
 }
 fn connecting() -> State<String> {
     CONNECTING.with(Clone::clone)
+}
+fn show_all() -> State<bool> {
+    SHOW_ALL.with(Clone::clone)
+}
+
+/// Listed in the menu: known, connected or joining, or any after a scan.
+fn shown(path: &str, net: &WifiNet) -> bool {
+    net.known || show_all().peek() || connected().with(|c| c == path) || connecting().with(|c| c == path)
+}
+
+/// The listed networks, in order.
+fn shown_paths() -> Vec<String> {
+    let map = nets().peek();
+    paths().peek().into_iter().filter(|p| map.get(p).is_some_and(|n| shown(p, n))).collect()
 }
 
 /// Signal is in 100*dBm units from iwd
@@ -84,7 +101,7 @@ pub fn focus_target() -> Option<String> {
     if !iwd::powered().peek() {
         return Some("power".into());
     }
-    let list = paths().peek();
+    let list = shown_paths();
     for p in [FOCUSED.with(FocusMemory::last), Some(connected().peek())].into_iter().flatten() {
         if list.contains(&p) {
             return Some(row_id(&p));
@@ -97,6 +114,7 @@ fn refocus() {
     focus_menu("wifi", focus_target);
 }
 
+/// Rebuilds the list from iwd's caches on the next idle pass.
 fn queue_refresh() {
     thread_local! {
         static Q: Cell<bool> = const { Cell::new(false) };
@@ -104,11 +122,10 @@ fn queue_refresh() {
     if Q.with(|q| q.replace(true)) {
         return;
     }
+    // kept live while the menu is closed, so it opens on the current list
     runtime::idle(|| {
         Q.with(|q| q.set(false));
-        if current().peek() == Some("wifi") {
-            runtime::spawn(refresh());
-        }
+        refresh();
     });
 }
 
@@ -119,46 +136,36 @@ fn clear() {
     connecting().set(String::new());
 }
 
-pub async fn refresh() {
-    let generation = GEN.with(|g| {
-        g.set(g.get() + 1);
-        g.get()
-    });
-    let Some(objects) = iwd::refresh().await else { return };
-    if generation != GEN.with(Cell::get) {
+/// The list from iwd's cached tree and ordered networks (unknown ones too: the menu filters).
+fn refresh() {
+    // the open password entry keeps its row where it is
+    if PASSWORD.with(|p| p.borrow().is_some()) {
         return;
     }
     let station = iwd::station();
     if !iwd::powered().peek() || station.is_empty() {
         return clear();
     }
-    let Ok(reply) = iwd::call(&station, STATION, "GetOrderedNetworks", |m| m).await else { return };
-    let Ok(ordered) = reply.read1::<Vec<(Path<'static>, i16)>>() else { return };
-    if generation != GEN.with(Cell::get) || PASSWORD.with(|p| p.borrow().is_some()) {
-        return;
-    }
-    let st = objects.get(&Path::from(station)).and_then(|i| i.get(STATION));
-    let current_net = st.and_then(|p| p.get("ConnectedNetwork")).and_then(|v| v.0.as_str()).unwrap_or("").to_string();
-    let joining = st.and_then(|p| prop_str(p, "State")).as_deref() == Some("connecting");
+    let ordered = iwd::ordered();
+    let (current_net, joining, next, mut order) = iwd::with_objects(|objects| {
+        let st = objects.get(&Path::from(station.as_str())).and_then(|i| i.get(STATION));
+        let current_net = st.and_then(|p| p.get("ConnectedNetwork")).and_then(|v| v.0.as_str()).unwrap_or("").to_string();
+        let joining = st.and_then(|p| prop_str(p, "State")).as_deref() == Some("connecting");
+        let mut next = BTreeMap::new();
+        let mut order = vec![];
+        for (path, mbm) in ordered {
+            let Some(p) = objects.get(&Path::from(path.as_str())).and_then(|i| i.get(NETWORK)) else { continue };
+            let Some(name) = prop_str(p, "Name") else { continue };
+            let kn = p.get("KnownNetwork").and_then(|v| v.0.as_str()).unwrap_or("");
+            let known = !kn.is_empty() && kn != "/";
+            next.insert(path.clone(), WifiNet { ssid: name, security: prop_str(p, "Type").unwrap_or_default(), level: sig_level(mbm as i64), known });
+            order.push(path);
+        }
+        (current_net, joining, next, order)
+    });
     let pending = PENDING.with(|p| p.borrow().clone());
     connected().set(if joining { String::new() } else { current_net.clone() });
-    connecting().set(if joining { current_net.clone() } else { pending.clone() });
-
-    let show_all = SHOW_ALL.with(Cell::get);
-    let mut next = BTreeMap::new();
-    let mut order = vec![];
-    for (path, mbm) in ordered {
-        let Some(p) = objects.get(&path).and_then(|i| i.get(NETWORK)) else { continue };
-        let Some(name) = prop_str(p, "Name") else { continue };
-        let path = path.to_string();
-        let kn = p.get("KnownNetwork").and_then(|v| v.0.as_str()).unwrap_or("");
-        let known = !kn.is_empty() && kn != "/";
-        if !known && !show_all && path != current_net && path != pending {
-            continue;
-        }
-        next.insert(path.clone(), WifiNet { ssid: name, security: prop_str(p, "Type").unwrap_or_default(), level: sig_level(mbm as i64), known });
-        order.push(path);
-    }
+    connecting().set(if joining { current_net.clone() } else { pending });
     order.sort_by(|a, b| {
         ((b == &current_net) as i32)
             .cmp(&((a == &current_net) as i32))
@@ -187,7 +194,7 @@ async fn toggle_wifi() {
     if !next {
         clear();
     } else {
-        refresh().await;
+        iwd::refresh().await;
     }
 }
 
@@ -198,7 +205,7 @@ async fn scan() {
         return;
     }
     scanning.set(true);
-    SHOW_ALL.with(|s| s.set(true));
+    show_all().set(true);
     queue_refresh();
     if let Err(e) = iwd::call(&station, STATION, "Scan", |m| m).await
         && !e.contains("Operation already in progress")
@@ -216,7 +223,7 @@ fn join(path: &str, attempt: impl std::future::Future<Output = ()> + 'static) {
         if PENDING.with(|p| *p.borrow() == path) {
             PENDING.with(|p| p.borrow_mut().clear());
         }
-        refresh().await;
+        iwd::refresh().await;
     });
 }
 
@@ -225,12 +232,16 @@ pub fn start() {
     iwd::on_change(queue_refresh);
     current().subscribe(|| {
         if current().peek() != Some("wifi") {
-            SHOW_ALL.with(|s| s.set(false));
-            PASSWORD.with(|p| p.borrow_mut().take());
+            show_all().set(false);
+            if PASSWORD.with(|p| p.borrow_mut().take()).is_some() {
+                // refreshes skipped while it was open
+                queue_refresh();
+            }
         } else {
             refocus();
+            // signal levels change without a signal
+            queue_refresh();
         }
-        queue_refresh();
     });
 }
 
@@ -239,7 +250,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
         return Node::label(base.inherit(), "Streaming mode enabled").align(Align::Center, Align::Fill).expand(true, false);
     }
     let on = iwd::powered().peek();
-    let list = paths().peek();
+    let list = shown_paths();
     let map = nets().peek();
     let (conn, joining) = (connected().peek(), connecting().peek());
     let pw = PASSWORD.with(|p| p.borrow().clone());
@@ -309,9 +320,10 @@ pub fn activate(id: &str) -> Option<Option<String>> {
                 }
                 runtime::spawn(async move {
                     let _ = iwd::call(&station, STATION, "Disconnect", |m| m).await;
-                    refresh().await;
+                    iwd::refresh().await;
                 });
-            } else if net.security != "open" && !net.known {
+            } else if net.security != "open" && net.security != "8021x" && !net.known {
+                // (an unknown 802.1X network needs a provisioning file, not a passphrase)
                 if PASSWORD.with(|p| p.borrow().as_ref().is_some_and(|(p, _)| *p == path)) {
                     close_password();
                     return Some(None);

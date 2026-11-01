@@ -76,7 +76,12 @@ fn bind_socket() -> Option<UnixDatagram> {
             _ => std::process::exit(0),
         }
     }
-    let sock = UnixDatagram::bind(&path).ok()?;
+    let sock = match UnixDatagram::bind(&path) {
+        Ok(s) => s,
+        // another shell won the race to bind it
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => std::process::exit(0),
+        Err(_) => return None,
+    };
     let _ = sock.set_nonblocking(true);
     Some(sock)
 }
@@ -96,16 +101,31 @@ fn serve(sock: UnixDatagram) {
     });
 }
 
+/// Checked at startup, then once a day (a one-shot timer chain, no polling).
 fn reminders() {
+    let _ = runtime::timeout(86_400_000, reminders);
     // lastSync: unix ms
-    let last: u64 = std::fs::read_to_string(format!("{}/flurry/lastSync", xdg::state_dir())).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let last_sync = format!("{}/flurry/lastSync", xdg::state_dir());
+    let last: u64 = std::fs::read_to_string(&last_sync).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let now = lib::time::now_secs() * 1000;
     if !settings::SYNC_COMMAND.is_empty() && now.saturating_sub(last) > 7 * 86_400_000 {
         let argv: Vec<String> = settings::SYNC_COMMAND.iter().map(|s| s.to_string()).collect();
-        lib::notifySend::notify_send("Sync", "Sync system", "", vec![(1, "Update & Sync".into(), argv)]);
+        lib::notifd::send_local("Sync", "Sync system", "", &[("1".into(), "Update & Sync".into())], move |action| {
+            if action == "1" {
+                if let Some(dir) = std::path::Path::new(&last_sync).parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&last_sync, (lib::time::now_secs() * 1000).to_string());
+                lib::apps::launch(&argv);
+            }
+        });
         return;
     }
     let downloads = xdg::user_dir("DOWNLOAD");
+    // no Downloads dir configured: user-dirs points it at $HOME, whose size means nothing here
+    if downloads.trim_end_matches('/') == xdg::home_dir().trim_end_matches('/') {
+        return;
+    }
     // the walk can take a while on a full folder: off the loop
     ui::runtime::spawn(async move {
         let d = downloads.clone();

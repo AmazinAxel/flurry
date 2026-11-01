@@ -5,7 +5,9 @@
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub const URL: &str = "flurry:claude";
@@ -87,17 +89,34 @@ pub fn quote(s: &str) -> String {
 }
 
 /// The page is read from FLURRY_CLAUDE_PAGE (set by the package wrapper; kept out of the binary so
-/// page edits don't rebuild Servo), else from the source tree.
+/// page edits don't rebuild Servo); debug builds fall back to the source tree. A release build's
+/// source path means nothing at runtime (and anyone could create it), so there is no page then.
 pub fn page_url() -> Option<url::Url> {
-    let page = std::env::var_os("FLURRY_CLAUDE_PAGE").map(std::path::PathBuf::from);
-    let page = page.unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/claude").into());
+    let page = std::env::var_os("FLURRY_CLAUDE_PAGE").map(PathBuf::from);
+    let page = page.or_else(|| cfg!(debug_assertions).then(|| concat!(env!("CARGO_MANIFEST_DIR"), "/claude").into()))?;
     url::Url::from_file_path(page.join("index.html")).ok()
+}
+
+/// Where `claude` is: $PATH, then the user profiles (the service PATH may lack them).
+fn find_bin() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let user = std::env::var("USER").unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let profiles = [Some(PathBuf::from(format!("/etc/profiles/per-user/{user}/bin"))), home.as_ref().map(|h| h.join(".nix-profile/bin")), home.map(|h| h.join(".local/bin"))];
+    std::env::split_paths(&path)
+        .chain(profiles.into_iter().flatten())
+        .map(|d| d.join("claude"))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
 #[derive(Default)]
 pub struct Chat {
     proc: Option<(Child, ChildStdin, ChildStdout)>,
     buf: Vec<u8>,
+    /// input not yet taken by Claude Code (stdin is nonblocking: a big image must not stall the panel)
+    out: Vec<u8>,
+    /// found once, looked up again only if it stops working
+    bin: Option<PathBuf>,
     stops: u32,
 }
 
@@ -106,54 +125,91 @@ impl Chat {
         self.proc.as_ref().map_or(-1, |(_, _, out)| out.as_raw_fd())
     }
 
-    fn spawn() -> Option<(Child, ChildStdin, ChildStdout)> {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let user = std::env::var("USER").unwrap_or_default();
-        // the service PATH may lack the user profile
-        let bins = ["claude".to_string(), format!("/etc/profiles/per-user/{user}/bin/claude"), format!("{home}/.nix-profile/bin/claude"), format!("{home}/.local/bin/claude")];
+    /// Claude Code's stdin while input waits for room in the pipe, else -1 (ignored by poll).
+    pub fn write_fd(&self) -> RawFd {
+        match &self.proc {
+            Some((_, stdin, _)) if !self.out.is_empty() => stdin.as_raw_fd(),
+            _ => -1,
+        }
+    }
+
+    fn spawn(&mut self) -> Option<(Child, ChildStdin, ChildStdout)> {
         let cwd = dir()?;
         let _ = std::fs::create_dir_all(&cwd);
-        bins.iter().find_map(|bin| {
-            let mut cmd = Command::new(bin);
-            // dies with the helper, however that goes
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                    Ok(())
-                });
-            }
-            let mut child = cmd
-                // for short questions: no user settings, CLAUDE.md, hooks, claude.ai connectors or default
-                // system prompt, so the first turn costs ~650 tokens, not ~38000;
-                // sessions are saved under this cwd, so `claude -c` / `-r` there continues them
-                .args(["-p", "--tools", "", "--setting-sources", "", "--strict-mcp-config"])
-                .args(["--model", "opus", "--effort", "medium"])
-                // summarized thinking for the status line (billed as thinking already is: no extra tokens)
-                .args(["--settings", r#"{"showThinkingSummaries":true}"#])
-                .args(["--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
-                .args(["--system-prompt", SYSTEM])
-                .current_dir(&cwd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            let (stdin, stdout) = (child.stdin.take()?, child.stdout.take()?);
-            unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) | libc::O_NONBLOCK) };
-            Some((child, stdin, stdout))
-        })
+        if self.bin.is_none() {
+            self.bin = find_bin();
+        }
+        let proc = Self::spawn_bin(self.bin.as_ref()?, &cwd);
+        if proc.is_none() {
+            self.bin = None; // gone since: looked up again next time
+        }
+        proc
+    }
+
+    fn spawn_bin(bin: &Path, cwd: &Path) -> Option<(Child, ChildStdin, ChildStdout)> {
+        let mut cmd = Command::new(bin);
+        // dies with the helper, however that goes
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+        let mut child = cmd
+            // for short questions: no user settings, CLAUDE.md, hooks, claude.ai connectors or default
+            // system prompt, so the first turn costs ~650 tokens, not ~38000;
+            // sessions are saved under this cwd, so `claude -c` / `-r` there continues them
+            .args(["-p", "--tools", "", "--setting-sources", "", "--strict-mcp-config"])
+            .args(["--model", "opus", "--effort", "medium"])
+            // summarized thinking for the status line (billed as thinking already is: no extra tokens)
+            .args(["--settings", r#"{"showThinkingSummaries":true}"#])
+            .args(["--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
+            .args(["--system-prompt", SYSTEM])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let (stdin, stdout) = (child.stdin.take()?, child.stdout.take()?);
+        for fd in [stdin.as_raw_fd(), stdout.as_raw_fd()] {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) };
+        }
+        Some((child, stdin, stdout))
     }
 
     /// Starts Claude Code ahead of the first message (the launch is most of the first reply's wait).
     pub fn prewarm(&mut self) {
         if self.proc.is_none() {
-            self.proc = Self::spawn();
+            self.proc = self.spawn();
         }
     }
 
-    fn write(&mut self, line: &str) -> bool {
+    /// Hands queued input to Claude Code as far as the pipe takes it; false once it can't take any
+    /// more ever (gone).
+    pub fn flush(&mut self) -> bool {
         let Some((_, stdin, _)) = &mut self.proc else { return false };
-        stdin.write_all(line.as_bytes()).and_then(|_| stdin.write_all(b"\n")).and_then(|_| stdin.flush()).is_ok()
+        while !self.out.is_empty() {
+            match stdin.write(&self.out) {
+                Ok(n) if n > 0 => drop(self.out.drain(..n)),
+                // the rest on POLLOUT
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => break,
+                _ => {
+                    self.out.clear(); // nothing left to poll for
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn write(&mut self, line: &str) -> bool {
+        if self.proc.is_none() {
+            return false;
+        }
+        self.out.extend_from_slice(line.as_bytes());
+        self.out.push(b'\n');
+        self.flush()
     }
 
     /// One stream-json user message (see `user_message`); the conversation lives in the running
@@ -182,6 +238,7 @@ impl Chat {
             let _ = child.wait();
         }
         self.buf.clear();
+        self.out.clear();
     }
 
     /// Complete event lines read so far; an `exit` event once the process is gone.

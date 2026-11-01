@@ -108,7 +108,34 @@ pub fn first_sink() -> Option<String> {
     sound::listed().first().map(|s| format!("sink:{}", node_name(s)))
 }
 
-pub fn set_slider(id: &str, value: f64) {
+thread_local! {
+    /// a drag's latest value waiting for the throttle; Some(None) while throttled with none waiting
+    static SLIDER: std::cell::Cell<Option<Option<(&'static str, f64)>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pointer drags move a slider faster than frames: applied at most once a frame (~16ms), the
+/// latest value winning.
+pub fn set_slider(id: &'static str, value: f64) {
+    if SLIDER.with(|s| s.get()).is_some() {
+        return SLIDER.with(|s| s.set(Some(Some((id, value)))));
+    }
+    apply_slider(id, value);
+    SLIDER.with(|s| s.set(Some(None)));
+    crate::ui::runtime::timeout(16, flush_slider);
+}
+
+fn flush_slider() {
+    match SLIDER.with(|s| s.get()).flatten() {
+        Some((id, value)) => {
+            SLIDER.with(|s| s.set(Some(None)));
+            apply_slider(id, value);
+            crate::ui::runtime::timeout(16, flush_slider);
+        }
+        None => SLIDER.with(|s| s.set(None)),
+    }
+}
+
+fn apply_slider(id: &str, value: f64) {
     match id {
         "volume" => {
             if let Some(s) = audio::default_speaker() {

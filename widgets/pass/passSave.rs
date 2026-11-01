@@ -31,8 +31,7 @@ impl Rng {
 
     fn byte(&mut self) -> u8 {
         if self.pos == self.buf.len() {
-            let n = unsafe { libc::getrandom(self.buf.as_mut_ptr().cast(), self.buf.len(), 0) };
-            if n != self.buf.len() as isize {
+            if !fill(&mut self.buf) {
                 std::process::abort(); // never a password from a predictable buffer
             }
             self.pos = 0;
@@ -51,6 +50,23 @@ impl Rng {
             }
         }
     }
+}
+
+/// getrandom until `buf` is full: a signal or a short read is retried, a few times at most.
+fn fill(buf: &mut [u8]) -> bool {
+    let mut off = 0;
+    for _ in 0..8 {
+        let n = unsafe { libc::getrandom(buf[off..].as_mut_ptr().cast(), buf.len() - off, 0) };
+        if n > 0 {
+            off += n as usize;
+            if off == buf.len() {
+                return true;
+            }
+        } else if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+    false
 }
 
 impl Drop for Rng {
@@ -109,7 +125,7 @@ pub fn pass_save() {
             window::set_visible("passSave", false);
             runtime::spawn(async move {
                 let mut entry = format!("{p}\nlogin: {u}\n");
-                let saved = crate::lib::process::run_input(&["pass", "insert", "-m", "-f", &s], entry.as_bytes()).await;
+                let saved = crate::lib::process::run_input(&["pass", "insert", "-m", "-f", "--", &s], entry.as_bytes()).await;
                 crate::ui::entry::wipe(&mut entry);
                 if !saved {
                     crate::ui::entry::wipe(&mut p);
@@ -118,7 +134,8 @@ pub fn pass_save() {
                 }
                 copy_login(&u, &p);
                 crate::ui::entry::wipe(&mut p);
-                if exec(&["pass-sync"]).await.is_err() {
+                // a personal sync script: only where it exists
+                if crate::lib::apps::in_path("pass-sync") && exec(&["pass-sync"]).await.is_err() {
                     crate::lib::notifySend::notify_send("Pass", "Pass sync failed", "", vec![]);
                 }
             });

@@ -1,6 +1,7 @@
 // flurry-sideview: Servo web pages in a right-edge layer surface, driven by the flurry process over
 // stdin (widgets/sideview.rs). Commands, one per line:
 //   show <page> <url> | hide | focus <true|false> <ignore|exclusive> | width <px> | dark <true|false>
+// and "mapped" on stdout once a show's first frame is on screen.
 
 mod claude;
 
@@ -16,15 +17,15 @@ use dpi::PhysicalSize;
 use euclid::Scale;
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle};
 use servo::{
-    Code, ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, Opts, Preferences, RenderingContext, ServoBuilder, Theme,
-    UserContentManager, UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
-    WindowRenderingContext,
+    ClipboardDelegate, Code, ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, Opts, Preferences, RenderingContext, ServoBuilder,
+    StringRequest, Theme, UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WebViewPoint,
+    WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_keyboard, wl_pointer, wl_region, wl_registry, wl_seat,
-    wl_subcompositor, wl_subsurface, wl_surface,
+    wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry,
+    wl_seat, wl_subcompositor, wl_subsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
@@ -74,7 +75,46 @@ struct Frame {
     messages: RefCell<Vec<(WebView, String)>>,
     /// the only page allowed to use that channel: any site can write to its console
     claude_url: Option<url::Url>,
+    /// the web views made for it: the only ones that may read local files, and only its own
+    claude_views: RefCell<Vec<WebViewId>>,
 }
+
+/// Local files are for the claude page's own directory; every other load of one fails.
+fn filter_files(load: WebResourceLoad, page: Option<&url::Url>) {
+    let url = &load.request().url;
+    let own = page.and_then(|p| p.join(".").ok()).is_some_and(|dir| url.as_str().starts_with(dir.as_str()));
+    if url.scheme() == "file" && !own {
+        let url = url.clone();
+        load.intercept(WebResourceResponse::new(url)).cancel();
+    }
+}
+
+/// Pages write the clipboard as they like, but read it only to paste: within a second of a Ctrl+V
+/// given to that page.
+#[derive(Default)]
+struct Clipboard(std::cell::OnceCell<Option<RefCell<arboard::Clipboard>>>);
+impl Clipboard {
+    fn with<T>(&self, f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Option<T> {
+        let c = self.0.get_or_init(|| arboard::Clipboard::new().ok().map(RefCell::new)).as_ref()?;
+        f(&mut c.borrow_mut()).ok()
+    }
+}
+impl ClipboardDelegate for Clipboard {
+    fn clear(&self, _: WebView) {
+        self.with(|c| c.clear());
+    }
+    fn get_text(&self, webview: WebView, request: StringRequest) {
+        let pasting = PASTE_AT.with(|p| p.get()).is_some_and(|(id, at)| id == webview.id() && at.elapsed() < Duration::from_secs(1));
+        match pasting.then(|| self.with(|c| c.get_text())).flatten() {
+            Some(text) => request.success(text),
+            None => request.failure(String::new()),
+        }
+    }
+    fn set_text(&self, _: WebView, text: String) {
+        self.with(|c| c.set_text(text));
+    }
+}
+
 impl WebViewDelegate for Frame {
     fn show_console_message(&self, webview: WebView, _: ConsoleLogLevel, message: String) {
         if let Some(m) = message.strip_prefix('\u{1}')
@@ -90,18 +130,27 @@ impl WebViewDelegate for Frame {
         let ok = if self.claude_url.is_some() && webview.url() == self.claude_url {
             Some(&nav.url) == self.claude_url.as_ref()
         } else {
-            matches!(nav.url.scheme(), "http" | "https" | "about" | "data" | "blob" | "javascript")
+            matches!(nav.url.scheme(), "http" | "https" | "about" | "blob" | "javascript")
         };
         if ok { nav.allow() } else { nav.deny() }
+    }
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
+        let own = self.claude_views.borrow().contains(&webview.id());
+        filter_files(load, self.claude_url.as_ref().filter(|_| own));
     }
     fn notify_new_frame_ready(&self, _: WebView) {
         self.dirty.set(true);
     }
-    fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
-        // new windows open in the default browser: catch the popup's first navigation
+    fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
+        // new windows open in the default browser: catch the popup's first navigation; a page
+        // already waiting on two gets none (window.open returns null)
+        if POPUPS.with(|p| p.borrow().len()) >= 2 {
+            return;
+        }
         RENDERING.with(|r| {
             if let Some(rc) = r.borrow().clone() {
-                let aux = request.builder(rc).delegate(Rc::new(Popup)).build();
+                let aux = request.builder(rc).delegate(Rc::new(Popup(parent.id()))).build();
+                aux.hide(); // never in the scene
                 POPUPS.with(|p| p.borrow_mut().push((aux, Instant::now())));
             }
         });
@@ -109,10 +158,12 @@ impl WebViewDelegate for Frame {
 }
 
 /// Web links only: pages must not be able to hand local files or other schemes to their handlers.
-/// At most one a second, so a page can't flood the browser.
-fn open_external(url: &str) {
+/// Only from the page on screen, right after a click or key there (a hidden page can't open
+/// anything), and at most one a second, so a page can't flood the browser.
+fn open_external(url: &str, from: WebViewId) {
     let now = Instant::now();
     if (url.starts_with("https://") || url.starts_with("http://"))
+        && INPUT_AT.with(|i| i.get()).is_some_and(|(id, at)| id == from && now < at + Duration::from_secs(1))
         && LAST_OPEN.with(|l| l.get().is_none_or(|at| now >= at + Duration::from_secs(1)))
         && let Ok(mut child) = std::process::Command::new("xdg-open").arg(url).spawn()
     {
@@ -121,13 +172,17 @@ fn open_external(url: &str) {
     }
 }
 
-struct Popup;
+/// A page's new window, by the page that opened it.
+struct Popup(WebViewId);
 impl WebViewDelegate for Popup {
+    fn load_web_resource(&self, _: WebView, load: WebResourceLoad) {
+        filter_files(load, None);
+    }
     fn request_navigation(&self, webview: WebView, nav: NavigationRequest) {
         let url = nav.url.to_string();
         nav.deny();
         if url != "about:blank" {
-            open_external(&url);
+            open_external(&url, self.0);
             POPUPS.with(|p| p.borrow_mut().retain(|(wv, _)| *wv != webview));
         }
     }
@@ -138,6 +193,10 @@ thread_local! {
     /// popups waiting for their first navigation, dropped after a few seconds without one
     static POPUPS: RefCell<Vec<(WebView, Instant)>> = const { RefCell::new(Vec::new()) };
     static LAST_OPEN: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// the last click or key press given to the page on screen
+    static INPUT_AT: Cell<Option<(WebViewId, Instant)>> = const { Cell::new(None) };
+    /// the last Ctrl+V given to a page
+    static PASTE_AT: Cell<Option<(WebViewId, Instant)>> = const { Cell::new(None) };
 }
 
 struct State {
@@ -152,7 +211,8 @@ struct State {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer_dev: Option<wl_pointer::WlPointer>,
     events: Vec<InputEvent>,
-    keys: Vec<(xkb::Keycode, bool)>,
+    /// (key, pressed, repeat)
+    keys: Vec<(xkb::Keycode, bool, bool)>,
     repeat_key: Option<(xkb::Keycode, Instant)>,
     /// announced offers not yet claimed by a selection or drag
     offers: Vec<(wl_data_offer::WlDataOffer, Vec<String>)>,
@@ -222,13 +282,19 @@ fn main() {
     let sub = subcompositor.get_subsurface(&content, &border, &qh, ());
     sub.set_desync();
     sub.set_position(BORDER, BORDER);
+    // input goes to the border surface, whose coordinates the pointer handling assumes
+    let none = compositor.create_region(&qh, ());
+    content.set_input_region(Some(&none));
+    none.destroy();
+    content.commit();
     let viewport = viewporter.get_viewport(&border, &qh, ());
     let mut s = Surfaces { border, content, viewport, layer: None };
 
     let mut state = State {
         size: (400, 1),
         configured: false,
-        scale: 2,
+        // the outputs' until the surface is told its own
+        scale: 1,
         ctx: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
         xkb: None,
         repeat: (25, 600),
@@ -244,6 +310,19 @@ fn main() {
         dnd: None,
         closed: false,
     };
+    // the outputs' scale to start with: just their first announcement
+    let outputs: Vec<wl_output::WlOutput> = globals.contents().with_list(|list| {
+        list.iter()
+            .filter(|g| g.interface == "wl_output" && g.version >= 2)
+            .map(|g| globals.registry().bind(g.name, g.version.min(4), &qh, ()))
+            .collect()
+    });
+    if queue.roundtrip(&mut state).is_err() {
+        return;
+    }
+    for o in outputs.into_iter().filter(|o| o.version() >= 3) {
+        o.release();
+    }
 
     let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     let data = std::env::var_os("XDG_DATA_HOME")
@@ -283,6 +362,11 @@ fn main() {
     let mut chat = claude::Chat::default();
     let mut chat_view: Option<WebView> = None;
     let frame = Rc::new(Frame { claude_url: claude::page_url(), ..Default::default() });
+    let clipboard = Rc::new(Clipboard::default());
+    // the panel's border waits for the first frame presented after a map, and flurry for "mapped"
+    let mut bordered = false;
+    let mut announce = false;
+    let mut prewarm = false;
     // a show before the first configure (no rendering context yet), run once there is one
     let mut pending_show: Option<String> = None;
 
@@ -355,9 +439,10 @@ fn main() {
                     let swap = visible && current.as_deref().is_some_and(|c| c != name && pages.contains_key(c));
                     if !visible {
                         visible = true;
-                        // the last presented frame maps instantly and stays until the new page paints
                         map(&mut s, width, focused, &zone);
                     }
+                    announce = true;
+                    INPUT_AT.with(|i| i.set(None)); // input given to the page shown before doesn't count
                     let Some(rc) = &rendering else {
                         // web views are created once the first configure gives the surface a size
                         pending_show = Some(line.clone());
@@ -372,13 +457,16 @@ fn main() {
                             .hidpi_scale_factor(Scale::new(state.scale as f32))
                             .user_content_manager(scripts.clone())
                             .delegate(frame.clone())
+                            .clipboard_delegate(clipboard.clone())
                             .build();
                         wv.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
+                        if is_claude {
+                            frame.claude_views.borrow_mut().push(wv.id());
+                        }
                         pages.insert(name.to_string(), wv);
                     }
-                    if is_claude {
-                        chat.prewarm(); // first reply without waiting for Claude Code to start
-                    }
+                    // first reply without waiting for Claude Code to start (once the page is up)
+                    prewarm |= is_claude;
                     // hide before show: the shared scene never holds two pages at once
                     for (n, wv) in &pages {
                         if n != name {
@@ -400,6 +488,8 @@ fn main() {
                     // a show still waiting for the first configure is cancelled, not replayed after
                     pending_show = None;
                     state.release_keys();
+                    INPUT_AT.with(|i| i.set(None));
+                    (bordered, announce) = (false, false);
                     // hidden web views drop out of the scene and are throttled (no animations or
                     // rAF, timers at most once a second); losing focus fires blur, a cue for pages
                     // to pause themselves
@@ -449,6 +539,9 @@ fn main() {
             let cw = (w as i32 - BORDER).max(1) as u32;
             let ch = (h as i32 - 2 * BORDER).max(1) as u32;
             s.content.set_buffer_scale(state.scale);
+            for wv in pages.values() {
+                wv.set_hidpi_scale_factor(Scale::new(state.scale as f32));
+            }
             let phys = PhysicalSize::new(cw * state.scale as u32, ch * state.scale as u32);
             match &rendering {
                 Some(rc) => {
@@ -473,7 +566,9 @@ fn main() {
                 }
             }
             mapped = true;
-            paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });
+            if bordered {
+                paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 }); // commits the new size
+            }
             if awaiting.is_none() {
                 frame.dirty.set(true);
             }
@@ -485,11 +580,11 @@ fn main() {
         if let Some((code, at)) = state.repeat_key
             && now >= at
         {
-            state.keys.push((code, true));
+            state.keys.push((code, true, true));
             state.repeat_key = Some((code, now + Duration::from_millis((1000 / state.repeat.0.max(1)) as u64)));
         }
-        let keys: Vec<(xkb::Keycode, bool)> = state.keys.drain(..).collect();
-        for (code, pressed) in keys {
+        let keys: Vec<(xkb::Keycode, bool, bool)> = state.keys.drain(..).collect();
+        for (code, pressed, repeat) in keys {
             let Some(x) = &state.xkb else { continue };
             let sym = x.key_get_one_sym(code);
             let active = |m| x.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
@@ -504,7 +599,7 @@ fn main() {
             }
             let wv = current.as_ref().and_then(|c| pages.get(c));
             if pressed && ctrl && sym == xkb::Keysym::r {
-                if let Some(wv) = wv {
+                if !repeat && let Some(wv) = wv {
                     wv.reload(); // ctrl+R to reload page
                     if frame.claude_url.is_some() && wv.url() == frame.claude_url {
                         // the reloaded chat starts empty: so does its conversation
@@ -516,6 +611,14 @@ fn main() {
                 continue;
             }
             if pressed
+                && ctrl
+                && sym == xkb::Keysym::v
+                && let Some(wv) = wv
+            {
+                PASTE_AT.with(|p| p.set(Some((wv.id(), now))));
+            }
+            if pressed
+                && !repeat
                 && ctrl
                 && sym == xkb::Keysym::v
                 && let Some((offer, mimes)) = &state.selection
@@ -546,7 +649,7 @@ fn main() {
                 }
             }
             let ks = if pressed { KeyState::Down } else { KeyState::Up };
-            state.events.push(InputEvent::Keyboard(KeyboardEvent::new_without_event(ks, key, Code::Unidentified, Location::Standard, modifiers, false, false)));
+            state.events.push(InputEvent::Keyboard(KeyboardEvent::new_without_event(ks, key, Code::Unidentified, Location::Standard, modifiers, repeat, false)));
         }
 
         servo.spin_event_loop();
@@ -565,7 +668,7 @@ fn main() {
                 }
                 chat_view = Some(wv);
             } else if let Some(url) = m.strip_prefix("open:") {
-                open_external(url);
+                open_external(url, wv.id());
             } else {
                 eprintln!("flurry-sideview: {m}"); // page errors (window.onerror)
             }
@@ -582,6 +685,14 @@ fn main() {
         POPUPS.with(|p| p.borrow_mut().retain(|(_, at)| at.elapsed() < Duration::from_secs(5)));
         if let Some(wv) = current.as_ref().and_then(|c| pages.get(c)) {
             for ev in state.events.drain(..) {
+                let real = match &ev {
+                    InputEvent::MouseButton(e) => e.action == MouseButtonAction::Down,
+                    InputEvent::Keyboard(e) => e.event.state == KeyState::Down,
+                    _ => false,
+                };
+                if real && visible {
+                    INPUT_AT.with(|i| i.set(Some((wv.id(), Instant::now()))));
+                }
                 wv.notify_input_event(ev);
             }
             if awaiting.is_some() && frame.dirty.get() {
@@ -603,9 +714,24 @@ fn main() {
                 && frame.dirty.replace(false)
                 && let Some(rc) = &rendering
             {
+                if !bordered {
+                    // maps the panel, with this frame: never the stale one before it; sent ahead of
+                    // the swap, which may wait on the frame callback of one shown before the hide
+                    bordered = true;
+                    paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });
+                    let _ = conn.flush();
+                }
                 wv.paint();
                 rc.present();
                 awaiting = None;
+                if std::mem::take(&mut announce) {
+                    use std::io::Write;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(b"mapped\n").and_then(|_| out.flush());
+                }
+                if std::mem::take(&mut prewarm) {
+                    chat.prewarm();
+                }
             }
         } else {
             state.events.clear();
@@ -621,8 +747,9 @@ fn main() {
             libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
-            // -1 (no chat process) is ignored by poll
+            // -1 (no chat process, or nothing to write) is ignored by poll
             libc::pollfd { fd: chat.fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: chat.write_fd(), events: libc::POLLOUT, revents: 0 },
         ];
         let wake_at = match (state.repeat_key.map(|r| r.1), awaiting.filter(|_| visible && mapped)) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -641,11 +768,14 @@ fn main() {
             let mut b = 0u64;
             unsafe { libc::read(wake_fd, (&raw mut b).cast(), 8) };
         }
+        if fds[4].revents != 0 {
+            chat.flush(); // a failure shows as the process's end on its stdout
+        }
         let had_keyboard = state.has_keyboard;
         if queue.dispatch_pending(&mut state).is_err() {
             return;
         }
-        if state.has_keyboard != had_keyboard && visible {
+        if state.has_keyboard != had_keyboard && visible && bordered {
             // #sideview:focus-within
             paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });
         }
@@ -713,6 +843,15 @@ delegate_noop!(State: ignore wp_viewporter::WpViewporter);
 delegate_noop!(State: ignore wp_viewport::WpViewport);
 delegate_noop!(State: ignore wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1);
 delegate_noop!(State: ignore wl_data_device_manager::WlDataDeviceManager);
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(state: &mut Self, _: &wl_output::WlOutput, ev: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // the largest: downscaled is sharper than upscaled until the surface knows its own
+        if let wl_output::Event::Scale { factor } = ev {
+            state.scale = state.scale.max(factor);
+        }
+    }
+}
 delegate_noop!(State: zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
 impl Dispatch<wl_surface::WlSurface, ()> for State {
@@ -784,7 +923,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state.release_keys();
             }
             wl_keyboard::Event::Key { key, state: ks, .. } => {
-                state.keys.push((xkb::Keycode::new(key + 8), ks == WEnum::Value(wl_keyboard::KeyState::Pressed)))
+                state.keys.push((xkb::Keycode::new(key + 8), ks == WEnum::Value(wl_keyboard::KeyState::Pressed), false))
             }
             _ => {}
         }

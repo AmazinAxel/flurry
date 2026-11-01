@@ -1,6 +1,6 @@
 // Notification popups (widgets/notifications/*.tsx).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::lib::notifd::{self, Notification};
 use crate::lib::state::State;
@@ -14,11 +14,16 @@ use crate::widgets::focus::{focus, focus_text};
 
 /// shown at once, newest first
 const MAX_SHOWN: usize = 10;
+/// wrapped lines shown of the summary and the body
+const SUMMARY_LINES: usize = 2;
+const BODY_LINES: usize = 6;
 
 thread_local! {
     /// shown notifications, oldest first (Map insertion order)
     static SHOWN: RefCell<Vec<Notification>> = const { RefCell::new(Vec::new()) };
     static LIST: State<Vec<Notification>> = State::new(vec![]);
+    /// the shortest usable output height: the cards scroll past it instead of outgrowing the output
+    static MAX_HEIGHT: Cell<f32> = const { Cell::new(f32::MAX) };
 }
 
 /// Dropped for good (settings filters).
@@ -33,7 +38,19 @@ fn hidden(n: &Notification) -> bool {
 
 fn refresh() {
     let list: Vec<Notification> = SHOWN.with(|s| s.borrow().iter().rev().filter(|n| !hidden(n)).take(MAX_SHOWN).cloned().collect());
+    if !list.is_empty() {
+        // usable area (bars excluded) of the visible workspaces
+        let h = sway::workspaces().and_then(|ws| {
+            ws.arr().iter().filter(|w| w.get("visible").bool() == Some(true)).filter_map(|w| w.get("rect").get("height").int()).min()
+        });
+        MAX_HEIGHT.with(|m| m.set(h.map_or(f32::MAX, |h| (h as f32 - SPACE_L).max(0.0))));
+    }
     LIST.with(|l| l.set(list));
+}
+
+/// `text` with runs of line breaks (and blank lines) collapsed into one.
+fn collapse_lines(text: &str) -> String {
+    text.split('\n').map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 fn item(base: &Style, n: &Notification) -> Node {
@@ -49,10 +66,10 @@ fn item(base: &Style, n: &Notification) -> Node {
     summary.font.weight = 700;
     let mut kids = vec![];
     if !n.summary.trim().is_empty() {
-        kids.push(Node::label(summary, n.summary.clone()).wrap(30.0).xalign(0.0).align(Align::Start, Align::Fill));
+        kids.push(Node::label(summary, collapse_lines(&n.summary)).wrap(30.0).max_lines(SUMMARY_LINES).xalign(0.0).align(Align::Start, Align::Fill));
     }
     if !n.body.trim().is_empty() {
-        kids.push(Node::label(base.inherit(), n.body.clone()).wrap(30.0).xalign(0.0));
+        kids.push(Node::label(base.inherit(), collapse_lines(&n.body)).wrap(30.0).max_lines(BODY_LINES).xalign(0.0));
     }
     if !n.actions.is_empty() {
         let s = Style { padding: Sides::trbl(SPACE_M, 0.0, 0.0, 0.0), ..base.inherit() };
@@ -74,7 +91,9 @@ pub fn notifications() {
     let w = Win::new(Spec { name: "notifications", anchor: Anchor::Top | Anchor::Right, layer: Layer::Top, per_monitor: true, ..Default::default() }, |_| {
         let base = window();
         let list = LIST.with(|l| l.peek());
-        Node::vbox(Style { padding: Sides::trbl(0.0, 0.0, SPACE_L, 0.0), ..base.inherit() }, 0.0, list.iter().map(|n| item(&base, n)).collect()).size(200.0, 0.0)
+        let cards = Node::vbox(base.inherit(), 0.0, list.iter().map(|n| item(&base, n)).collect());
+        let max = MAX_HEIGHT.with(Cell::get);
+        Node::vbox(Style { padding: Sides::trbl(0.0, 0.0, SPACE_L, 0.0), ..base.inherit() }, 0.0, vec![Node::scroll(base.inherit(), max, None, cards)]).size(200.0, 0.0)
     });
     let ww = w.clone();
     LIST.with(|l| {
@@ -86,9 +105,11 @@ pub fn notifications() {
     });
     notifd::on_notified(|id, _| {
         let Some(n) = notifd::get(id) else { return };
-        if filtered(&n) || hidden(&n) {
-            return notifd::dismiss(id);
+        // dropped unseen: expired, not dismissed by the user
+        if filtered(&n) {
+            return notifd::resolve(id, notifd::Reason::Expired);
         }
+        // one arriving while hidden (streaming, focusing) is kept and shows once that ends
         SHOWN.with(|s| {
             let mut s = s.borrow_mut();
             match s.iter_mut().find(|x| x.id == id) {
@@ -113,8 +134,9 @@ pub fn notifications() {
     focus_text().subscribe(refresh);
 }
 
+/// The oldest card on screen (the list is newest first).
 fn oldest() -> Option<Notification> {
-    SHOWN.with(|s| s.borrow().iter().find(|n| !hidden(n)).cloned())
+    LIST.with(|l| l.with(|l| l.last().cloned()))
 }
 
 pub fn clear_oldest_notification() {
@@ -140,6 +162,11 @@ pub fn invoke_oldest_notification(i: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn line_collapse() {
+        assert_eq!(super::collapse_lines("a\n\n\r\n  \nb\r\nc"), "a\nb\nc");
+    }
+
     #[test]
     fn app_id_charset() {
         assert!(super::safe_app_id("org.mozilla.firefox"));

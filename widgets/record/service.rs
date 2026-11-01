@@ -141,20 +141,24 @@ pub fn start_rec() {
 }
 
 pub fn save_clip() {
-    match CLIPPER.with(|c| c.borrow().as_ref().map(|p| p.pid)) {
-        None => start_clipping_service(),
-        Some(pid) => unsafe {
-            libc::kill(pid as i32, libc::SIGUSR1);
-        },
+    let saved = CLIPPER.with(|c| c.borrow().as_ref().map(|p| p.signal(libc::SIGUSR1)).is_some());
+    if !saved {
+        start_clipping_service();
     }
 }
 
 pub fn stop_rec() {
-    if let Some((p, file, on_exit)) = REC.with(|r| r.borrow_mut().take()) {
-        // copy the file once the recorder has finalized it
-        *on_exit.borrow_mut() = Some(Box::new(move || copy_uri(&file)));
-        p.signal(libc::SIGINT);
-    }
     is_rec().set(false);
-    start_clipping_service();
+    let Some((p, file, on_exit)) = REC.with(|r| r.borrow_mut().take()) else {
+        start_clipping_service();
+        return;
+    };
+    // once the recorder has finalized the file: copy it, then the clipper takes the GPU again
+    *on_exit.borrow_mut() = Some(Box::new(move || {
+        copy_uri(&file);
+        if CLIPPER.with(|c| c.borrow().is_none()) {
+            start_clipping_service();
+        }
+    }));
+    p.signal(libc::SIGINT);
 }

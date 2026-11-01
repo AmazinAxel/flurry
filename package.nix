@@ -1,8 +1,9 @@
-{ lib, rustPlatform, writeText, runCommand, settings ? {}, sideview, pkg-config, makeWrapper, harfbuzz, fontconfig, woff2, libxkbcommon, dbus, pipewire, pam,
+{ lib, rustPlatform, writeText, runCommand, settings ? {}, sideview, pkg-config, makeBinaryWrapper, harfbuzz, fontconfig, woff2, libxkbcommon, dbus, pipewire, pam,
   nerd-fonts, noto-fonts-color-emoji, dejavu_fonts,
   swappy, ffmpeg-headless }: let
   bins = [ swappy ffmpeg-headless ];
-  # same defaults as settings.rs (and hm-module.nix)
+  # the one place defaults live: hm-module.nix passes only the options that are set (settings.rs is
+  # the dev build's copy)
   s = {
     sideview = {};
     bluetoothNames = {};
@@ -86,7 +87,7 @@ in rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false; # tests run in the dev shell; skipping them saves a second LTO compile per rebuild
 
-  nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook makeWrapper ];
+  nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook makeBinaryWrapper ];
   buildInputs = [ harfbuzz libxkbcommon dbus pipewire pam ];
 
   postPatch = ''
@@ -95,7 +96,8 @@ in rustPlatform.buildRustPackage {
 
   postInstall = ''
     ln -s ${lib.getExe sideview} $out/bin/flurry-sideview
-    # only the shell needs the tools; the client stays an unwrapped binary (no bash per keybind)
+    # only the shell needs the tools; the client stays an unwrapped binary (a binary wrapper: no
+    # bash starts with the shell)
     wrapProgram $out/bin/flurry-shell --prefix PATH : "${lib.makeBinPath bins}"
   '';
 
