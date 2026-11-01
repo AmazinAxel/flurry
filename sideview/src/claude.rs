@@ -8,7 +8,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub const URL: &str = "flurry:claude";
 
-const SYSTEM: &str = "Talk caveman: no filler, no articles, short fragments, plain words anyone gets. Answer first. Code, numbers, names stay exact. Markdown ok. Math in LaTeX: $...$ inline, $$...$$ display.";
+const SYSTEM: &str = r#"Caveman, fewest words, every reply. No articles, "I", filler, hedges, praise. Not: "The sky looks blue because air scatters short wavelengths more." But: "Air scatters blue most."
+Think full, talk small: keep cause, caveat, disagreement; wrong premise → say so. Answer first. Default 1 line, cap 3 unless detail asked; asked → full, still terse.
+No headers, bold, lists, tables, recap, offers, unless asked. Unsure → say so, never invent.
+Code, numbers, names, errors exact, in fenced blocks. Math LaTeX: $...$, $$...$$."#;
 
 fn dir() -> std::path::PathBuf {
     let run = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
@@ -43,10 +46,10 @@ impl Chat {
         let _ = std::fs::create_dir_all(&cwd);
         bins.iter().find_map(|bin| {
             let mut child = Command::new(bin)
-                // for short questions: no user settings, CLAUDE.md, hooks or default system prompt, so the
-                // first turn costs ~650 tokens, not ~4500;
+                // for short questions: no user settings, CLAUDE.md, hooks, claude.ai connectors or default
+                // system prompt, so the first turn costs ~650 tokens, not ~38000;
                 // sessions are saved under this cwd, so `claude -c` / `-r` there continues them
-                .args(["-p", "--tools", "", "--setting-sources", ""])
+                .args(["-p", "--tools", "", "--setting-sources", "", "--strict-mcp-config"])
                 .args(["--model", "opus", "--effort", "medium"])
                 // summarized thinking for the status line (billed as thinking already is: no extra tokens)
                 .args(["--settings", r#"{"showThinkingSummaries":true}"#])
