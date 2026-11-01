@@ -5,6 +5,8 @@ on:
     - cron: '0 9 * * 5' # Every Friday at 2AM PT
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   update-flake-lock:
     runs-on: ubuntu-latest
@@ -14,14 +16,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Nix
-        uses: DeterminateSystems/determinate-nix-action@v3
+        uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
 
       - name: Update flake lock
         id: update
-        uses: DeterminateSystems/update-flake-lock@v23
+        uses: DeterminateSystems/update-flake-lock@db4ee38117a597ea8df8f7f75a187dd65093eade # v23
         with:
           pr-title: "chore: update flake lock"
           # nixpkgs-servo is bumped by hand: Servo is a long build
@@ -29,8 +31,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # only a lock that still builds gets merged
+      - name: Build
+        if: ${{ steps.update.outputs.pull-request-number != '' }}
+        run: |
+          gh pr checkout "$PR"
+          nix develop -c cargo test
+        env:
+          PR: ${{ steps.update.outputs.pull-request-number }}
+          GH_TOKEN: ${{ github.token }}
+
       - name: Merge PR
         if: ${{ steps.update.outputs.pull-request-number != '' }}
-        run: gh pr merge "${{ steps.update.outputs.pull-request-number }}" --rebase --delete-branch
+        run: gh pr merge "$PR" --rebase --delete-branch
         env:
+          PR: ${{ steps.update.outputs.pull-request-number }}
           GH_TOKEN: ${{ github.token }}

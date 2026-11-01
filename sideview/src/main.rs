@@ -70,8 +70,8 @@ impl EventLoopWaker for Waker {
 #[derive(Default)]
 struct Frame {
     dirty: Cell<bool>,
-    /// console messages addressed to us (\u{1} prefix): the claude page's channel out
-    messages: RefCell<Vec<String>>,
+    /// console messages addressed to us (\u{1} prefix), with their page: the claude page's channel out
+    messages: RefCell<Vec<(WebView, String)>>,
     /// the only page allowed to use that channel: any site can write to its console
     claude_url: Option<url::Url>,
 }
@@ -81,8 +81,18 @@ impl WebViewDelegate for Frame {
             && self.claude_url.is_some()
             && webview.url() == self.claude_url
         {
-            self.messages.borrow_mut().push(m.to_string());
+            self.messages.borrow_mut().push((webview, m.to_string()));
         }
+    }
+    fn request_navigation(&self, webview: WebView, nav: NavigationRequest) {
+        // the claude page stays itself; web pages stay on the web (no local files, so no way into
+        // the claude page's channel either)
+        let ok = if self.claude_url.is_some() && webview.url() == self.claude_url {
+            Some(&nav.url) == self.claude_url.as_ref()
+        } else {
+            matches!(nav.url.scheme(), "http" | "https" | "about" | "data" | "blob" | "javascript")
+        };
+        if ok { nav.allow() } else { nav.deny() }
     }
     fn notify_new_frame_ready(&self, _: WebView) {
         self.dirty.set(true);
@@ -92,34 +102,42 @@ impl WebViewDelegate for Frame {
         RENDERING.with(|r| {
             if let Some(rc) = r.borrow().clone() {
                 let aux = request.builder(rc).delegate(Rc::new(Popup)).build();
-                POPUPS.with(|p| p.borrow_mut().push(aux));
+                POPUPS.with(|p| p.borrow_mut().push((aux, Instant::now())));
             }
         });
     }
 }
 
 /// Web links only: pages must not be able to hand local files or other schemes to their handlers.
+/// At most one a second, so a page can't flood the browser.
 fn open_external(url: &str) {
-    if url.starts_with("https://") || url.starts_with("http://") {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    let now = Instant::now();
+    if (url.starts_with("https://") || url.starts_with("http://"))
+        && LAST_OPEN.with(|l| l.get().is_none_or(|at| now >= at + Duration::from_secs(1)))
+        && let Ok(mut child) = std::process::Command::new("xdg-open").arg(url).spawn()
+    {
+        LAST_OPEN.with(|l| l.set(Some(now)));
+        std::thread::spawn(move || child.wait()); // reaped
     }
 }
 
 struct Popup;
 impl WebViewDelegate for Popup {
-    fn request_navigation(&self, _: WebView, nav: NavigationRequest) {
+    fn request_navigation(&self, webview: WebView, nav: NavigationRequest) {
         let url = nav.url.to_string();
         nav.deny();
         if url != "about:blank" {
             open_external(&url);
-            POPUPS.with(|p| p.borrow_mut().clear());
+            POPUPS.with(|p| p.borrow_mut().retain(|(wv, _)| *wv != webview));
         }
     }
 }
 
 thread_local! {
     static RENDERING: RefCell<Option<Rc<dyn RenderingContext>>> = const { RefCell::new(None) };
-    static POPUPS: RefCell<Vec<WebView>> = const { RefCell::new(Vec::new()) };
+    /// popups waiting for their first navigation, dropped after a few seconds without one
+    static POPUPS: RefCell<Vec<(WebView, Instant)>> = const { RefCell::new(Vec::new()) };
+    static LAST_OPEN: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 struct State {
@@ -131,11 +149,26 @@ struct State {
     repeat: (i32, i32),
     pointer: (f64, f64),
     has_keyboard: bool,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer_dev: Option<wl_pointer::WlPointer>,
     events: Vec<InputEvent>,
     keys: Vec<(xkb::Keycode, bool)>,
-    offers: HashMap<u32, Vec<String>>,
+    repeat_key: Option<(xkb::Keycode, Instant)>,
+    /// announced offers not yet claimed by a selection or drag
+    offers: Vec<(wl_data_offer::WlDataOffer, Vec<String>)>,
     selection: Option<(wl_data_offer::WlDataOffer, Vec<String>)>,
+    /// drags are not taken; their offer is only held until they leave
+    dnd: Option<wl_data_offer::WlDataOffer>,
     closed: bool,
+}
+
+impl State {
+    /// Keyboard focus gone (or the panel hidden): nothing keeps repeating, presses not yet handled
+    /// are dropped (releases still go through).
+    fn release_keys(&mut self) {
+        self.repeat_key = None;
+        self.keys.retain(|k| !k.1);
+    }
 }
 
 struct Surfaces {
@@ -201,10 +234,14 @@ fn main() {
         repeat: (25, 600),
         pointer: (0.0, 0.0),
         has_keyboard: false,
+        keyboard: None,
+        pointer_dev: None,
         events: vec![],
         keys: vec![],
-        offers: HashMap::new(),
+        repeat_key: None,
+        offers: vec![],
         selection: None,
+        dnd: None,
         closed: false,
     };
 
@@ -241,10 +278,13 @@ fn main() {
     let mut awaiting: Option<Instant> = None;
     let mut skip_blank = false;
     let mut rendering: Option<Rc<WindowRenderingContext>> = None;
+    // one Claude Code process for every page showing flurry:claude: replies go to the page that
+    // sent the last message (two such pages share the conversation)
     let mut chat = claude::Chat::default();
-    let mut claude_page: Option<String> = None;
+    let mut chat_view: Option<WebView> = None;
     let frame = Rc::new(Frame { claude_url: claude::page_url(), ..Default::default() });
-    let mut repeat_key: Option<(xkb::Keycode, Instant)> = None;
+    // a show before the first configure (no rendering context yet), run once there is one
+    let mut pending_show: Option<String> = None;
 
     let stdin_fd = 0;
     unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, libc::fcntl(stdin_fd, libc::F_GETFL) | libc::O_NONBLOCK) };
@@ -297,13 +337,20 @@ fn main() {
             }
             input.extend_from_slice(&buf[..n as usize]);
         }
-        let mut deferred = vec![];
+        let mut lines: Vec<String> = rendering.as_ref().and_then(|_| pending_show.take()).into_iter().collect();
         while let Some(i) = input.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = input.drain(..=i).collect();
-            let line = String::from_utf8_lossy(&line).trim().to_string();
+            lines.push(String::from_utf8_lossy(&line).trim().to_string());
+        }
+        for line in lines {
             let mut w = line.splitn(3, ' ');
             match (w.next(), w.next(), w.next()) {
                 (Some("show"), Some(name), Some(url)) => {
+                    let is_claude = url == claude::URL;
+                    let target = || if is_claude { claude::page_url() } else { url::Url::parse(url).ok() };
+                    if !pages.contains_key(name) && target().is_none() {
+                        continue; // nothing to show
+                    }
                     // a visible page swapped for another: its hide builds a frame of neither page
                     let swap = visible && current.as_deref().is_some_and(|c| c != name && pages.contains_key(c));
                     if !visible {
@@ -313,18 +360,10 @@ fn main() {
                     }
                     let Some(rc) = &rendering else {
                         // web views are created once the first configure gives the surface a size
-                        deferred.push(line.clone());
+                        pending_show = Some(line.clone());
                         continue;
                     };
                     current = Some(name.to_string());
-                    let mut target = || {
-                        if url == claude::URL {
-                            claude_page = Some(name.to_string());
-                            claude::page_url()
-                        } else {
-                            url::Url::parse(url).ok()
-                        }
-                    };
                     if !pages.contains_key(name)
                         && let Some(u) = target()
                     {
@@ -337,7 +376,7 @@ fn main() {
                         wv.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
                         pages.insert(name.to_string(), wv);
                     }
-                    if claude_page.as_deref() == Some(name) {
+                    if is_claude {
                         chat.prewarm(); // first reply without waiting for Claude Code to start
                     }
                     // hide before show: the shared scene never holds two pages at once
@@ -359,10 +398,14 @@ fn main() {
                 }
                 (Some("hide"), _, _) => {
                     // a show still waiting for the first configure is cancelled, not replayed after
-                    deferred.clear();
-                    // hidden web views drop out of the scene and stop animating: nothing renders
+                    pending_show = None;
+                    state.release_keys();
+                    // hidden web views drop out of the scene and are throttled (no animations or
+                    // rAF, timers at most once a second); losing focus fires blur, a cue for pages
+                    // to pause themselves
                     for wv in pages.values() {
                         wv.hide();
+                        wv.set_focused(false);
                     }
                     awaiting = None;
                     visible = false;
@@ -396,9 +439,6 @@ fn main() {
                 }
                 _ => {}
             }
-        }
-        for line in deferred.into_iter().rev() {
-            input.splice(0..0, format!("{line}\n").into_bytes());
         }
 
         // configure: (re)size the web content to the surface minus the border
@@ -437,16 +477,16 @@ fn main() {
             if awaiting.is_none() {
                 frame.dirty.set(true);
             }
-            continue; // run the deferred show now
+            continue; // run a pending show now
         }
 
         // keyboard: repeat, Ctrl+R reload, media paste
         let now = Instant::now();
-        if let Some((code, at)) = repeat_key
+        if let Some((code, at)) = state.repeat_key
             && now >= at
         {
             state.keys.push((code, true));
-            repeat_key = Some((code, now + Duration::from_millis((1000 / state.repeat.0.max(1)) as u64)));
+            state.repeat_key = Some((code, now + Duration::from_millis((1000 / state.repeat.0.max(1)) as u64)));
         }
         let keys: Vec<(xkb::Keycode, bool)> = state.keys.drain(..).collect();
         for (code, pressed) in keys {
@@ -454,17 +494,24 @@ fn main() {
             let sym = x.key_get_one_sym(code);
             let active = |m| x.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
             let ctrl = active(xkb::MOD_NAME_CTRL);
-            if pressed && x.get_keymap().key_repeats(code) {
-                if repeat_key.map(|r| r.0) != Some(code) {
-                    repeat_key = Some((code, now + Duration::from_millis(state.repeat.1 as u64)));
+            // a repeat rate of 0 turns repeating off
+            if pressed && state.repeat.0 > 0 && x.get_keymap().key_repeats(code) {
+                if state.repeat_key.map(|r| r.0) != Some(code) {
+                    state.repeat_key = Some((code, now + Duration::from_millis(state.repeat.1 as u64)));
                 }
-            } else if !pressed && repeat_key.map(|r| r.0) == Some(code) {
-                repeat_key = None;
+            } else if !pressed && state.repeat_key.map(|r| r.0) == Some(code) {
+                state.repeat_key = None;
             }
             let wv = current.as_ref().and_then(|c| pages.get(c));
             if pressed && ctrl && sym == xkb::Keysym::r {
                 if let Some(wv) = wv {
                     wv.reload(); // ctrl+R to reload page
+                    if frame.claude_url.is_some() && wv.url() == frame.claude_url {
+                        // the reloaded chat starts empty: so does its conversation
+                        chat.reset();
+                        chat.prewarm();
+                        chat_view = None;
+                    }
                 }
                 continue;
             }
@@ -504,30 +551,35 @@ fn main() {
 
         servo.spin_event_loop();
         // the claude page: its requests out, Claude Code's events back in
-        for m in frame.messages.take() {
+        for (wv, m) in frame.messages.take() {
             if m == "claude:new" {
                 chat.reset();
                 chat.prewarm(); // the next chat starts without a process launch
-            } else if let Some(line) = m.strip_prefix("claude:") {
-                if !chat.send(line) {
-                    let wv = claude_page.as_ref().and_then(|c| pages.get(c));
-                    if let Some(wv) = wv {
-                        wv.evaluate_javascript(r#"window.__claude({"type":"exit"})"#, |_| {}); // claude not found: unblock the page
-                    }
+            } else if m == "claude:stop" {
+                chat.interrupt();
+            } else if let Some(parts) = m.strip_prefix("claude:user") {
+                // only a well-formed user message reaches Claude Code
+                let sent = claude::user_message(parts).is_some_and(|line| chat.send(&line));
+                if !sent {
+                    wv.evaluate_javascript(r#"window.__claude(['{"type":"exit"}'])"#, |_| {}); // claude not found: unblock the page
                 }
+                chat_view = Some(wv);
             } else if let Some(url) = m.strip_prefix("open:") {
                 open_external(url);
             } else {
                 eprintln!("flurry-sideview: {m}"); // page errors (window.onerror)
             }
         }
-        if let Some(wv) = claude_page.as_ref().and_then(|c| pages.get(c)) {
-            // one script-thread round trip per read, however many events arrived
-            let calls: String = chat.read().iter().map(|l| format!("window.__claude({l});")).collect();
-            if !calls.is_empty() {
-                wv.evaluate_javascript(calls, |_| {});
-            }
+        // one script-thread round trip per read, however many events arrived; the lines go in as
+        // data (string literals), parsed by the page
+        let lines = chat.read();
+        if let Some(wv) = &chat_view
+            && !lines.is_empty()
+        {
+            let lines: Vec<String> = lines.iter().map(|l| claude::quote(l)).collect();
+            wv.evaluate_javascript(format!("window.__claude([{}])", lines.join(",")), |_| {});
         }
+        POPUPS.with(|p| p.borrow_mut().retain(|(_, at)| at.elapsed() < Duration::from_secs(5)));
         if let Some(wv) = current.as_ref().and_then(|c| pages.get(c)) {
             for ev in state.events.drain(..) {
                 wv.notify_input_event(ev);
@@ -572,7 +624,7 @@ fn main() {
             // -1 (no chat process) is ignored by poll
             libc::pollfd { fd: chat.fd(), events: libc::POLLIN, revents: 0 },
         ];
-        let wake_at = match (repeat_key.map(|r| r.1), awaiting.filter(|_| visible && mapped)) {
+        let wake_at = match (state.repeat_key.map(|r| r.1), awaiting.filter(|_| visible && mapped)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
@@ -609,9 +661,28 @@ fn receive(conn: &Connection, offer: &wl_data_offer::WlDataOffer, mime: &str) ->
     offer.receive(mime.into(), wr.as_fd());
     drop(wr);
     let _ = conn.flush();
+    // a slow or endless source must not hang the panel: what isn't all there in time is dropped
+    const CAP: usize = 20 << 20;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    unsafe { libc::fcntl(rd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+    let mut file = std::fs::File::from(rd);
     let mut out = vec![];
-    let _ = std::fs::File::from(rd).read_to_end(&mut out);
-    out
+    let mut chunk = [0u8; 65536];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => return out,
+            Ok(n) if out.len() + n <= CAP => out.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
+                let mut pfd = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                if left <= 0 || unsafe { libc::poll(&mut pfd, 1, left) } <= 0 {
+                    return vec![];
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return vec![],
+        }
+    }
 }
 
 fn base64(b: &[u8]) -> String {
@@ -670,13 +741,23 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
 }
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
-    fn event(_: &mut Self, seat: &wl_seat::WlSeat, ev: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+    fn event(state: &mut Self, seat: &wl_seat::WlSeat, ev: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = ev {
-            if caps.contains(wl_seat::Capability::Keyboard) {
-                seat.get_keyboard(qh, ());
+            if !caps.contains(wl_seat::Capability::Keyboard) {
+                if let Some(k) = state.keyboard.take() {
+                    k.release();
+                }
+                state.has_keyboard = false;
+                state.release_keys();
+            } else if state.keyboard.is_none() {
+                state.keyboard = Some(seat.get_keyboard(qh, ()));
             }
-            if caps.contains(wl_seat::Capability::Pointer) {
-                seat.get_pointer(qh, ());
+            if !caps.contains(wl_seat::Capability::Pointer) {
+                if let Some(p) = state.pointer_dev.take() {
+                    p.release();
+                }
+            } else if state.pointer_dev.is_none() {
+                state.pointer_dev = Some(seat.get_pointer(qh, ()));
             }
         }
     }
@@ -698,7 +779,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => state.repeat = (rate, delay),
             wl_keyboard::Event::Enter { .. } => state.has_keyboard = true,
-            wl_keyboard::Event::Leave { .. } => state.has_keyboard = false,
+            wl_keyboard::Event::Leave { .. } => {
+                state.has_keyboard = false;
+                state.release_keys();
+            }
             wl_keyboard::Event::Key { key, state: ks, .. } => {
                 state.keys.push((xkb::Keycode::new(key + 8), ks == WEnum::Value(wl_keyboard::KeyState::Pressed)))
             }
@@ -745,17 +829,30 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
 impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
     fn event(state: &mut Self, _: &wl_data_device::WlDataDevice, ev: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match ev {
-            wl_data_device::Event::DataOffer { id } => {
-                state.offers.insert(id.id().protocol_id(), vec![]);
-            }
+            wl_data_device::Event::DataOffer { id } => state.offers.push((id, vec![])),
             wl_data_device::Event::Selection { id } => {
                 if let Some((old, _)) = state.selection.take() {
                     old.destroy();
                 }
-                state.selection = id.map(|o| {
-                    let m = state.offers.remove(&o.id().protocol_id()).unwrap_or_default();
-                    (o, m)
-                });
+                let mime = id.as_ref().and_then(|o| state.offers.iter().position(|(p, _)| p == o)).map(|i| state.offers.swap_remove(i).1);
+                // any other announced offer is stale now
+                for (o, _) in state.offers.drain(..) {
+                    o.destroy();
+                }
+                state.selection = id.map(|o| (o, mime.unwrap_or_default()));
+            }
+            wl_data_device::Event::Enter { id, .. } => {
+                if let Some(o) = &id {
+                    state.offers.retain(|(p, _)| p != o);
+                }
+                if let Some(old) = std::mem::replace(&mut state.dnd, id) {
+                    old.destroy();
+                }
+            }
+            wl_data_device::Event::Leave | wl_data_device::Event::Drop => {
+                if let Some(o) = state.dnd.take() {
+                    o.destroy();
+                }
             }
             _ => {}
         }
@@ -769,7 +866,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
 impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
     fn event(state: &mut Self, o: &wl_data_offer::WlDataOffer, ev: wl_data_offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         if let wl_data_offer::Event::Offer { mime_type } = ev {
-            if let Some(m) = state.offers.get_mut(&o.id().protocol_id()) {
+            if let Some((_, m)) = state.offers.iter_mut().find(|(p, _)| p == o) {
                 m.push(mime_type);
             } else if let Some((sel, m)) = &mut state.selection
                 && sel == o

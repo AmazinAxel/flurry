@@ -7,20 +7,19 @@ mod settings;
 mod ui;
 mod widgets;
 
-use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixDatagram;
 
 use lib::{menuState, mediaPlayer, streamingMode::streaming_mode, xdg};
 use ui::{runtime, window};
 use widgets::{clipboard, focus, lockscreen::lockscreen, notifications::notifications as notifs, record::service, sideview, status};
 
-fn socket_path() -> String {
-    format!("{}/flurry.sock", xdg::runtime_dir())
-}
-
 /// Requests from sway keybinds (`flurry <cmd> [arg]`).
 fn request(cmd: &str, arg: Option<&str>) {
+    // locked: nothing may open behind (or over) the lock screen
+    if (lockscreen::locked().peek() || ui::wayland::is_locking()) && !matches!(cmd, "lock" | "media") {
+        return;
+    }
     match cmd {
         "toggle" => {
             if let Some(w) = arg {
@@ -64,48 +63,46 @@ fn request(cmd: &str, arg: Option<&str>) {
     }
 }
 
-fn serve() {
-    let path = socket_path();
-    let _ = std::fs::remove_file(&path);
-    let Ok(listener) = UnixListener::bind(&path) else { return };
-    let _ = listener.set_nonblocking(true);
-    let fd = listener.as_raw_fd();
-    runtime::watch(fd, move || {
-        while let Ok((mut s, _)) = listener.accept() {
-            let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 512];
-            while let Ok(n) = s.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.contains(&b'\n') {
-                    break;
-                }
+/// Binds the request socket; exits if another shell is already serving it.
+fn bind_socket() -> Option<UnixDatagram> {
+    let path = xdg::socket_path()?;
+    if std::path::Path::new(&path).exists() {
+        let probe = UnixDatagram::unbound().ok()?;
+        let _ = probe.set_nonblocking(true);
+        match probe.send_to(b"", &path) {
+            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                let _ = std::fs::remove_file(&path); // stale
             }
-            let line = String::from_utf8_lossy(&buf).trim().to_string();
+            _ => std::process::exit(0),
+        }
+    }
+    let sock = UnixDatagram::bind(&path).ok()?;
+    let _ = sock.set_nonblocking(true);
+    Some(sock)
+}
+
+fn serve(sock: UnixDatagram) {
+    let fd = sock.as_raw_fd();
+    runtime::watch(fd, move || {
+        let mut buf = [0u8; 512];
+        while let Ok(n) = sock.recv(&mut buf) {
+            let line = String::from_utf8_lossy(&buf[..n]);
             // `sideview plan` style: the first two words
-            let mut words = line.split(' ');
+            let mut words = line.trim().split(' ');
             if let Some(cmd) = words.next() {
                 request(cmd, words.next());
             }
-            let _ = s.write_all(b"\n");
         }
     });
 }
 
 fn reminders() {
+    // lastSync: unix ms
     let last: u64 = std::fs::read_to_string(format!("{}/flurry/lastSync", xdg::state_dir())).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    let has_sync = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("sys-sync").is_file()));
-    if has_sync && now.saturating_sub(last) > 540_000_000 {
-        // Last sync was ~7 days ago
-        lib::notifySend::notify_send("Sync", "Sync system", "", vec![(
-            1,
-            "Update & Sync".into(),
-            r#"footclient -e fish -c 'sys-sync; echo "Press a key to exit"; read --nchars=1'"#.into(),
-        )]);
+    let now = lib::time::now_secs() * 1000;
+    if !settings::SYNC_COMMAND.is_empty() && now.saturating_sub(last) > 7 * 86_400_000 {
+        let argv: Vec<String> = settings::SYNC_COMMAND.iter().map(|s| s.to_string()).collect();
+        lib::notifySend::notify_send("Sync", "Sync system", "", vec![(1, "Update & Sync".into(), argv)]);
         return;
     }
     let downloads = xdg::user_dir("DOWNLOAD");
@@ -114,7 +111,8 @@ fn reminders() {
         let d = downloads.clone();
         // Greater than 100MB
         if ui::runtime::blocking(move || dir_size(std::path::Path::new(&d))).await.unwrap_or(0) > 100_000_000 {
-            lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), format!("nemo {downloads}"))]);
+            let argv: Vec<String> = settings::FILE_MANAGER.iter().map(|s| s.to_string()).chain([downloads]).collect();
+            lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), argv)]);
         }
     });
 }
@@ -139,6 +137,7 @@ fn main() {
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20); // blur buffers are ~3MB per card header
     }
+    let sock = bind_socket();
     if !ui::wayland::connect() {
         eprintln!("flurry: cannot connect to the Wayland display");
         std::process::exit(1);
@@ -164,12 +163,17 @@ fn main() {
     widgets::pass::pass::pass();
     widgets::pass::passSave::pass_save();
     window::set_visible("focusMenu", true);
-    serve();
+    if let Some(s) = sock {
+        serve(s);
+    }
 
     // services once the first frame has gone out: it never waits on them
     let start = || {
         lib::logind::start();
         lockscreen::start();
+        if lockscreen::was_locked() {
+            lockscreen::lock_screen(); // restarted while locked: lock again
+        }
         lib::notifd::start();
         lib::battery::start();
         lib::bluetooth::start();
@@ -185,7 +189,6 @@ fn main() {
         lib::apps::reload();
         reminders();
         service::start_clipping_service();
-        ui::text::release_fontconfig();
         unsafe { libc::malloc_trim(0) };
     };
     match window::get("focusMenu") {

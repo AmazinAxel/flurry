@@ -94,7 +94,12 @@ struct PortInfo {
     channel: String,
 }
 
+type Global<'a> = pw::registry::GlobalObject<&'a spa::utils::dict::DictRef>;
+
 struct Pw {
+    // listeners first: fields drop in order, and a hook must go before the object it hangs on
+    _core_listener: pw::core::Listener,
+    _registry_listener: Option<pw::registry::Listener>,
     _main: pw::main_loop::MainLoop,
     _context: pw::context::Context,
     core: pw::core::Core,
@@ -104,8 +109,8 @@ struct Pw {
     metadata: Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>,
     ports: HashMap<u32, PortInfo>,
     links: HashMap<u32, (u32, u32)>, // id -> (output node, input node)
+    /// link proxies from the last `link` call, kept until the next (object.linger keeps the links)
     pending_links: Vec<pw::link::Link>,
-    _registry_listener: Option<pw::registry::Listener>,
 }
 
 thread_local! {
@@ -163,10 +168,10 @@ pub fn start() {
             let get = |k: &str| props.and_then(|p| p.get(k)).map(String::from);
             match g.type_ {
                 pw::types::ObjectType::Node if get("media.class").as_deref() == Some("Audio/Sink") => {
-                    bind_node(&reg, g.id, &get);
+                    bind_node(&reg, g, &get);
                 }
-                pw::types::ObjectType::Device if get("media.class").as_deref() == Some("Audio/Device") => bind_device(&reg, g.id),
-                pw::types::ObjectType::Metadata if get("metadata.name").as_deref() == Some("default") => bind_metadata(&reg, g.id),
+                pw::types::ObjectType::Device if get("media.class").as_deref() == Some("Audio/Device") => bind_device(&reg, g),
+                pw::types::ObjectType::Metadata if get("metadata.name").as_deref() == Some("default") => bind_metadata(&reg, g),
                 pw::types::ObjectType::Port => {
                     let node = get("node.id").and_then(|v| v.parse().ok());
                     if let Some(node) = node {
@@ -226,6 +231,7 @@ pub fn start() {
                     if let Some(fd) = fd {
                         runtime::unwatch(fd);
                     }
+                    ROUTE_READS.with(|r| r.borrow_mut().clear());
                     speakers().set(vec![]);
                     default_name().set(None);
                     ready().set(false);
@@ -234,10 +240,11 @@ pub fn start() {
             }
         })
         .register();
-    std::mem::forget(core_listener);
 
     PW.with(|p| {
         *p.borrow_mut() = Some(Pw {
+            _core_listener: core_listener,
+            _registry_listener: Some(listener),
             _main: main,
             _context: context,
             core,
@@ -248,7 +255,6 @@ pub fn start() {
             ports: HashMap::new(),
             links: HashMap::new(),
             pending_links: vec![],
-            _registry_listener: Some(listener),
         })
     });
     // the loop is dispatched without holding PW: its callbacks (registry, params) borrow PW themselves
@@ -260,7 +266,8 @@ pub fn start() {
     }
 }
 
-fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option<String>) {
+fn bind_node(reg: &pw::registry::Registry, g: &Global, get: &dyn Fn(&str) -> Option<String>) {
+    let id = g.id;
     let sink = Sink {
         id,
         name: get("node.name").unwrap_or_default(),
@@ -270,7 +277,7 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
         profile_device: get("card.profile.device").and_then(|v| v.parse().ok()),
         ..Default::default()
     };
-    let Ok(node) = reg.bind::<pw::node::Node, _>(&global_props(id)) else { return };
+    let Ok(node) = reg.bind::<pw::node::Node, _>(g) else { return };
     let listener = node
         .add_listener_local()
         // registry globals omit card.profile.device: without it no Route matched and volume went to
@@ -322,14 +329,9 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
     with(|p| p.nodes.insert(id, (node, listener)));
 }
 
-fn global_props(id: u32) -> pw::registry::GlobalObject<pw::properties::Properties> {
-    pw::registry::GlobalObject { id, permissions: pw::permissions::PermissionFlags::all(), type_: pw::types::ObjectType::Node, version: 3, props: None }
-}
-
-fn bind_device(reg: &pw::registry::Registry, id: u32) {
-    let mut g = global_props(id);
-    g.type_ = pw::types::ObjectType::Device;
-    let Ok(dev) = reg.bind::<pw::device::Device, _>(&g) else { return };
+fn bind_device(reg: &pw::registry::Registry, g: &Global) {
+    let id = g.id;
+    let Ok(dev) = reg.bind::<pw::device::Device, _>(g) else { return };
     let listener = dev
         .add_listener_local()
         .param(move |_, _, _, _, pod| {
@@ -369,10 +371,8 @@ fn bind_device(reg: &pw::registry::Registry, id: u32) {
     with(|p| p.devices.insert(id, (dev, listener, vec![])));
 }
 
-fn bind_metadata(reg: &pw::registry::Registry, id: u32) {
-    let mut g = global_props(id);
-    g.type_ = pw::types::ObjectType::Metadata;
-    let Ok(md) = reg.bind::<pw::metadata::Metadata, _>(&g) else { return };
+fn bind_metadata(reg: &pw::registry::Registry, g: &Global) {
+    let Ok(md) = reg.bind::<pw::metadata::Metadata, _>(g) else { return };
     let listener = md
         .add_listener_local()
         .property(|subject, key, _, value| {
@@ -494,6 +494,7 @@ pub fn link(output: &str, input: &str, connect: bool) {
     let Some(o) = list.iter().find(|s| s.name == output).map(|s| s.id) else { return };
     let Some(i) = list.iter().find(|s| s.name == input).map(|s| s.id) else { return };
     with(|p| {
+        p.pending_links.clear();
         if !connect {
             let ids: Vec<u32> = p.links.iter().filter(|(_, (a, b))| *a == o && *b == i).map(|(id, _)| *id).collect();
             for id in ids {

@@ -15,7 +15,6 @@ use crate::ui::node::{Align, Node, Style, TRANSPARENT};
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{self, Spec, Win};
 use crate::ui::runtime;
-use crate::widgets::clipboard::clipboard::tmp_dir;
 use crate::widgets::focus::levelbar;
 
 const TARGETS: [u32; 5] = [10, 20, 50, 100, 500]; // MB
@@ -76,11 +75,14 @@ fn compress() {
         Some(i) => file[..i].to_string(),
         None => file,
     };
-    let out = format!("{}/{}.mp4", tmp_dir(), if base == id.to_string() { base } else { format!("{base}_{id}") });
+    // videos are big: on disk, not in the RAM-backed runtime dir
+    let dir = format!("{}/flurry", crate::lib::xdg::cache_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    let out = format!("{dir}/{}.mp4", if base == id.to_string() { base } else { format!("{base}_{id}") });
     runtime::spawn(async move {
         let result: Result<(), String> = async {
             let d = exec(&["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", &source]).await?;
-            let duration: f64 = d.trim().parse().map_err(|_| d.clone())?;
+            let duration: f64 = d.trim().parse().ok().filter(|d: &f64| *d > 0.0).ok_or_else(|| d.clone())?;
             let vb = ((limit * 7_600_000.0 / duration - 128_000.0).round() as i64).max(100_000);
             let args = [
                 "-i", &source, "-c:v", "libx264", "-preset", "veryfast", "-b:v", &vb.to_string(), "-maxrate", &vb.to_string(), "-bufsize",

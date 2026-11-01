@@ -10,22 +10,29 @@ use crate::lib::sway;
 use crate::ui::node::{Align, Node, Sides, Style};
 use crate::ui::wayland::{Anchor, Layer};
 use crate::ui::window::{Spec, Win};
-use crate::widgets::focus::focus;
+use crate::widgets::focus::{focus, focus_text};
 
-const FLURRY_APPS: [&str; 6] = ["Low battery", "Focus", "Pass", "Compress", "Sync", "Cleanup"];
+/// shown at once, newest first
+const MAX_SHOWN: usize = 10;
 
 thread_local! {
     /// shown notifications, oldest first (Map insertion order)
-    static SHOWN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    static SHOWN: RefCell<Vec<Notification>> = const { RefCell::new(Vec::new()) };
     static LIST: State<Vec<Notification>> = State::new(vec![]);
 }
 
+/// Dropped for good (settings filters).
+fn filtered(n: &Notification) -> bool {
+    crate::settings::NOTIFICATION_FILTERS.iter().any(|f| n.body.starts_with(f))
+}
+
+/// Hidden while streaming or focusing; flurry's own notifications still show.
 fn hidden(n: &Notification) -> bool {
-    ((streaming_mode().peek() || focus()) && !FLURRY_APPS.contains(&n.app_name.as_str())) || n.body.starts_with("Failed to connect to server")
+    !n.local && (streaming_mode().peek() || focus())
 }
 
 fn refresh() {
-    let list: Vec<Notification> = SHOWN.with(|s| s.borrow().iter().rev().filter_map(|id| notifd::get(*id)).collect());
+    let list: Vec<Notification> = SHOWN.with(|s| s.borrow().iter().rev().filter(|n| !hidden(n)).take(MAX_SHOWN).cloned().collect());
     LIST.with(|l| l.set(list));
 }
 
@@ -79,13 +86,14 @@ pub fn notifications() {
     });
     notifd::on_notified(|id, _| {
         let Some(n) = notifd::get(id) else { return };
-        if hidden(&n) {
+        if filtered(&n) || hidden(&n) {
             return notifd::dismiss(id);
         }
         SHOWN.with(|s| {
             let mut s = s.borrow_mut();
-            if !s.contains(&id) {
-                s.push(id);
+            match s.iter_mut().find(|x| x.id == id) {
+                Some(slot) => *slot = n,
+                None => s.push(n),
             }
         });
         refresh();
@@ -94,17 +102,19 @@ pub fn notifications() {
         let removed = SHOWN.with(|s| {
             let mut s = s.borrow_mut();
             let before = s.len();
-            s.retain(|x| *x != id);
+            s.retain(|x| x.id != id);
             before != s.len()
         });
         if removed {
             refresh();
         }
     });
+    streaming_mode().subscribe(refresh);
+    focus_text().subscribe(refresh);
 }
 
 fn oldest() -> Option<Notification> {
-    SHOWN.with(|s| s.borrow().first().copied()).and_then(notifd::get)
+    SHOWN.with(|s| s.borrow().iter().find(|n| !hidden(n)).cloned())
 }
 
 pub fn clear_oldest_notification() {
@@ -113,15 +123,29 @@ pub fn clear_oldest_notification() {
     }
 }
 
+/// Window app ids are plain names; anything else could inject sway criteria.
+fn safe_app_id(app: &str) -> bool {
+    !app.is_empty() && app.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
 pub fn invoke_oldest_notification(i: usize) {
     let Some(n) = oldest() else { return };
     let Some((action, _)) = n.actions.get(i).cloned() else { return };
     notifd::invoke(n.id, &action);
     let app = if n.desktop_entry.is_empty() { &n.app_name } else { &n.desktop_entry };
-    if action == "default" && !app.is_empty() {
+    if action == "default" && safe_app_id(app) {
         sway::command(&format!("[app_id=\"{app}\"] focus"));
     }
-    if !n.resident {
-        notifd::dismiss(n.id);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_id_charset() {
+        assert!(super::safe_app_id("org.mozilla.firefox"));
+        assert!(super::safe_app_id("foot_2-x"));
+        assert!(!super::safe_app_id(""));
+        assert!(!super::safe_app_id("x\"] exec rm"));
+        assert!(!super::safe_app_id("a b"));
     }
 }

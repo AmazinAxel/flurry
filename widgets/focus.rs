@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::lib::backgroundSection::background_section;
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
-use crate::lib::process::exec;
+use crate::lib::process;
 use crate::lib::searchDialog::search_entry;
 use crate::lib::state::State;
 use crate::lib::style::*;
@@ -17,7 +17,8 @@ use crate::ui::window::{self, Spec, Win};
 
 thread_local! {
     static FOCUS_TEXT: State<String> = State::new(String::new());
-    static BREAK_WAIT: State<f64> = State::new(-1.0);
+    /// the 10s wait before a blocked app runs
+    static BREAK_WAIT: State<bool> = State::new(false);
     static BREAK_TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
     static BREAK_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     static CLOSING_NOTIF: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -29,18 +30,18 @@ pub fn focus_text() -> State<String> {
 pub fn focus() -> bool {
     !focus_text().peek().is_empty()
 }
-fn break_wait() -> State<f64> {
+fn break_wait() -> State<bool> {
     BREAK_WAIT.with(Clone::clone)
 }
 
 fn end_break() {
     BREAK_TIMERS.with(|t| t.borrow_mut().drain(..).for_each(Timer::cancel));
     BREAK_START.with(|s| s.set(None));
-    break_wait().set(-1.0);
+    break_wait().set(false);
 }
 
 pub fn cancel_break() {
-    if break_wait().peek() >= 0.0 {
+    if break_wait().peek() {
         end_break();
     }
 }
@@ -55,20 +56,20 @@ pub fn start_break(cmd: &str) {
         return;
     }
     BREAK_START.with(|s| s.set(Some(std::time::Instant::now())));
-    break_wait().set(0.0);
+    break_wait().set(true);
     let cmd = cmd.to_string();
     let t = runtime::timeout(10_000, move || {
         end_break();
         let cmd = cmd.clone();
         runtime::spawn(async move {
-            let _ = exec(&["systemd-run", "--user", "--scope", "--collect", "-p", "RuntimeMaxSec=300", "sh", "-c", &cmd]).await;
+            let _ = process::status(&["systemd-run", "--user", "--scope", "--collect", "-p", "RuntimeMaxSec=300", "sh", "-c", &cmd]).await;
             end_break();
             let id = CLOSING_NOTIF.with(|n| n.replace(0));
             if id != 0 {
                 crate::lib::notifd::dismiss(id);
             }
         });
-        let t = runtime::timeout(105_000, || {
+        let t = runtime::timeout(285_000, || {
             let id = crate::lib::notifySend::notify_send("Focus", "App closing in 15s", "", vec![]);
             CLOSING_NOTIF.with(|n| n.set(id));
         });
@@ -141,10 +142,10 @@ pub fn focus_task() -> Rc<Win> {
         l.padding = Sides::vh(SPACE_S, SPACE_M);
         l.background = Background::Color(dark1());
         let wait = break_wait().peek();
-        let progress = BREAK_START.with(|s| s.get()).map(|s| s.elapsed().as_secs_f64() / 10.0).unwrap_or(wait.max(0.0));
+        let progress = BREAK_START.with(|s| s.get()).map_or(0.0, |s| s.elapsed().as_secs_f64() / 10.0);
         Node::vbox(base.inherit(), 0.0, vec![
             Node::label(l, focus_text().peek()),
-            levelbar(&base, progress, blue3(), rgba(255, 255, 255, 0.12), 6.0).show(wait >= 0.0),
+            levelbar(&base, progress, blue3(), rgba(255, 255, 255, 0.12), 6.0).show(wait),
         ])
     });
     let fw = Rc::downgrade(&w);

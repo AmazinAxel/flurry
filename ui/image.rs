@@ -2,33 +2,75 @@
 
 use tiny_skia::{IntSize, Pixmap};
 
-pub fn decode_png(bytes: &[u8]) -> Option<Pixmap> {
+/// Pixel count past which images are refused: a few-KB file can claim gigapixels (decompression bomb).
+const MAX_PIXELS: u64 = 8192 * 8192;
+
+fn too_big(w: usize, h: usize) -> bool {
+    (w as u64).checked_mul(h as u64).is_none_or(|n| n > MAX_PIXELS)
+}
+
+fn png_reader(bytes: &[u8]) -> Option<png::Reader<&[u8]>> {
     let mut decoder = png::Decoder::new(bytes);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().ok()?;
-    let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).ok()?;
-    let rgba = match info.color_type {
-        png::ColorType::Rgba => buf,
-        png::ColorType::Rgb => buf.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
-        png::ColorType::GrayscaleAlpha => buf.chunks(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
-        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        png::ColorType::Indexed => return None,
-    };
-    from_rgba(rgba, info.width, info.height)
+    let reader = decoder.read_info().ok()?;
+    let i = reader.info();
+    (!too_big(i.width as usize, i.height as usize)).then_some(reader)
+}
+
+/// Decodes the frame into the front of `dst` (sized w*h*4), then expands it in place, back to
+/// front, to premultiplied RGBA: no intermediate buffer.
+fn png_frame(reader: &mut png::Reader<&[u8]>, dst: &mut [u8]) -> Option<()> {
+    let info = reader.next_frame(dst).ok()?;
+    let n = info.width as usize * info.height as usize;
+    if dst.len() != n * 4 || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    match info.color_type {
+        png::ColorType::Rgba => expand::<4>(dst, n, |p| [p[0], p[1], p[2], p[3]]),
+        png::ColorType::Rgb => expand::<3>(dst, n, |p| [p[0], p[1], p[2], 255]),
+        png::ColorType::GrayscaleAlpha => expand::<2>(dst, n, |p| [p[0], p[0], p[0], p[1]]),
+        png::ColorType::Grayscale => expand::<1>(dst, n, |p| [p[0], p[0], p[0], 255]),
+        _ => return None,
+    }
+    Some(())
+}
+
+/// `n` pixels of `CH` bytes at the front of `dst` widened to 4, last first so nothing unread is overwritten.
+fn expand<const CH: usize>(dst: &mut [u8], n: usize, f: impl Fn(&[u8]) -> [u8; 4]) {
+    for i in (0..n).rev() {
+        let px = premultiply(f(&dst[i * CH..i * CH + CH]));
+        dst[i * 4..i * 4 + 4].copy_from_slice(&px);
+    }
+}
+
+pub fn decode_png(bytes: &[u8]) -> Option<Pixmap> {
+    let mut reader = png_reader(bytes)?;
+    let (w, h) = (reader.info().width, reader.info().height);
+    let mut buf = vec![0; w as usize * h as usize * 4];
+    png_frame(&mut reader, &mut buf)?;
+    Pixmap::from_vec(buf, IntSize::from_wh(w, h)?)
 }
 
 fn jpeg_decoder(bytes: &[u8]) -> zune_jpeg::JpegDecoder<&[u8]> {
     let opts = zune_jpeg::zune_core::options::DecoderOptions::default()
-        .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+        .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA)
+        .set_max_width(1 << 15)
+        .set_max_height(1 << 15);
     zune_jpeg::JpegDecoder::new_with_options(bytes, opts)
+}
+
+/// Header read and size checked.
+fn jpeg_dims(d: &mut zune_jpeg::JpegDecoder<&[u8]>) -> Option<(u32, u32)> {
+    d.decode_headers().ok()?;
+    let (w, h) = d.dimensions()?;
+    (!too_big(w, h)).then_some((w as u32, h as u32))
 }
 
 pub fn decode_jpeg(bytes: &[u8]) -> Option<Pixmap> {
     let mut d = jpeg_decoder(bytes);
-    let px = d.decode().ok()?;
-    let (w, h) = d.dimensions()?;
-    from_rgba(px, w as u32, h as u32)
+    let (w, h) = jpeg_dims(&mut d)?;
+    // opaque, so already premultiplied
+    Pixmap::from_vec(d.decode().ok()?, IntSize::from_wh(w, h)?)
 }
 
 /// Sniffs the format from the header.
@@ -40,33 +82,34 @@ pub fn decode(bytes: &[u8]) -> Option<Pixmap> {
     }
 }
 
-/// Decodes into the buffer `alloc(w, h, fill)` provides, as premultiplied RGBA; `fill` reports
-/// success. JPEGs (opaque, so already premultiplied) decode straight in, with no intermediate copy.
-pub fn decode_into<T>(bytes: &[u8], alloc: impl FnOnce(u32, u32, &dyn Fn(&mut [u8]) -> bool) -> Option<T>) -> Option<T> {
-    if bytes.starts_with(&[0xff, 0xd8]) {
-        let mut d = jpeg_decoder(bytes);
-        d.decode_headers().ok()?;
-        let (w, h) = d.dimensions()?;
-        let d = std::cell::RefCell::new(d);
-        return alloc(w as u32, h as u32, &|dst| d.borrow_mut().decode_into(dst).is_ok());
+/// Decodes as premultiplied RGBA straight into the `w`x`h` buffer `alloc` provides (`buf` its
+/// bytes), with no intermediate copy.
+pub fn decode_into<T>(bytes: &[u8], alloc: impl FnOnce(u32, u32) -> Option<T>, buf: impl Fn(&mut T) -> &mut [u8]) -> Option<T> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => {
+            let mut reader = png_reader(bytes)?;
+            let mut t = alloc(reader.info().width, reader.info().height)?;
+            png_frame(&mut reader, buf(&mut t))?;
+            Some(t)
+        }
+        [0xff, 0xd8, ..] => {
+            let mut d = jpeg_decoder(bytes);
+            let (w, h) = jpeg_dims(&mut d)?;
+            let mut t = alloc(w, h)?;
+            d.decode_into(buf(&mut t)).ok()?;
+            Some(t)
+        }
+        _ => None,
     }
-    let pix = decode(bytes)?;
-    alloc(pix.width(), pix.height(), &|dst| {
-        dst.copy_from_slice(pix.data());
-        true
-    })
 }
 
-fn from_rgba(mut rgba: Vec<u8>, w: u32, h: u32) -> Option<Pixmap> {
-    for p in rgba.as_chunks_mut::<4>().0 {
-        let a = p[3] as u16;
-        if a != 255 {
-            for c in &mut p[..3] {
-                *c = ((*c as u16 * a + 127) / 255) as u8;
-            }
-        }
+fn premultiply(p: [u8; 4]) -> [u8; 4] {
+    let a = p[3] as u16;
+    if a == 255 {
+        return p;
     }
-    Pixmap::from_vec(rgba, IntSize::from_wh(w, h)?)
+    let m = |c: u8| ((c as u16 * a + 127) / 255) as u8;
+    [m(p[0]), m(p[1]), m(p[2]), p[3]]
 }
 
 /// Gaussian blur in place (sigma = radius / 2, as GSK does), approximated by three box blurs per
@@ -122,6 +165,7 @@ fn gaussian(src: Vec<f32>, w: usize, h: usize, ch: usize, radius: f32) -> Option
                 px.iter_mut().for_each(|v| *v *= n);
             }
         }
+        drop(src);
         let small = blur_full(small, sw, sh, ch, sigma / f as f32);
         // bilinear: per output row, the two source rows mixed once, then sampled along x
         let taps: Vec<(usize, usize, f32)> = (0..w)
@@ -152,13 +196,16 @@ fn gaussian(src: Vec<f32>, w: usize, h: usize, ch: usize, radius: f32) -> Option
 
 fn blur_full(src: Vec<f32>, w: usize, h: usize, ch: usize, sigma: f32) -> Vec<f32> {
     let boxes = box_sizes(sigma);
-    let mut a = transpose(&src, w, h, ch);
+    let mut a = vec![0f32; src.len()];
+    transpose(&src, &mut a, w, h, ch);
+    drop(src);
     let mut b = vec![0f32; a.len()];
     for r in boxes {
         vpass(&a, &mut b, w, r, h * ch);
         std::mem::swap(&mut a, &mut b);
     }
-    let mut a = transpose(&a, h, w, ch);
+    transpose(&a, &mut b, h, w, ch);
+    std::mem::swap(&mut a, &mut b);
     for r in boxes {
         vpass(&a, &mut b, h, r, w * ch);
         std::mem::swap(&mut a, &mut b);
@@ -166,10 +213,9 @@ fn blur_full(src: Vec<f32>, w: usize, h: usize, ch: usize, sigma: f32) -> Vec<f3
     a
 }
 
-/// `w`x`h` pixels of `ch` channels -> `h`x`w`, in cache-sized tiles.
-fn transpose(src: &[f32], w: usize, h: usize, ch: usize) -> Vec<f32> {
+/// `w`x`h` pixels of `ch` channels -> `h`x`w` into `out`, in cache-sized tiles.
+fn transpose(src: &[f32], out: &mut [f32], w: usize, h: usize, ch: usize) {
     const T: usize = 32;
-    let mut out = vec![0f32; src.len()];
     for ty in (0..h).step_by(T) {
         for tx in (0..w).step_by(T) {
             for y in ty..(ty + T).min(h) {
@@ -180,7 +226,6 @@ fn transpose(src: &[f32], w: usize, h: usize, ch: usize) -> Vec<f32> {
             }
         }
     }
-    out
 }
 
 /// Box radii whose 3-pass sum approximates a gaussian with `sigma`.
@@ -234,6 +279,21 @@ mod tests {
     fn cover_crops_the_long_side() {
         assert_eq!(cover(200.0, 100.0, 100.0, 100.0), (50.0, 0.0, 100.0, 100.0));
         assert_eq!(cover(100.0, 200.0, 100.0, 100.0), (0.0, 50.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn refuses_bombs() {
+        assert!(!too_big(8192, 8192));
+        assert!(too_big(8193, 8192));
+        assert!(too_big(usize::MAX, 2));
+    }
+
+    #[test]
+    fn expands_in_place_premultiplied() {
+        // two gray+alpha pixels at the front, widened to RGBA
+        let mut buf = [200, 255, 100, 0, 0, 0, 0, 0];
+        expand::<2>(&mut buf, 2, |p| [p[0], p[0], p[0], p[1]]);
+        assert_eq!(buf, [200, 200, 200, 255, 0, 0, 0, 0]);
     }
 
     #[test]

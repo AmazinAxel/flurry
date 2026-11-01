@@ -1,16 +1,17 @@
-// cliphist history dialog (widgets/clipboard/clipboard.tsx + clipboardItem.tsx).
+// Clipboard history dialog (widgets/clipboard/clipboard.tsx + clipboardItem.tsx).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use tiny_skia::Pixmap;
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::backgroundSection::background_section;
-use crate::lib::clipboard::{is_sensitive, keep_sensitive, set_sensitive};
+use crate::lib::apps::launch;
+use crate::lib::clipboard::{Entry, copy_entry, entry_file};
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
-use crate::lib::process::exec;
 use crate::lib::searchDialog::search_entry;
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::style::*;
@@ -22,19 +23,14 @@ use crate::widgets::clipboard::compress::open_compress;
 const MAX_W: f32 = 380.0;
 const MAX_H: f32 = 150.0;
 
-/// Decoded clipboard files and compress output: the runtime dir is private to this user.
-pub fn tmp_dir() -> String {
-    format!("{}/flurry", crate::lib::xdg::runtime_dir())
-}
-
-pub fn cache_dir() -> String {
-    format!("{}/cliphist", tmp_dir())
-}
+/// Thumbnails decoded per show (newest media first), and kept at most.
+const THUMB_ROWS: usize = 12;
+const THUMB_CAP: usize = 24;
 
 #[derive(Clone)]
 enum Thumb {
     Loading,
-    Ready(Rc<Pixmap>, f32), // device pixels per logical pixel
+    Ready(Rc<crate::ui::node::Pic>, f32), // device pixels per logical pixel
     Failed,
 }
 
@@ -43,7 +39,7 @@ struct Item {
     id: u64,
     content: String,
     path: Option<String>,
-    image: Option<(String, String, String)>, // ext, width, height
+    image: Option<String>, // WxH
     video: bool,
     mime: String,
     search: String,
@@ -52,42 +48,24 @@ struct Item {
 thread_local! {
     static ITEMS: RefCell<Vec<Item>> = const { RefCell::new(Vec::new()) };
     static THUMBS: RefCell<HashMap<u64, Thumb>> = RefCell::default();
+    /// THUMBS ids, least recently shown first
+    static THUMB_LRU: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     static QUERY: RefCell<String> = const { RefCell::new(String::new()) };
     static SELECTED: Cell<Option<u64>> = const { Cell::new(None) };
     static PRODUCE: Rc<runtime::Queue> = Rc::default();
-    static REFRESH: Rc<runtime::Queue> = Rc::default();
-}
-
-/// `[[ binary data 12 KiB png 1920x1080 ]]` -> (ext, w, h)
-pub fn binary_data(content: &str) -> Option<(String, String, String)> {
-    let start = content.find("[[ binary data ")?;
-    let rest = &content[start + 15..];
-    let end = rest.find(" ]]")?;
-    let parts: Vec<&str> = rest[..end].split(' ').collect();
-    if parts.len() != 4 || !["B", "KiB", "MiB", "GiB"].contains(&parts[1]) || !parts[0].chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    // copied text can look like this too, and the extension ends up in a path and a shell command
-    if parts[2].is_empty() || !parts[2].chars().all(|c| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    let (w, h) = parts[3].split_once('x')?;
-    if !w.chars().all(|c| c.is_ascii_digit()) || !h.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some((parts[2].to_string(), w.to_string(), h.to_string()))
 }
 
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%'
             && i + 2 < b.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
         {
-            out.push(v);
+            out.push(h << 4 | l);
             i += 3;
             continue;
         }
@@ -97,11 +75,11 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn entry_path(id: u64, content: &str) -> Option<String> {
-    if let Some((ext, _, _)) = binary_data(content) {
-        return Some(format!("{}/{id}.{ext}", cache_dir()));
+pub fn entry_path(e: &Entry) -> Option<String> {
+    if e.mime.starts_with("image/") {
+        return Some(entry_file(e.id, &e.mime));
     }
-    let single = content.trim();
+    let single = e.preview.trim();
     if single.contains('\n') || single.contains(' ') {
         return None; // not a path
     }
@@ -117,18 +95,20 @@ pub fn is_video(p: &str) -> bool {
     [".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"].iter().any(|e| l.ends_with(e))
 }
 
-
-async fn decode_bytes(id: u64, path: &str) -> bool {
-    crate::lib::process::to_file(&["cliphist", "decode", &id.to_string()], path).await
-}
-
 /// Thumbnails are rendered at the largest output scale so they map 1:1 onto device pixels.
 fn device_scale() -> f32 {
     crate::ui::wayland::outputs().iter().map(|o| o.scale).max().unwrap_or(1).max(1) as f32
 }
 
-fn load_scaled(file: &str, k: f32) -> Option<Pixmap> {
-    let src = image::decode(&std::fs::read(file).ok()?)?;
+/// A child's whole stdout, binary-safe (blocking: worker threads only).
+fn read_output(argv: &[&str]) -> Option<Vec<u8>> {
+    let (prog, args) = argv.split_first()?;
+    let out = Command::new(prog).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+fn load_scaled(bytes: &[u8], k: f32) -> Option<Pixmap> {
+    let src = image::decode(bytes)?;
     let s = (MAX_W * k / src.width() as f32).min(MAX_H * k / src.height() as f32).min(k);
     let (w, h) = ((src.width() as f32 * s).round().max(1.0) as u32, (src.height() as f32 * s).round().max(1.0) as u32);
     let mut out = Pixmap::new(w, h)?;
@@ -137,7 +117,23 @@ fn load_scaled(file: &str, k: f32) -> Option<Pixmap> {
     Some(out)
 }
 
-/// Thumbnails are produced one at a time (produceQueue).
+/// Marks `id` most recently used, evicting the least recently used finished thumbnails past the cap.
+fn touch_thumb(id: u64) {
+    THUMB_LRU.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|i| *i != id);
+        l.push(id);
+        THUMBS.with(|t| {
+            let mut t = t.borrow_mut();
+            while l.len() > THUMB_CAP {
+                let old = l.remove(0);
+                t.remove(&old);
+            }
+        });
+    });
+}
+
+/// Thumbnails are produced one at a time (produceQueue), in memory: nothing lands in the runtime dir.
 fn request_thumb(item: &Item) {
     if THUMBS.with(|t| t.borrow().contains_key(&item.id)) {
         return;
@@ -148,40 +144,46 @@ fn request_thumb(item: &Item) {
         let produce = PRODUCE.with(Clone::clone);
         let _turn = produce.lock().await;
         let k = device_scale();
-        let file = if item.video { format!("{}/{}.{k}x.jpg", cache_dir(), item.id) } else { item.path.clone().unwrap_or_default() };
-        let ready = std::path::Path::new(&file).exists()
-            || if item.video {
-                let scale = format!("scale=w={}:h={}:force_original_aspect_ratio=decrease", MAX_W * k, MAX_H * k);
-                let src = item.path.clone().unwrap_or_default();
-                exec(&["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-y", &file]).await.is_ok()
-            } else {
-                decode_bytes(item.id, &file).await
-            };
+        let (id, video, src) = (item.id, item.video, item.path.clone().unwrap_or_default());
         // decoding a screenshot takes tens of ms: off the loop
-        let pix = if ready { runtime::blocking(move || load_scaled(&file, k)).await.flatten() } else { None };
-        let thumb = pix.map(|p| Thumb::Ready(Rc::new(p), k)).unwrap_or(Thumb::Failed);
-        THUMBS.with(|t| t.borrow_mut().insert(item.id, thumb));
+        let pix = runtime::blocking(move || {
+            let bytes = if video {
+                let scale = format!("scale=w={}:h={}:force_original_aspect_ratio=decrease", MAX_W * k, MAX_H * k);
+                read_output(&["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"])
+            } else {
+                std::fs::read(&src).ok()
+            };
+            load_scaled(&bytes?, k)
+        })
+        .await
+        .flatten();
+        let thumb = pix.map(|p| Thumb::Ready(crate::ui::node::Pic::new(p), k)).unwrap_or(Thumb::Failed);
+        // dropped meanwhile (wipe, stale entry): don't resurrect it
+        if THUMBS.with(|t| t.borrow_mut().get_mut(&id).map(|t| *t = thumb).is_some()) {
+            touch_thumb(id);
+        }
         if let Some(w) = window::get("clipboard") {
             w.redraw();
         }
     });
 }
 
-/// Image/video rows stay hidden until their thumbnail exists, so they are requested up front
-/// (requesting from the row builder never fired: hidden rows are never built).
+/// Lazily, while the dialog is up: the newest media rows get thumbnails; older ones show their
+/// description. Rows stay hidden while loading (requesting from the row builder never fired:
+/// hidden rows are never built).
 fn request_thumbs() {
-    if streaming_mode().peek() {
+    if streaming_mode().peek() || !window::get("clipboard").is_some_and(|w| w.visible()) {
         return;
     }
-    let media: Vec<Item> = ITEMS.with(|i| i.borrow().iter().filter(|x| (x.image.is_some() || x.video) && !is_sensitive(x.id)).cloned().collect());
-    for item in &media {
+    let media: Vec<Item> = ITEMS.with(|i| i.borrow().iter().filter(|x| x.image.is_some() || x.video).cloned().collect());
+    for item in media.iter().take(THUMB_ROWS) {
         request_thumb(item);
     }
 }
 
 fn describe(item: &Item) -> String {
-    if let Some((_, w, h)) = &item.image {
-        format!("Image ({w}x{h})")
+    if let Some(dims) = &item.image {
+        format!("Image ({dims})")
     } else if item.video {
         format!("Video ({})", item.path.as_deref().unwrap_or("").rsplit('/').next().unwrap_or(""))
     } else {
@@ -190,16 +192,14 @@ fn describe(item: &Item) -> String {
 }
 
 fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
-    if is_sensitive(item.id) {
-        return Some(Node::label(row.inherit(), "[ Sensitive ]").xalign(0.0));
-    }
     if streaming_mode().peek() {
         return Some(Node::label(row.inherit(), describe(item)).xalign(0.0));
     }
     if item.image.is_some() || item.video {
         return match THUMBS.with(|t| t.borrow().get(&item.id).cloned()) {
             Some(Thumb::Ready(p, k)) => {
-                let (w, h) = (p.width() as f32 / k, p.height() as f32 / k);
+                touch_thumb(item.id);
+                let (w, h) = (p.pix.width() as f32 / k, p.pix.height() as f32 / k);
                 let s = base.inherit();
                 let pic = Node::new(Kind::Picture { pixmap: crate::ui::node::Img::Pix(p), cover: false, blur: 0.0, density: k }, base.inherit());
                 let mut kids = vec![pic];
@@ -209,9 +209,9 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
                 }
                 Some(Node::overlay(s, kids).size(w, h).align(Align::Center, Align::Center))
             }
-            Some(Thumb::Failed) => Some(Node::label(row.inherit(), describe(item)).xalign(0.0)),
-            // hidden until loaded (visible=false rows are filtered out)
-            _ => None,
+            // hidden while loading (visible=false rows are filtered out)
+            Some(Thumb::Loading) => None,
+            Some(Thumb::Failed) | None => Some(Node::label(row.inherit(), describe(item)).xalign(0.0)),
         };
     }
     let mut n = Node::label(row.inherit(), item.content.clone()).xalign(0.0);
@@ -226,19 +226,17 @@ fn visible_rows() -> Vec<Item> {
     let q = QUERY.with(|q| q.borrow().clone());
     let streaming = streaming_mode().peek();
     // filter first, clone only what is shown
-    let mut items: Vec<Item> = THUMBS.with(|t| {
+    THUMBS.with(|t| {
         let t = t.borrow();
         ITEMS.with(|i| {
             i.borrow()
                 .iter()
-                .filter(|i| streaming || (i.image.is_none() && !i.video) || is_sensitive(i.id) || !matches!(t.get(&i.id), Some(Thumb::Loading) | None))
-                .filter(|i| q.is_empty() || (!is_sensitive(i.id) && i.search.contains(&q)))
+                .filter(|i| streaming || (i.image.is_none() && !i.video) || !matches!(t.get(&i.id), Some(Thumb::Loading)))
+                .filter(|i| q.is_empty() || i.search.contains(&q))
                 .cloned()
                 .collect()
         })
-    });
-    items.sort_by_key(|i| std::cmp::Reverse(i.id));
-    items
+    })
 }
 
 fn select_top(keep: bool) {
@@ -271,98 +269,33 @@ fn hide() {
 
 fn activate(item: &Item) {
     hide();
-    let hint = if is_sensitive(item.id) { "--sensitive " } else { "" };
-    let cmd = format!("cliphist decode {} | wl-copy {hint}-t {} 2>/dev/null", item.id, item.mime);
-    runtime::spawn(async move {
-        let _ = exec(&["bash", "-c", &cmd]).await;
-    });
+    copy_entry(item.id, &item.mime);
 }
 
-async fn refresh_items() {
-    let queue = REFRESH.with(Clone::clone);
-    let _turn = queue.lock().await;
-    if let Ok(out) = exec(&["cliphist", "list"]).await {
-        let entries: Vec<(u64, String)> = out
-            .split('\n')
-            .filter_map(|l| {
-                let (id, content) = l.split_once('\t')?;
-                (!id.is_empty() && !content.is_empty()).then(|| Some((id.parse().ok()?, content.to_string()))).flatten()
-            })
-            .collect();
-        keep_sensitive(&entries.iter().map(|(id, _)| *id).collect::<Vec<_>>());
-        let stale: Vec<u64> = ITEMS.with(|i| {
-            let mut items = i.borrow_mut();
-            for (id, content) in &entries {
-                if items.iter().any(|x| x.id == *id) {
-                    continue;
-                }
-                let image = binary_data(content);
-                let path = entry_path(*id, content);
-                let video = path.as_deref().is_some_and(|p| is_video(p) && std::path::Path::new(p).exists());
-                let mime = if let Some((ext, _, _)) = &image {
-                    format!("image/{ext}")
-                } else if content.trim().starts_with("file://") {
-                    "text/uri-list".into() // paste the ACTUAL file
-                } else {
-                    "text/plain".into()
-                };
-                let search = format!("{}{}", if image.is_some() { "image " } else { "" }, content.to_lowercase());
-                items.push(Item { id: *id, content: content.clone(), path, image, video, mime, search });
-            }
-            let stale: Vec<u64> = items.iter().filter(|x| !entries.iter().any(|(id, _)| *id == x.id)).map(|x| x.id).collect();
-            items.retain(|x| !stale.contains(&x.id));
-            stale
-        });
-        // their decodes and thumbnails are dead weight now
-        if !stale.is_empty()
-            && let Ok(rd) = std::fs::read_dir(cache_dir())
-        {
-            for f in rd.flatten() {
-                let name = f.file_name().to_string_lossy().into_owned();
-                if name.split('.').next().and_then(|i| i.parse::<u64>().ok()).is_some_and(|i| stale.contains(&i)) {
-                    let _ = std::fs::remove_file(f.path());
-                }
-            }
-            THUMBS.with(|t| t.borrow_mut().retain(|id, _| !stale.contains(id)));
-        }
-        select_top(true);
-        request_thumbs();
-    }
+fn new_item(e: Entry) -> Item {
+    let image = e.mime.starts_with("image/").then(|| e.preview.clone());
+    let path = entry_path(&e);
+    let video = path.as_deref().is_some_and(|p| is_video(p) && std::path::Path::new(p).exists());
+    let search = format!("{}{}", if image.is_some() { "image " } else { "" }, e.preview.to_lowercase());
+    Item { id: e.id, content: e.preview, path, image, video, mime: e.mime, search }
+}
+
+/// Rebuilt from the history, keeping rows (and thumbnails) of entries still in it.
+fn refresh_items() {
+    let ids: Vec<u64> = ITEMS.with(|i| {
+        let mut old: HashMap<u64, Item> = i.take().into_iter().map(|x| (x.id, x)).collect();
+        let items: Vec<Item> = crate::lib::clipboard::history().into_iter().map(|e| old.remove(&e.id).unwrap_or_else(|| new_item(e))).collect();
+        let ids = items.iter().map(|x| x.id).collect();
+        *i.borrow_mut() = items;
+        ids
+    });
+    THUMBS.with(|t| t.borrow_mut().retain(|id, _| ids.contains(id)));
+    THUMB_LRU.with(|l| l.borrow_mut().retain(|id| ids.contains(id)));
+    select_top(true);
+    request_thumbs();
     if let Some(w) = window::get("clipboard") {
         w.redraw();
     }
-}
-
-fn watch_db() {
-    let dir = format!("{}/cliphist", crate::lib::xdg::cache_dir());
-    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-    let Ok(c) = std::ffi::CString::new(dir) else { return };
-    if fd < 0 || unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) } < 0 {
-        return;
-    }
-    runtime::watch(fd, move || {
-        let mut buf = [0u8; 4096];
-        let mut db_changed = false;
-        loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                break;
-            }
-            // inotify_event: wd(4) mask(4) cookie(4) len(4) name
-            let mut off = 0usize;
-            while off + 16 <= n as usize {
-                let len = u32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap()) as usize;
-                let name = String::from_utf8_lossy(&buf[off + 16..off + 16 + len]);
-                if name.trim_end_matches('\0') == "db" {
-                    db_changed = true;
-                }
-                off += 16 + len;
-            }
-        }
-        if db_changed {
-            runtime::spawn(refresh_items());
-        }
-    });
 }
 
 fn show_in_file_manager(file: &str) {
@@ -373,40 +306,26 @@ fn show_in_file_manager(file: &str) {
     }
 }
 
-/// Streaming mode skips thumbnails, so image entries may have no decode on disk yet.
-fn with_file(want: Option<fn(&str) -> bool>, action: impl FnOnce(String, u64) + 'static) {
+fn with_file(want: Option<fn(&str) -> bool>, action: impl FnOnce(String, u64)) {
     let Some(item) = selected_item() else { return };
-    let Some(path) = item.path.clone() else { return };
-    if want.is_some_and(|w| !w(&path)) {
+    let Some(path) = item.path else { return };
+    if want.is_some_and(|w| !w(&path)) || !std::path::Path::new(&path).exists() {
         return;
     }
-    let run = move || {
-        if !std::path::Path::new(&path).exists() {
-            return;
-        }
-        hide();
-        action(path, item.id);
-    };
-    if std::path::Path::new(item.path.as_deref().unwrap_or("")).exists() || !item.mime.starts_with("image/") {
-        return run();
-    }
-    let p = item.path.clone().unwrap_or_default();
-    runtime::spawn(async move {
-        if decode_bytes(item.id, &p).await {
-            run();
-        }
-    });
+    hide();
+    action(path, item.id);
 }
 
-fn spawn_exec(argv: Vec<String>) {
-    runtime::spawn(async move {
-        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let _ = exec(&refs).await;
-    });
+fn with_prefix(prefix: &[&str], file: String) -> Vec<String> {
+    prefix.iter().map(|s| s.to_string()).chain([file]).collect()
+}
+
+fn wipe() {
+    hide();
+    crate::lib::clipboard::wipe();
 }
 
 pub fn clipboard() {
-    let _ = std::fs::create_dir_all(cache_dir());
     let e = entry::new("");
     e.borrow_mut().on_change = Some(Rc::new(|text: &str| {
         QUERY.with(|q| *q.borrow_mut() = text.to_lowercase());
@@ -449,7 +368,10 @@ pub fn clipboard() {
     };
     let ctrl = |k: Keysym, f: fn()| -> (Keysym, crate::lib::inputControl::Action) { (k, Rc::new(f)) };
     let w = input_control("clipboard", build, Opts {
-        on_show: Some(Rc::new(|| select_top(false))),
+        on_show: Some(Rc::new(|| {
+            refresh_items();
+            select_top(false);
+        })),
         focus: Some("entry"),
         actions: vec![
             ctrl(Keysym::Return, || {
@@ -468,22 +390,11 @@ pub fn clipboard() {
                     activate(i); // copy 2nd recent entry
                 }
             }),
-            ctrl(Keysym::e, || with_file(Some(|f| !is_video(f)), |f, _| spawn_exec(vec!["swappy".into(), "-f".into(), f]))),
-            ctrl(Keysym::g, || with_file(None, |f, _| spawn_exec(vec!["gthumb".into(), f]))),
+            ctrl(Keysym::e, || with_file(Some(|f| !is_video(f)), |f, _| launch(&with_prefix(&["swappy", "-f"], f)))),
+            ctrl(Keysym::g, || with_file(None, |f, _| launch(&with_prefix(crate::settings::IMAGE_VIEWER, f)))),
             ctrl(Keysym::m, || with_file(Some(is_video), |f, id| open_compress(&f, id))),
             ctrl(Keysym::n, || with_file(None, |f, _| show_in_file_manager(&f))),
-            ctrl(Keysym::s, || {
-                if let Some(i) = selected_item() {
-                    set_sensitive(i.id, !is_sensitive(i.id));
-                    request_thumbs();
-                }
-            }),
-            ctrl(Keysym::w, || {
-                keep_sensitive(&[]);
-                let cmd = format!("cliphist wipe && rm -rf {0}/* && mkdir -p {0}", cache_dir());
-                spawn_exec(vec!["bash".into(), "-c".into(), cmd]);
-                hide();
-            }),
+            ctrl(Keysym::w, wipe),
         ],
         entries: vec![EntryBinding { id: "entry", entry: e, on_activate: None, on_key: None }],
         ..Default::default()
@@ -492,8 +403,12 @@ pub fn clipboard() {
     streaming_mode().subscribe(|| {
         request_thumbs(); // rows themselves just redraw (watched above): no refetch gap
     });
-    runtime::spawn(refresh_items());
-    watch_db();
+    // rows are only built while the dialog is up: hidden, a copy just lands in the history
+    crate::lib::clipboard::watch(|| {
+        if window::get("clipboard").is_some_and(|w| w.visible()) {
+            refresh_items();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -501,15 +416,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_cliphist_entries() {
-        assert_eq!(binary_data("[[ binary data 12 KiB png 1920x1080 ]]"), Some(("png".into(), "1920".into(), "1080".into())));
-        assert_eq!(entry_path(7, "[[ binary data 1 B jpeg 1x1 ]]"), Some(format!("{}/7.jpeg", cache_dir())));
-        // copied text posing as a binary entry never reaches a path or the shell
-        assert_eq!(binary_data("[[ binary data 1 B png;$(id) 1x1 ]]"), None);
-        assert_eq!(binary_data("[[ binary data 1 B ../x 1x1 ]]"), None);
-        assert_eq!(entry_path(1, "file:///home/a/x%20y.mp4").as_deref(), Some("/home/a/x y.mp4"));
-        assert_eq!(entry_path(1, "/tmp/a b"), None);
-        assert_eq!(entry_path(1, "hello"), None);
+    fn finds_entry_paths() {
+        let e = |mime: &str, preview: &str| entry_path(&Entry { id: 7, mime: mime.into(), preview: preview.into() });
+        assert_eq!(e("image/jpeg", "1x1"), Some(entry_file(7, "image/jpeg")));
+        assert_eq!(e("text/uri-list", "file:///home/a/x%20y.mp4").as_deref(), Some("/home/a/x y.mp4"));
+        assert_eq!(e("text/plain", "/tmp/a b"), None);
+        assert_eq!(e("text/plain", "hello"), None);
         assert!(is_video("/a/B.MKV"));
+        // multibyte after a broken escape: kept, never a panic
+        assert_eq!(e("text/plain", "file:%aé").as_deref(), Some("/%aé"));
     }
 }

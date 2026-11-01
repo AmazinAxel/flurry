@@ -1,6 +1,6 @@
-// Sideview controller (widgets/sideview.tsx). The web view itself lives in the `flurry-sideview`
-// process (Servo), spawned on first use and killed by closeSideview; this side keeps the state
-// machine, the dim window and the color scheme sync.
+// Sideview controller. The web view itself lives in the `flurry-sideview` process (Servo),
+// spawned by the first show and stopped by closeSideview; this side keeps the state machine, the
+// dim window and the color scheme sync.
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -10,6 +10,7 @@ use crate::config::sideview_url;
 use crate::lib::dbus::{self, SignalFilter, method, set_prop};
 use crate::lib::inputControl::DIM;
 use crate::ui::node::{Node, Style};
+use crate::ui::runtime;
 use crate::ui::wayland::{Anchor, Layer};
 use crate::ui::window::{self, Spec, Win};
 
@@ -23,27 +24,46 @@ thread_local! {
     static DARK: Cell<bool> = const { Cell::new(true) };
 }
 
+/// Whether the sideview is shown; a helper that died takes its panel (and the dim) with it.
+fn visible() -> bool {
+    let died = HELPER.with(|h| {
+        let mut h = h.borrow_mut();
+        let died = h.as_mut().is_some_and(|(child, _)| child.try_wait().ok().flatten().is_some());
+        if died {
+            *h = None;
+        }
+        died
+    });
+    if died && VISIBLE.with(|v| v.replace(false)) {
+        PUSHED_ASIDE.with(|p| p.set(false));
+        FOCUSED.with(|f| f.set(false));
+        window::set_visible("sideviewDim", false);
+    }
+    VISIBLE.with(Cell::get)
+}
+
+fn focus_cmd() -> String {
+    let focused = FOCUSED.with(Cell::get);
+    let ignore = focused && !PUSHED_ASIDE.with(Cell::get);
+    format!("focus {focused} {}", if ignore { "ignore" } else { "exclusive" })
+}
+
+/// Only `show` starts the helper; other commands without one are moot (a new helper gets the
+/// current state first).
 fn send(cmd: &str) {
+    visible();
     HELPER.with(|h| {
         let mut h = h.borrow_mut();
-        if let Some((child, _)) = h.as_mut()
-            && child.try_wait().ok().flatten().is_some()
-        {
-            *h = None; // helper died; respawn below
-        }
-        if h.is_none() {
+        if h.is_none() && cmd.starts_with("show ") {
             let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("flurry-sideview")));
             let exe = exe.filter(|p| p.exists()).map(|p| p.into_os_string()).unwrap_or_else(|| "flurry-sideview".into());
             if let Ok(mut child) = Command::new(exe).stdin(Stdio::piped()).spawn()
-                && let Some(stdin) = child.stdin.take()
+                && let Some(mut s) = child.stdin.take()
             {
-                *h = Some((child, stdin));
-                let dark = DARK.with(Cell::get);
-                let width = WIDTH.with(Cell::get);
-                if let Some((_, s)) = h.as_mut() {
-                    let _ = writeln!(s, "dark {dark}");
-                    let _ = writeln!(s, "width {width}");
-                }
+                let _ = writeln!(s, "dark {}", DARK.with(Cell::get));
+                let _ = writeln!(s, "width {}", WIDTH.with(Cell::get));
+                let _ = writeln!(s, "{}", focus_cmd());
+                *h = Some((child, s));
             }
         }
         if let Some((_, s)) = h.as_mut() {
@@ -55,28 +75,27 @@ fn send(cmd: &str) {
 
 fn set_focused(focused: bool) {
     FOCUSED.with(|f| f.set(focused));
-    let ignore = focused && !PUSHED_ASIDE.with(Cell::get);
-    send(&format!("focus {focused} {}", if ignore { "ignore" } else { "exclusive" }));
+    send(&focus_cmd());
     window::set_visible("sideviewDim", focused);
 }
 
 pub fn show_page(name: &str) {
     let Some(url) = sideview_url(name) else { return };
-    let visible = VISIBLE.with(Cell::get);
+    let visible = visible();
     if visible && CURRENT.with(|c| c.borrow().as_deref() == Some(name)) {
         return hide_sideview();
     }
-    let fresh = !visible;
+    if !visible {
+        // focus first: the show then maps the panel once, already with the keyboard
+        set_focused(true);
+    }
     send(&format!("show {name} {url}"));
     CURRENT.with(|c| *c.borrow_mut() = Some(name.to_string()));
     VISIBLE.with(|v| v.set(true));
-    if fresh {
-        set_focused(true);
-    }
 }
 
 pub fn toggle_sideview_focus() {
-    if !VISIBLE.with(Cell::get) {
+    if !visible() {
         return;
     }
     PUSHED_ASIDE.with(|p| p.set(true)); // first focus makes it take screen space only
@@ -92,7 +111,7 @@ pub fn hide_sideview() {
 
 /// Hides the sideview, or brings back the last shown page.
 pub fn toggle_sideview() {
-    if VISIBLE.with(Cell::get) {
+    if visible() {
         return hide_sideview();
     }
     if let Some(name) = CURRENT.with(|c| c.borrow().clone()) {
@@ -103,21 +122,22 @@ pub fn toggle_sideview() {
 /// Destroys all web views (the whole helper process).
 pub fn close_sideview() {
     hide_sideview();
-    HELPER.with(|h| {
-        if let Some((mut child, _)) = h.borrow_mut().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    });
+    if let Some((mut child, stdin)) = HELPER.with(|h| h.borrow_mut().take()) {
+        drop(stdin); // EOF: the helper exits by itself (stopping Claude Code)
+        runtime::timeout(1000, move || {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            std::thread::spawn(move || child.wait()); // reaped off the loop
+        });
+    }
     CURRENT.with(|c| c.borrow_mut().take());
 }
 
 pub fn toggle_sideview_size() {
     let next = if WIDTH.with(Cell::get) == 400 { 700 } else { 400 };
     WIDTH.with(|w| w.set(next));
-    if HELPER.with(|h| h.borrow().is_some()) {
-        send(&format!("width {next}"));
-    }
+    send(&format!("width {next}"));
 }
 
 /// Mirrors dark/light mode into the night light temperature (and the web views).
@@ -128,9 +148,7 @@ fn apply_color_scheme(dark: bool) {
         m.set_auto_start(false);
         bus.send(m);
     }
-    if HELPER.with(|h| h.borrow().is_some()) {
-        send(&format!("dark {dark}"));
-    }
+    send(&format!("dark {dark}"));
 }
 
 fn read_scheme() {

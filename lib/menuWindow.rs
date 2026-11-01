@@ -23,10 +23,6 @@ pub const MENU_WIDTH: f32 = 500.0;
 /// Spacing unit inside the cards; also the wallpaper's inner padding.
 pub const GAP: f32 = SPACE_L;
 
-thread_local! {
-    static DRAG: Cell<Option<&'static str>> = const { Cell::new(None) };
-}
-
 /// Wallpaper-backed part, and what goes under it.
 fn content(base: &Style, name: &str, focus: Option<&str>) -> (Node, Option<Node>) {
     let menu = match name {
@@ -149,24 +145,25 @@ pub fn menu_window() -> Rc<Win> {
     });
 
     let ww = Rc::downgrade(&w);
+    // the slider being dragged
+    let drag: Cell<Option<&'static str>> = Cell::new(None);
     w.on_pointer(move |ev, _| {
         let Some(w) = ww.upgrade() else { return };
-        let inside = |id: &str, x: f64, y: f64| w.rect_of(id).is_some_and(|r| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom());
-        let hit = |x: f64, y: f64| {
-            ["volume", "brightness"].into_iter().find_map(|id| w.rect_of(id).filter(|r| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom()).map(|r| (id, r)))
-        };
+        let contains = |r: &tiny_skia::Rect, x: f64, y: f64| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom();
+        let inside = |id: &str, x: f64, y: f64| w.rect_of(id).is_some_and(|r| contains(&r, x, y));
+        let hit = |x: f64, y: f64| ["volume", "brightness"].into_iter().find_map(|id| w.rect_of(id).filter(|r| contains(r, x, y)).map(|r| (id, r)));
         match ev {
             PointerEvent::Button { x, y, pressed: true } => {
                 if inside("mediaBtn", x, y) {
                     mediaPlayer::play_pause();
                 } else if let Some((id, r)) = hit(x, y) {
-                    DRAG.with(|d| d.set(Some(id)));
+                    drag.set(Some(id));
                     set_slider(id, slider_value(r, x as f32));
                 }
             }
-            PointerEvent::Button { pressed: false, .. } | PointerEvent::Leave => DRAG.with(|d| d.set(None)),
+            PointerEvent::Button { pressed: false, .. } | PointerEvent::Leave => drag.set(None),
             PointerEvent::Motion { x, .. } => {
-                if let Some(id) = DRAG.with(Cell::get)
+                if let Some(id) = drag.get()
                     && let Some(r) = w.rect_of(id)
                 {
                     set_slider(id, slider_value(r, x as f32));

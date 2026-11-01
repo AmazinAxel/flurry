@@ -136,6 +136,17 @@ pub fn input_control(name: &'static str, build: impl Fn(&View) -> Node + 'static
         }
     });
 
+    // typed text (a password, say) doesn't outlive the dialog
+    let o = opts.clone();
+    let weak = Rc::downgrade(&win);
+    win.visibility.subscribe(move || {
+        if weak.upgrade().is_some_and(|w| !w.visible()) {
+            for b in o.entries.iter().filter(|b| Some(b.id) == o.focus) {
+                b.entry.borrow_mut().set_text("");
+            }
+        }
+    });
+
     let o = opts.clone();
     let weak = Rc::downgrade(&win);
     win.on_key(move |ev| {
@@ -145,9 +156,14 @@ pub fn input_control(name: &'static str, build: impl Fn(&View) -> Node + 'static
             return true;
         }
         let lower = ev.lower();
-        let action = o.actions.iter().find(|(k, _)| *k == lower).map(|(_, a)| a.clone()).or_else(|| {
-            ev.ctrl.then(|| o.ctrl_actions.iter().find(|(k, _)| *k == lower).map(|(_, a)| a.clone())).flatten()
-        });
+        let find = |list: &Actions| list.iter().find(|(k, _)| *k == lower).map(|(_, a)| a.clone());
+        let action = if ev.alt {
+            None
+        } else if ev.ctrl {
+            find(&o.ctrl_actions)
+        } else {
+            find(&o.actions)
+        };
         if let Some(a) = action {
             a();
             w.redraw();

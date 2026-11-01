@@ -30,7 +30,10 @@ pub struct Entry {
 pub type EntryRef = Rc<RefCell<Entry>>;
 
 pub fn new(placeholder: &str) -> EntryRef {
-    Rc::new(RefCell::new(Entry { placeholder: placeholder.into(), invisible_char: Some('●'), ..Default::default() }))
+    let mut e = Entry::default();
+    e.placeholder = placeholder.into();
+    e.invisible_char = Some('●');
+    Rc::new(RefCell::new(e))
 }
 
 fn prev_char(s: &str, i: usize) -> usize {
@@ -60,18 +63,42 @@ fn next_word(s: &str, i: usize) -> usize {
     j
 }
 
-/// Zeroes a secret before its memory is freed; empties the string.
+/// Zeroes a secret's whole buffer (spare capacity holds deleted bytes too); empties the string.
 pub fn wipe(s: &mut String) {
-    for b in unsafe { s.as_bytes_mut() } {
-        unsafe { std::ptr::write_volatile(b, 0) };
+    let v = unsafe { s.as_mut_vec() };
+    let p = v.as_mut_ptr();
+    for i in 0..v.capacity() {
+        unsafe { std::ptr::write_volatile(p.add(i), 0) };
     }
-    s.clear();
+    v.clear();
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        if self.password {
+            wipe(&mut self.text);
+        }
+    }
 }
 
 impl Entry {
+    /// Room for `extra` more bytes; a password grows into a fresh buffer and the old one is wiped
+    /// (a plain realloc would free it with the secret still in it).
+    fn reserve(&mut self, extra: usize) {
+        let need = self.text.len() + extra;
+        if !self.password || need <= self.text.capacity() {
+            return;
+        }
+        let mut grown = String::with_capacity(need.max(self.text.capacity() * 2).max(64));
+        grown.push_str(&self.text);
+        wipe(&mut self.text);
+        self.text = grown;
+    }
+
     pub fn set_text(&mut self, t: &str) {
         if self.password {
             wipe(&mut self.text); // and keep the buffer: no reallocation copies while typing
+            self.reserve(t.len());
             self.text.push_str(t);
         } else {
             self.text = t.into();
@@ -109,9 +136,13 @@ impl Entry {
             let room = max.saturating_sub(self.text.chars().count());
             s = s.chars().take(room).collect();
         }
+        self.reserve(s.len());
         self.text.insert_str(self.cursor, &s);
         self.cursor += s.len();
         self.anchor = self.cursor;
+        if self.password {
+            wipe(&mut s);
+        }
         self.changed();
     }
 
@@ -151,11 +182,13 @@ impl Entry {
                 Keysym::v => {
                     drop(e);
                     let weak = Rc::downgrade(this);
-                    wayland::paste(move |s| {
+                    wayland::paste(move |mut s| {
                         if let Some(e) = weak.upgrade() {
-                            let line = s.lines().next().unwrap_or("").to_string();
-                            e.borrow_mut().insert(&line);
+                            e.borrow_mut().insert(s.lines().next().unwrap_or(""));
+                            // it lands after the key's redraw
+                            wayland::redraw_focused();
                         }
+                        wipe(&mut s);
                     });
                     return true;
                 }
@@ -164,14 +197,18 @@ impl Entry {
         }
         match sym {
             Keysym::BackSpace => {
-                if !e.delete_selection() && e.cursor > 0 {
+                let mut removed = e.delete_selection();
+                if !removed && e.cursor > 0 {
                     let to = if ev.ctrl { prev_word(&e.text, e.cursor) } else { prev_char(&e.text, e.cursor) };
                     let c = e.cursor;
                     e.text.replace_range(to..c, "");
                     e.cursor = to;
                     e.anchor = to;
+                    removed = true;
                 }
-                e.changed();
+                if removed {
+                    e.changed();
+                }
                 true
             }
             Keysym::Left => {
@@ -235,7 +272,10 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
     let key = {
         let e = this.borrow();
         let colors = [look.color, look.placeholder, look.selection_bg, look.selection_fg].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits));
-        Some(super::node::hash(&(&e.text, e.cursor, e.anchor, e.password, e.invisible_char, &e.placeholder, e.scroll.to_bits(), look.caret, colors)))
+        // what's displayed, never a secret: a password is keyed by its length only
+        let text = (!e.password).then_some(e.text.as_str());
+        let len = if e.password { e.text.chars().count() } else { 0 };
+        Some(super::node::hash(&(text, len, e.cursor, e.anchor, e.password, e.invisible_char, &e.placeholder, e.scroll.to_bits(), look.caret, colors)))
     };
     let this = this.clone();
     let font = style.font.clone();
@@ -244,7 +284,7 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
     let paint = Rc::new(move |pm: &mut PixmapMut, r: Rect, ts: Transform| {
         let mut e = this.borrow_mut();
         let shown = e.display();
-        let (text_s, color) = if shown.is_empty() { (e.placeholder.clone(), look.placeholder) } else { (shown.clone(), look.color) };
+        let (text_s, color) = if e.text.is_empty() { (e.placeholder.clone(), look.placeholder) } else { (shown.clone(), look.color) };
         let layout = text::layout(&text_s, &font, None, Wrap::None, false);
         let x_at = |byte: usize| text::layout(&shown[..byte.min(shown.len())], &font, None, Wrap::None, false).width();
         let caret_x = x_at(e.display_index(e.cursor));
@@ -322,7 +362,8 @@ mod tests {
 
     #[test]
     fn insert_respects_max_len_and_selection() {
-        let mut e = Entry { max_len: Some(5), ..Default::default() };
+        let mut e = Entry::default();
+        e.max_len = Some(5);
         e.insert("abcdefg");
         assert_eq!(e.text, "abcde");
         e.anchor = 1;
@@ -330,5 +371,21 @@ mod tests {
         e.insert("X");
         assert_eq!(e.text, "aXde");
         assert_eq!(e.cursor, 2);
+    }
+
+    #[test]
+    fn password_growth_keeps_text() {
+        let mut e = Entry::default();
+        e.password = true;
+        for _ in 0..100 {
+            e.insert("ab");
+        }
+        assert_eq!(e.text.len(), 200);
+        assert!(e.text.bytes().all(|b| b == b'a' || b == b'b'));
+        let mut s = String::from("secret");
+        s.truncate(2);
+        wipe(&mut s);
+        let v = unsafe { s.as_mut_vec() };
+        assert!(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.capacity()) }.iter().all(|&b| b == 0));
     }
 }

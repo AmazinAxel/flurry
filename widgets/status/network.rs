@@ -7,21 +7,25 @@ use std::collections::BTreeMap;
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::menuState::{current, focus_menu};
-use crate::lib::dbus::{prop_bool, prop_str};
-use crate::lib::deviceMenu::{DeviceMenu, aside_row, device_menu};
+use crate::lib::dbus::{Path, prop_str};
+use crate::lib::deviceMenu::{DeviceMenu, FocusMemory, Trailing, aside_row, device_menu, device_row};
 use crate::lib::iwd::{self, DEVICE, NETWORK, STATION};
-use crate::lib::process::exec;
 use crate::lib::searchDialog::plain_entry;
 use crate::lib::state::State;
-use crate::lib::style::{SPACE_M, SPACE_S};
+use crate::lib::style::SPACE_S;
 use crate::lib::streamingMode::streaming_mode;
 use crate::ui::entry::{self, Entry, EntryRef};
 use crate::ui::node::{Align, Node, Sides, Style};
 use crate::ui::runtime;
 use crate::ui::wayland::KeyEvent;
 
-const STATION_NAME: &str = "wlan0";
-const LEVELS: [&str; 5] = ["none", "weak", "ok", "good", "excellent"];
+const LEVEL_ICONS: [&str; 5] = [
+    "network-wireless-signal-none-symbolic",
+    "network-wireless-signal-weak-symbolic",
+    "network-wireless-signal-ok-symbolic",
+    "network-wireless-signal-good-symbolic",
+    "network-wireless-signal-excellent-symbolic",
+];
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct WifiNet {
@@ -36,14 +40,10 @@ thread_local! {
     static NETS: State<BTreeMap<String, WifiNet>> = State::new(BTreeMap::new());
     static CONNECTED: State<String> = State::new(String::new());
     static CONNECTING: State<String> = State::new(String::new());
-    static SCANNING: State<bool> = State::new(false);
-    static WIFI_ON: State<bool> = State::new(true);
-    static STATION_PATH: RefCell<String> = const { RefCell::new(String::new()) };
-    static DEVICE_PATH: RefCell<String> = const { RefCell::new(String::new()) };
     static PENDING: RefCell<String> = const { RefCell::new(String::new()) };
     static SHOW_ALL: Cell<bool> = const { Cell::new(false) };
     static GEN: Cell<u32> = const { Cell::new(0) };
-    static FOCUSED_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
+    static FOCUSED: FocusMemory = const { FocusMemory::new("wifi:") };
     /// network path with the open password entry
     static PASSWORD: RefCell<Option<(String, EntryRef)>> = const { RefCell::new(None) };
 }
@@ -53,8 +53,8 @@ pub fn watch(w: &std::rc::Rc<crate::ui::window::Win>) {
     w.watch(&nets());
     w.watch(&connected());
     w.watch(&connecting());
-    w.watch(&scanning());
-    w.watch(&wifi_on());
+    w.watch(&iwd::scanning());
+    w.watch(&iwd::powered());
     w.watch(&streaming_mode());
 }
 
@@ -70,39 +70,22 @@ fn connected() -> State<String> {
 fn connecting() -> State<String> {
     CONNECTING.with(Clone::clone)
 }
-fn scanning() -> State<bool> {
-    SCANNING.with(Clone::clone)
-}
-fn wifi_on() -> State<bool> {
-    WIFI_ON.with(Clone::clone)
-}
 
 /// Signal is in 100*dBm units from iwd
 pub fn sig_level(mbm: i64) -> usize {
-    let dbm = mbm as f64 / 100.0;
-    if dbm >= -50.0 {
-        4
-    } else if dbm >= -65.0 {
-        3
-    } else if dbm >= -75.0 {
-        2
-    } else if dbm >= -85.0 {
-        1
-    } else {
-        0
-    }
+    [-5000, -6500, -7500, -8500].iter().position(|t| mbm >= *t).map_or(0, |i| 4 - i)
 }
 
 fn row_id(path: &str) -> String {
-    format!("wifi:{path}")
+    FOCUSED.with(|f| f.row_id(path))
 }
 
 pub fn focus_target() -> Option<String> {
-    if !wifi_on().peek() {
+    if !iwd::powered().peek() {
         return Some("power".into());
     }
     let list = paths().peek();
-    for p in [FOCUSED_PATH.with(|f| f.borrow().clone()), Some(connected().peek())].into_iter().flatten() {
+    for p in [FOCUSED.with(FocusMemory::last), Some(connected().peek())].into_iter().flatten() {
         if list.contains(&p) {
             return Some(row_id(&p));
         }
@@ -141,31 +124,20 @@ pub async fn refresh() {
         g.set(g.get() + 1);
         g.get()
     });
-    let Ok(objects) = iwd::objects().await else { return };
-    for (path, ifaces) in &objects {
-        if ifaces.get(DEVICE).and_then(|p| prop_str(p, "Name")).as_deref() == Some(STATION_NAME) {
-            DEVICE_PATH.with(|d| *d.borrow_mut() = path.to_string());
-            if ifaces.contains_key(STATION) {
-                STATION_PATH.with(|s| *s.borrow_mut() = path.to_string());
-            }
-        }
-    }
+    let Some(objects) = iwd::refresh().await else { return };
     if generation != GEN.with(Cell::get) {
         return;
     }
-    let device = DEVICE_PATH.with(|d| d.borrow().clone());
-    let station = STATION_PATH.with(|s| s.borrow().clone());
-    let powered = objects.iter().find(|(p, _)| p.to_string() == device).and_then(|(_, i)| i.get(DEVICE)).and_then(|p| prop_bool(p, "Powered")) != Some(false);
-    wifi_on().set(powered);
-    if !powered || station.is_empty() {
+    let station = iwd::station();
+    if !iwd::powered().peek() || station.is_empty() {
         return clear();
     }
     let Ok(reply) = iwd::call(&station, STATION, "GetOrderedNetworks", |m| m).await else { return };
-    let Ok(ordered) = reply.read1::<Vec<(crate::lib::dbus::Path<'static>, i16)>>() else { return };
+    let Ok(ordered) = reply.read1::<Vec<(Path<'static>, i16)>>() else { return };
     if generation != GEN.with(Cell::get) || PASSWORD.with(|p| p.borrow().is_some()) {
         return;
     }
-    let st = objects.iter().find(|(p, _)| p.to_string() == station).and_then(|(_, i)| i.get(STATION));
+    let st = objects.get(&Path::from(station)).and_then(|i| i.get(STATION));
     let current_net = st.and_then(|p| p.get("ConnectedNetwork")).and_then(|v| v.0.as_str()).unwrap_or("").to_string();
     let joining = st.and_then(|p| prop_str(p, "State")).as_deref() == Some("connecting");
     let pending = PENDING.with(|p| p.borrow().clone());
@@ -176,9 +148,9 @@ pub async fn refresh() {
     let mut next = BTreeMap::new();
     let mut order = vec![];
     for (path, mbm) in ordered {
-        let path = path.to_string();
-        let Some(p) = objects.iter().find(|(x, _)| x.to_string() == path).and_then(|(_, i)| i.get(NETWORK)) else { continue };
+        let Some(p) = objects.get(&path).and_then(|i| i.get(NETWORK)) else { continue };
         let Some(name) = prop_str(p, "Name") else { continue };
+        let path = path.to_string();
         let kn = p.get("KnownNetwork").and_then(|v| v.0.as_str()).unwrap_or("");
         let known = !kn.is_empty() && kn != "/";
         if !known && !show_all && path != current_net && path != pending {
@@ -205,16 +177,13 @@ pub async fn refresh() {
 }
 
 async fn toggle_wifi() {
-    if DEVICE_PATH.with(|d| d.borrow().is_empty()) {
-        refresh().await;
-    }
-    let next = !wifi_on().peek();
-    let device = DEVICE_PATH.with(|d| d.borrow().clone());
+    let Some(device) = iwd::device().await else { return };
+    let next = !iwd::powered().peek();
     let Some(bus) = crate::lib::dbus::system() else { return };
     if bus.call(crate::lib::dbus::set_prop(iwd::IWD, &device, DEVICE, "Powered", next)).await.is_err() {
         return;
     }
-    wifi_on().set(next);
+    iwd::powered().set(next);
     if !next {
         clear();
     } else {
@@ -223,20 +192,18 @@ async fn toggle_wifi() {
 }
 
 async fn scan() {
-    if scanning().peek() {
+    let scanning = iwd::scanning();
+    let station = iwd::station();
+    if scanning.peek() || station.is_empty() {
         return;
     }
-    scanning().set(true);
+    scanning.set(true);
     SHOW_ALL.with(|s| s.set(true));
     queue_refresh();
-    if STATION_PATH.with(|s| s.borrow().is_empty()) {
-        refresh().await;
-    }
-    let station = STATION_PATH.with(|s| s.borrow().clone());
     if let Err(e) = iwd::call(&station, STATION, "Scan", |m| m).await
         && !e.contains("Operation already in progress")
     {
-        scanning().set(false);
+        scanning.set(false);
     }
 }
 
@@ -254,13 +221,8 @@ fn join(path: &str, attempt: impl std::future::Future<Output = ()> + 'static) {
 }
 
 pub fn start() {
-    iwd::on_properties_changed(|path, iface, changed| {
-        if iface == STATION && STATION_PATH.with(|s| *s.borrow() == path) && prop_bool(changed, "Scanning") == Some(false) {
-            scanning().set(false);
-        }
-        queue_refresh();
-    });
-    iwd::on_objects_changed(queue_refresh);
+    iwd::start();
+    iwd::on_change(queue_refresh);
     current().subscribe(|| {
         if current().peek() != Some("wifi") {
             SHOW_ALL.with(|s| s.set(false));
@@ -276,26 +238,17 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
     if streaming_mode().peek() {
         return Node::label(base.inherit(), "Streaming mode enabled").align(Align::Center, Align::Fill).expand(true, false);
     }
-    let on = wifi_on().peek();
+    let on = iwd::powered().peek();
     let list = paths().peek();
     let map = nets().peek();
     let (conn, joining) = (connected().peek(), connecting().peek());
     let pw = PASSWORD.with(|p| p.borrow().clone());
     let mut rows = vec![];
-    for path in &list {
-        let net = map.get(path).cloned().unwrap_or(WifiNet { ssid: String::new(), security: "open".into(), level: 0, known: false });
+    for (path, net) in list.iter().filter_map(|p| Some((p, map.get(p)?))) {
         let id = row_id(path);
         let s = aside_row(base, *path == conn && *path != joining, *path == joining, focus == Some(id.as_str()));
-        let icon = crate::widgets::status::modules::statusIcons::leak(&format!("network-wireless-signal-{}-symbolic", LEVELS[net.level]));
-        rows.push(
-            Node::hbox(s.clone(), 0.0, vec![Node::hbox(s.inherit(), SPACE_M, vec![
-                Node::icon(s.inherit(), icon, 16.0),
-                Node::label(s.inherit(), net.ssid.clone()).xalign(0.0).expand(true, false).ellipsize(),
-                Node::icon(s.inherit(), "network-wireless-encrypted-symbolic", 16.0).show(net.security != "open"),
-            ])
-            .expand(true, false)])
-            .focusable(id),
-        );
+        let lock = if net.security != "open" { Trailing::Icon("network-wireless-encrypted-symbolic") } else { Trailing::None };
+        rows.push(device_row(s, id, LEVEL_ICONS[net.level.min(4)], net.ssid.clone(), lock));
         if let Some((p, e)) = &pw
             && p == path
         {
@@ -305,14 +258,11 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
         }
     }
     let icon = if on { "network-wireless-symbolic" } else { "network-wireless-offline-symbolic" };
-    let scanning = scanning().peek();
-    device_menu(DeviceMenu { base, powered: on, power_icon: icon, scanning, empty: list.is_empty(), focus, rows })
+    device_menu(DeviceMenu { base, powered: on, power_icon: icon, scanning: iwd::scanning().peek(), empty: list.is_empty(), focus, rows })
 }
 
 pub fn on_focus(id: &str) {
-    if let Some(p) = id.strip_prefix("wifi:") {
-        FOCUSED_PATH.with(|f| *f.borrow_mut() = Some(p.to_string()));
-    }
+    FOCUSED.with(|f| f.on_focus(id));
 }
 
 fn close_password() {
@@ -322,16 +272,18 @@ fn close_password() {
 
 fn submit(path: &str) {
     let Some((_, e)) = PASSWORD.with(|p| p.borrow().clone()) else { return };
-    let pw = e.borrow().text.clone();
-    let ssid = nets().with(|m| m.get(path).map(|n| n.ssid.clone())).unwrap_or_default();
+    if e.borrow().text.is_empty() {
+        return;
+    }
+    // moved out, not copied: iwd::connect wipes it once the agent has handed it over
+    let pw = {
+        let mut e = e.borrow_mut();
+        (e.cursor, e.anchor) = (0, 0);
+        std::mem::take(&mut e.text)
+    };
     close_password();
-    join(path, async move {
-        let _ = if pw.is_empty() {
-            exec(&["iwctl", "station", STATION_NAME, "connect", &ssid]).await
-        } else {
-            exec(&["iwctl", "--passphrase", &pw, "station", STATION_NAME, "connect", &ssid]).await
-        };
-    });
+    let p = path.to_string();
+    join(path, async move { iwd::connect(&p, Some(pw)).await });
 }
 
 /// Enter on a focused item; returns the id to focus next, if any.
@@ -351,7 +303,10 @@ pub fn activate(id: &str) -> Option<Option<String>> {
             }
             let net = nets().with(|m| m.get(&path).cloned())?;
             if connected().peek() == path {
-                let station = STATION_PATH.with(|s| s.borrow().clone());
+                let station = iwd::station();
+                if station.is_empty() {
+                    return Some(None);
+                }
                 runtime::spawn(async move {
                     let _ = iwd::call(&station, STATION, "Disconnect", |m| m).await;
                     refresh().await;
@@ -367,9 +322,7 @@ pub fn activate(id: &str) -> Option<Option<String>> {
                 return Some(Some("wifi-password".into()));
             } else {
                 let p = path.clone();
-                join(&path, async move {
-                    let _ = iwd::call(&p, NETWORK, "Connect", |m| m).await;
-                });
+                join(&path, async move { iwd::connect(&p, None).await });
             }
         }
     }
@@ -393,4 +346,15 @@ pub fn key(id: &str, ev: &KeyEvent) -> bool {
     Entry::key(&e, ev)
 }
 
-
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn signal_levels() {
+        assert_eq!(super::sig_level(-4000), 4);
+        assert_eq!(super::sig_level(-5000), 4);
+        assert_eq!(super::sig_level(-6000), 3);
+        assert_eq!(super::sig_level(-7500), 2);
+        assert_eq!(super::sig_level(-8000), 1);
+        assert_eq!(super::sig_level(-9000), 0);
+    }
+}

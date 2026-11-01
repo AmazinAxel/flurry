@@ -6,12 +6,17 @@ use crate::lib::state::State;
 use crate::ui::runtime::{self, Timer};
 
 thread_local! {
-    pub static NOW: State<i64> = State::new(now_secs());
+    static NOW: State<i64> = State::new(now_secs() as i64);
     static TICK: RefCell<Option<Timer>> = const { RefCell::new(None) };
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+/// Wall clock, unix seconds.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+unsafe extern "C" {
+    fn tzset();
 }
 
 pub fn now() -> State<i64> {
@@ -24,6 +29,8 @@ pub fn update() {
             t.cancel();
         }
     });
+    // pick up timezone changes (travel, DST rules) on every tick and wake-up
+    unsafe { tzset() };
     let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     now().set(d.as_secs() as i64);
     let ms = (60 - d.as_secs() % 60) * 1000 - d.subsec_millis() as u64;
@@ -47,10 +54,6 @@ pub fn format_now(fmt: &str) -> String {
 }
 
 pub fn start() {
-    unsafe extern "C" {
-        fn tzset();
-    }
-    unsafe { tzset() };
     update();
     let sleeping = crate::lib::logind::sleeping();
     let s = sleeping.clone();

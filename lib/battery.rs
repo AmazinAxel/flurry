@@ -53,6 +53,7 @@ pub fn start() {
     let Some(bus) = dbus::system() else { return };
     bus.subscribe(
         SignalFilter {
+            sender: Some(DEST.into()),
             path: Some(PATH.into()),
             interface: Some("org.freedesktop.DBus.Properties".into()),
             member: Some("PropertiesChanged".into()),

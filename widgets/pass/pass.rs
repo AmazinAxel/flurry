@@ -51,16 +51,16 @@ fn copy_pair(name: &str) {
     window::set_visible("pass", false);
     let name = name.to_string();
     runtime::spawn(async move {
-        let out = exec(&["pass", "show", &name]).await.unwrap_or_default();
+        let mut out = exec(&["pass", "show", &name]).await.unwrap_or_default();
         let mut lines = out.split('\n');
-        let password = lines.next().unwrap_or("").to_string();
+        let password = lines.next().unwrap_or("");
         let login = lines.next().unwrap_or("");
-        if password.is_empty() {
-            return;
+        if !password.is_empty() {
+            let stripped = strip_login(login);
+            let user = if stripped.is_empty() { name.rsplit('/').next().unwrap_or("").to_string() } else { stripped };
+            copy_login(&user, password);
         }
-        let stripped = strip_login(login);
-        let user = if stripped.is_empty() { name.rsplit('/').next().unwrap_or("").to_string() } else { stripped };
-        copy_login(&user, &password).await;
+        crate::ui::entry::wipe(&mut out);
     });
 }
 
@@ -79,8 +79,7 @@ pub fn strip_login(line: &str) -> String {
 }
 
 pub fn pass() {
-    load_entries();
-    search_dialog("pass", SearchSpec {
+    let w = search_dialog("pass", SearchSpec {
         search: Box::new(search),
         activate: Rc::new(|n: &String| copy_pair(n)),
         shift_activate: None,
@@ -92,6 +91,13 @@ pub fn pass() {
         }),
         sensitive: None,
         on_show: Some(Rc::new(load_entries)),
+    });
+    // the store's names don't stay in memory while hidden
+    let v = w.visibility.clone();
+    w.visibility.subscribe(move || {
+        if !v.peek() {
+            ENTRIES.with(|e| *e.borrow_mut() = Vec::new());
+        }
     });
 }
 

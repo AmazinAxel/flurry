@@ -5,7 +5,6 @@ use std::cell::Cell;
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::style::*;
-use crate::lib::time::format;
 use crate::ui::node::{Align, Background, Node, Sides, Style, rgba};
 use crate::ui::wayland::KeyEvent;
 
@@ -43,10 +42,10 @@ fn weekday(day: i64) -> i64 {
 
 /// Today as a day number (local).
 fn today() -> i64 {
-    let ymd = format(crate::lib::time::now().peek(), "%Y %m %d");
-    let mut it = ymd.split(' ').map(|v| v.parse().unwrap_or(1));
-    let (y, m, d) = (it.next().unwrap_or(1970), it.next().unwrap_or(1), it.next().unwrap_or(1));
-    days_from_civil(y, m, d)
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = crate::lib::time::now().peek() as libc::time_t;
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    days_from_civil(tm.tm_year as i64 + 1900, tm.tm_mon as i64 + 1, tm.tm_mday as i64)
 }
 
 /// Back to the current month when the calendar menu opens.
@@ -66,9 +65,15 @@ pub fn key(ev: &KeyEvent) -> bool {
     true
 }
 
-/// strftime on a day number (noon, so DST never shifts the date).
+/// strftime on a day number, in UTC so no offset shifts the date.
 fn day_format(day: i64, fmt: &str) -> String {
-    format(day * 86400 + 43200, fmt)
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = (day * 86400) as libc::time_t;
+    unsafe { libc::gmtime_r(&t, &mut tm) };
+    let cfmt = std::ffi::CString::new(fmt).unwrap_or_default();
+    let mut buf = [0u8; 64];
+    let n = unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), cfmt.as_ptr(), &tm) };
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 /// Seven equal-width cells.
@@ -137,5 +142,8 @@ mod tests {
         assert_eq!(civil_from_days(d), (2026, 10, 27));
         assert_eq!(weekday(d), 2); // Tuesday
         assert_eq!(weekday(0), 4); // 1970-01-01 was a Thursday
+        // C locale in tests: the header names follow the day number whatever the time zone
+        assert_eq!(day_format(d, "%a"), "Tue");
+        assert_eq!(day_format(days_from_civil(2026, 1, 1), "%B %Y"), "January 2026");
     }
 }

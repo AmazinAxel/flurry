@@ -1,6 +1,6 @@
-// Backlight via sysfs + kernel uevents (no udev), set through logind (lib/brightness.tsx).
+// Backlight via sysfs (no udev), set through logind.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 
 use crate::lib::state::State;
 use crate::ui::runtime;
@@ -8,10 +8,16 @@ use crate::ui::runtime;
 const DIR: &str = "/sys/class/backlight";
 
 thread_local! {
+    /// raw (direct panel control) > platform > firmware, like the kernel's own preference; then by name
     static SCREEN: String = {
-        let mut names: Vec<String> = std::fs::read_dir(DIR).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-        names.sort();
-        names.into_iter().next().unwrap_or_default()
+        let rank = |n: &str| match std::fs::read_to_string(format!("{DIR}/{n}/type")).as_deref().map(str::trim) {
+            Ok("raw") => 0,
+            Ok("platform") => 1,
+            Ok("firmware") => 2,
+            _ => 3,
+        };
+        let names = std::fs::read_dir(DIR).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>()).unwrap_or_default();
+        names.into_iter().min_by_key(|n| (rank(n), n.clone())).unwrap_or_default()
     };
     static MAX: u32 = read(&format!("{DIR}/{}/max_brightness", screen()));
     static BRIGHTNESS: State<f64> = State::new(read(&path()) as f64 / max().max(1) as f64);
@@ -49,38 +55,19 @@ pub fn set_brightness(percent: f64) {
     crate::lib::logind::set_brightness(&screen(), steps);
 }
 
-/// Listens for kernel backlight uevents (what GUdev did), only reacting to external changes.
+/// The backlight core sysfs_notify()s actual_brightness on every change (keys, logind, other tools),
+/// so this wakes only for brightness changes, not for every kernel uevent.
 pub fn monitor() {
-    if !available() {
-        return;
-    }
-    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, libc::NETLINK_KOBJECT_UEVENT) };
-    if fd < 0 {
-        return;
-    }
-    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as u16;
-    addr.nl_groups = 1;
-    if unsafe { libc::bind(fd, (&raw const addr).cast(), std::mem::size_of::<libc::sockaddr_nl>() as u32) } < 0 {
-        return;
-    }
-    // devpath is wherever the driver hangs it (amdgpu: .../card1-eDP-1/amdgpu_bl1), so match name + subsystem
-    let tail = format!("/{}", screen());
-    runtime::watch(sock.as_raw_fd(), move || {
-        let _keep = &sock;
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
-            if n <= 0 {
-                return;
-            }
-            let msg = String::from_utf8_lossy(&buf[..n as usize]);
-            let header = msg.split('\0').next().unwrap_or("");
-            if header.ends_with(&tail) && msg.split('\0').any(|f| f == "SUBSYSTEM=backlight") {
-                let v = read(&path()) as f64 / max() as f64;
-                brightness().set(v);
-            }
-        }
+    let Ok(file) = std::fs::File::open(format!("{DIR}/{}/actual_brightness", screen())) else { return };
+    // reading re-arms the notification
+    let rearm = move || {
+        let mut b = [0u8; 16];
+        unsafe { libc::pread(file.as_raw_fd(), b.as_mut_ptr().cast(), b.len(), 0) };
+        file.as_raw_fd()
+    };
+    let fd = rearm();
+    runtime::watch_pri(fd, move || {
+        rearm();
+        brightness().set(read(&path()) as f64 / max().max(1) as f64);
     });
 }

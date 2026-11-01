@@ -30,12 +30,17 @@ pub fn app_dirs() -> Vec<PathBuf> {
     data_dirs().into_iter().map(|d| d.join("applications")).filter(|d| d.is_dir()).collect()
 }
 
-fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, seen: &mut HashSet<PathBuf>) {
+    // symlinked dirs are followed once each: a link loop ends here
+    if !std::fs::canonicalize(dir).is_ok_and(|c| seen.insert(c)) {
+        return;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            walk(base, &p, out);
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir() || (t.is_symlink() && p.is_dir()));
+        if is_dir {
+            walk(base, &p, out, seen);
         } else if p.extension().is_some_and(|x| x == "desktop") {
             let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().replace('/', "-");
             out.push((rel, p));
@@ -109,7 +114,7 @@ fn scan() -> Vec<App> {
     let mut apps = vec![];
     for dir in app_dirs() {
         let mut files = vec![];
-        walk(&dir, &dir, &mut files);
+        walk(&dir, &dir, &mut files, &mut HashSet::new());
         for (id, path) in files {
             if !seen.insert(id.clone()) {
                 continue; // earlier dirs shadow later ones
@@ -187,18 +192,118 @@ fn score(term: &str, a: &App) -> f64 {
     fuzzy(term, &a.name) as f64 * 2.0 + fuzzy(term, &a.executable) as f64 * 0.5 + kw as f64 * 0.5
 }
 
-pub fn fuzzy_query(term: &str) -> Vec<App> {
-    let mut arr = APPS.with(|a| a.borrow().clone());
-    if term.is_empty() {
-        return arr;
+/// The best `limit` matches, best first.
+pub fn fuzzy_query(term: &str, limit: usize) -> Vec<App> {
+    APPS.with(|a| {
+        let apps = a.borrow();
+        if term.is_empty() {
+            return apps.iter().take(limit).cloned().collect();
+        }
+        let min = if term.chars().count() == 1 { f64::MIN_POSITIVE } else { 0.5 };
+        let mut hits: Vec<(f64, &App)> = apps.iter().map(|a| (score(term, a), a)).filter(|(s, _)| *s >= min).collect();
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0)); // stable: ties keep scan order
+        hits.into_iter().take(limit).map(|(_, a)| a.clone()).collect()
+    })
+}
+
+/// Desktop-entry Exec line -> argv: string escapes (`\s`, `\\`...), double-quoted args, `%%` -> `%`,
+/// field codes (`%U`, `%f`...) dropped.
+pub fn exec_argv(exec: &str) -> Vec<String> {
+    let mut unescaped = String::with_capacity(exec.len());
+    let mut chars = exec.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            unescaped.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('s') => unescaped.push(' '),
+            Some('n') => unescaped.push('\n'),
+            Some('t') => unescaped.push('\t'),
+            Some('r') => unescaped.push('\r'),
+            Some('\\') => unescaped.push('\\'), // `\\"` in the file is the Exec-level `\"`
+            Some(o) => {
+                unescaped.push('\\');
+                unescaped.push(o);
+            }
+            None => {}
+        }
     }
-    if term.chars().count() == 1 {
-        arr.retain(|a| score(term, a) != 0.0);
-        return arr;
+    let mut argv = vec![];
+    let mut cur = String::new();
+    let (mut has, mut quoted) = (false, false);
+    let mut chars = unescaped.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has = true;
+            }
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    has = true;
+                }
+            }
+            '%' => match chars.next() {
+                Some('%') => {
+                    cur.push('%');
+                    has = true;
+                }
+                Some(n) if n.is_ascii_alphabetic() => {}
+                Some(n) => {
+                    cur.push('%');
+                    cur.push(n);
+                    has = true;
+                }
+                None => {
+                    cur.push('%');
+                    has = true;
+                }
+            },
+            c if c.is_whitespace() && !quoted => {
+                if has {
+                    argv.push(std::mem::take(&mut cur));
+                }
+                has = false;
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
     }
-    arr.retain(|a| score(term, a) >= 0.5);
-    arr.sort_by(|a, b| score(term, b).total_cmp(&score(term, a)));
-    arr
+    if has {
+        argv.push(cur);
+    }
+    argv
+}
+
+/// `argv` as one `sh -c` line that sway's command parser passes through untouched: double quotes
+/// keep `,` `;` and spaces inside one arg for both, and `\\` `"` `$` `` ` `` are backslash-escaped.
+pub fn shell_line(argv: &[String]) -> String {
+    let mut line = String::new();
+    for a in argv {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push('"');
+        for c in a.chars() {
+            if matches!(c, '\\' | '"' | '$' | '`') {
+                line.push('\\');
+            }
+            line.push(c);
+        }
+        line.push('"');
+    }
+    line
+}
+
+/// Starts `argv` as sway's child, outside flurry's systemd cgroup (a shell restart never takes it down).
+pub fn launch(argv: &[String]) {
+    if !argv.is_empty() {
+        crate::lib::sway::command(&format!("exec {}", shell_line(argv)));
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +324,23 @@ mod tests {
         assert!(parse("a.desktop", "[Desktop Entry]\nName=A\nExec=a\nOnlyShowIn=GNOME;\n", &d).is_none());
         let a = parse("a.desktop", "[Desktop Entry]\nName=A\nExec=a %U\nKeywords=x;y;\n[Desktop Action n]\nName=B\n", &d).unwrap();
         assert_eq!((a.name.as_str(), a.keywords.len()), ("A", 2));
+    }
+
+    #[test]
+    fn exec_lines() {
+        let v = |s: &str| exec_argv(s);
+        assert_eq!(v("foot %U --x %f"), ["foot", "--x"]);
+        assert_eq!(v(r#"sh -c "echo \\"a b\\"; echo 100%%" %u"#), ["sh", "-c", r#"echo "a b"; echo 100%"#]);
+        assert_eq!(v(r#""a\sb" c\\\\d"#), ["a b", r"c\d"]);
+        assert_eq!(v(r#"x """#), ["x", ""]);
+        assert_eq!(shell_line(&["a b,c;d".into(), r#"$x"\`"#.into()]), r#""a b,c;d" "\$x\"\\\`""#);
+    }
+
+    #[test]
+    fn single_letter_query_filters() {
+        let app = |n: &str| App { name: n.into(), ..Default::default() };
+        APPS.with(|a| *a.borrow_mut() = vec![app("Zed"), app("Foot"), app("Info")]);
+        let names: Vec<String> = fuzzy_query("f", 5).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["Foot", "Info"]);
     }
 }

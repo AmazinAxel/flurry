@@ -18,6 +18,7 @@ use crate::ui::entry::{self, Entry, EntryRef};
 use crate::ui::node::{Align, Background, Kind, LabelSpec, Node, Sides, Style, alpha, hash, rgba};
 use crate::ui::runtime::{self, Timer};
 use crate::ui::wayland::{self, KeyEvent, Keymode, LockEvent, Surface};
+use wayland_client::protocol::wl_output::WlOutput;
 use crate::ui::window;
 use crate::widgets::status::modules::statusIcons::battery_percent;
 
@@ -38,8 +39,10 @@ thread_local! {
         e.borrow_mut().text.reserve(256); // typing never reallocates, leaving copies behind
         e
     };
-    static SURFACES: RefCell<Vec<(String, Surface)>> = const { RefCell::new(Vec::new()) };
+    static SURFACES: RefCell<Vec<(WlOutput, Surface)>> = const { RefCell::new(Vec::new()) };
     static BUSY: Cell<bool> = const { Cell::new(false) };
+    /// Bumped on every Locked: a password check only counts for the lock it started in.
+    static LOCK_GEN: Cell<u64> = const { Cell::new(0) };
     static FAILURES: Cell<u32> = const { Cell::new(0) };
     static DISPLAY_OFF: Cell<bool> = const { Cell::new(false) };
     static DISPLAY_OFF_ON_LOCK: Cell<bool> = const { Cell::new(false) };
@@ -66,18 +69,44 @@ fn is_locked() -> bool {
     wayland::is_locking() && locked().peek()
 }
 
+/// Marks a held lock in the runtime dir, so a restarted shell locks again.
+fn lock_marker() -> Option<String> {
+    crate::lib::xdg::runtime_dir().map(|d| format!("{d}/flurry/locked"))
+}
+
+pub fn was_locked() -> bool {
+    lock_marker().is_some_and(|m| std::path::Path::new(&m).exists())
+}
+
+fn set_marker(on: bool) {
+    let Some(m) = lock_marker() else { return };
+    if on {
+        if let Some(dir) = std::path::Path::new(&m).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&m, "");
+    } else {
+        let _ = std::fs::remove_file(&m);
+    }
+}
+
 fn check_login() {
-    if BUSY.with(|b| b.replace(true)) {
+    // an empty submit (or Return held down after one) is no attempt
+    if entry().borrow().text.is_empty() || BUSY.with(|b| b.replace(true)) {
         return;
     }
     // moved, not copied: pam wipes it when done
     let password = std::mem::replace(&mut entry().borrow_mut().text, String::with_capacity(256));
     entry().borrow_mut().set_text("");
-    pam::authenticate("flurry-auth", Some(password), |ev| {
+    let generation = LOCK_GEN.with(Cell::get);
+    pam::authenticate("flurry-auth", Some(password), move |ev| {
         let pam::Event::Done(ok) = ev else { return };
+        BUSY.with(|b| b.set(false));
+        if generation != LOCK_GEN.with(Cell::get) || !is_locked() {
+            return;
+        }
         if ok {
             unlock_screen();
-            FAILURES.with(|f| f.set(0));
         } else {
             let n = FAILURES.with(|f| {
                 f.set(f.get() + 1);
@@ -89,7 +118,6 @@ fn check_login() {
                 auth_failed().set(Failed::Password);
             }
         }
-        BUSY.with(|b| b.set(false));
     });
 }
 
@@ -170,7 +198,7 @@ fn assign_lock_window(output: &wayland::Output) {
     let gradient = (rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.5));
     let Some(s) = wayland::lock_surface(&output.wl, Rc::new(build), image, gradient) else { return };
     s.on_key(handle_keys);
-    SURFACES.with(|l| l.borrow_mut().push((output.name.clone(), s)));
+    SURFACES.with(|l| l.borrow_mut().push((output.wl.clone(), s)));
 }
 
 fn redraw() {
@@ -180,6 +208,8 @@ fn redraw() {
 fn on_lock_event(ev: LockEvent) {
     match ev {
         LockEvent::Locked => {
+            LOCK_GEN.with(|g| g.set(g.get() + 1));
+            set_marker(true);
             locked().set(true);
             if sleeping().peek() {
                 release_sleep();
@@ -202,6 +232,7 @@ fn on_lock_event(ev: LockEvent) {
         LockEvent::Finished => {
             // refused (another locker) or ended: never leave a half-locked state behind
             SURFACES.with(|l| l.borrow_mut().clear());
+            set_marker(false);
             if locked().peek() {
                 locked().set(false);
             }
@@ -219,6 +250,12 @@ fn on_lock_event(ev: LockEvent) {
 
 pub fn lock_screen() {
     if !wayland::lock(on_lock_event) {
+        // refused, or already locked: a pending action/display-off must not fire on a later lock.
+        // Still locking: Locked will run them.
+        if !wayland::is_locking() || locked().peek() {
+            DISPLAY_OFF_ON_LOCK.with(|d| d.set(false));
+            AFTER_LOCK.with(|a| a.borrow_mut().take());
+        }
         return;
     }
     for o in wayland::outputs() {
@@ -238,6 +275,8 @@ pub fn lock_then(action: Box<dyn FnOnce()>) {
 
 fn unlock_screen() {
     wayland::unlock();
+    set_marker(false);
+    FAILURES.with(|f| f.set(0));
     SURFACES.with(|l| l.borrow_mut().clear());
     locked().set(false);
     auth_failed().set(Failed::None);
@@ -258,6 +297,8 @@ fn prepare_unlock() {
 struct Fprint {
     mismatches: Cell<u32>,
     running: Cell<bool>,
+    /// this attempt ended on a "Failed to match"
+    mismatched: Cell<bool>,
     flash: RefCell<Option<Timer>>,
 }
 
@@ -271,12 +312,14 @@ impl Fprint {
             return;
         }
         self.running.set(true);
+        self.mismatched.set(false);
         let me = self.clone();
         pam::authenticate("flurry-fprint", None, move |ev| match ev {
             pam::Event::Info => {}
             pam::Event::Error(msg) => {
                 if msg.contains("Failed to match") {
                     me.mismatches.set(me.mismatches.get() + 1);
+                    me.mismatched.set(true);
                 }
                 entry().borrow_mut().set_text("");
                 if let Some(t) = me.flash.borrow_mut().take() {
@@ -300,8 +343,12 @@ impl Fprint {
                     if me.allowed() {
                         unlock_screen();
                     }
-                } else {
+                } else if me.mismatched.get() {
                     me.retry();
+                } else {
+                    // no reader, device busy, ...: back off instead of spinning
+                    let me = me.clone();
+                    let _ = runtime::timeout(2000, move || me.retry());
                 }
             }
         });
@@ -310,7 +357,7 @@ impl Fprint {
 
 pub fn start() {
     if std::path::Path::new("/etc/pam.d/flurry-fprint").exists() {
-        FPRINT.with(|f| *f.borrow_mut() = Some(Rc::new(Fprint { mismatches: Cell::new(0), running: Cell::new(false), flash: RefCell::default() })));
+        FPRINT.with(|f| *f.borrow_mut() = Some(Rc::new(Fprint { mismatches: Cell::new(0), running: Cell::new(false), mismatched: Cell::new(false), flash: RefCell::default() })));
     }
     auth_failed().subscribe(redraw);
     now().subscribe(|| {
@@ -328,8 +375,10 @@ pub fn start() {
         if !wayland::is_locking() {
             return;
         }
+        // removed outputs' surfaces are dead: drop them, so a replugged output gets a fresh one
+        SURFACES.with(|l| l.borrow_mut().retain(|(_, s)| s.alive()));
         for o in wayland::outputs() {
-            if !SURFACES.with(|l| l.borrow().iter().any(|(n, _)| *n == o.name)) {
+            if !SURFACES.with(|l| l.borrow().iter().any(|(w, _)| *w == o.wl)) {
                 assign_lock_window(&o);
             }
         }
@@ -337,6 +386,7 @@ pub fn start() {
 
     const REASON: &str = "Lock screen before sleep";
     inhibit_sleep(REASON);
+    // every PrepareForSleep(true) notifies, even a repeated one: lock now, or let sleep go if locked
     sleeping().subscribe(|| {
         auth_failed().set(Failed::None); // never sleep or wake on a stale red/orange clock
         if !sleeping().peek() {

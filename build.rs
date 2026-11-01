@@ -4,15 +4,6 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
-const NAMES: &[&str] = &[
-    "audio-input-microphone", "microphone-disabled", "bluetooth-active", "dialog-password", "display-brightness",
-    "emblem-default", "media-playback-pause", "media-playback-start", "media-record",
-    "network-wireless-acquiring", "network-wireless-encrypted", "network-wireless-offline", "network-wireless",
-    "notifications-disabled", "view-refresh",
-];
-
-
-
 fn flatten(group: &usvg::Group, opacity: f32, out: &mut String) {
     for node in group.children() {
         match node {
@@ -93,15 +84,16 @@ fn main() {
         .collect();
     // sorted by the full icon name: icons.rs looks them up with a binary search
     found.sort();
-    let missing: Vec<&&str> = NAMES.iter().filter(|n| !found.iter().any(|(f, _)| *f == format!("{n}-symbolic"))).collect();
-    if !missing.is_empty() {
-        println!("cargo:warning=missing icons: {missing:?}");
-    }
 
     let mut out = String::from("pub static ICONS: &[(&str, f32, &[Shape])] = &[\n");
     for (name, file) in &found {
-        let Ok(data) = std::fs::read(file) else { continue };
-        let Ok(tree) = usvg::Tree::from_data(&data, &usvg::Options::default()) else { continue };
+        let tree = match std::fs::read(file).map_err(|e| e.to_string()).and_then(|d| usvg::Tree::from_data(&d, &usvg::Options::default()).map_err(|e| e.to_string())) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("cargo:warning=icon {name} not baked: {e}");
+                continue;
+            }
+        };
         writeln!(out, "    (\"{name}\", {:?}, &[", tree.size().width()).unwrap();
         flatten(tree.root(), 1.0, &mut out);
         out.push_str("    ]),\n");

@@ -38,6 +38,11 @@ impl<T: Clone + PartialEq + 'static> State<T> {
             return;
         }
         *self.0.value.borrow_mut() = value;
+        self.notify();
+    }
+
+    /// Runs subscribers even if the value didn't change.
+    pub fn notify(&self) {
         let subs: Vec<Sub> = self.0.subs.borrow().iter().map(|(_, f)| f.clone()).collect();
         for f in subs {
             f();
@@ -87,6 +92,17 @@ mod tests {
         s.unsubscribe(id);
         s.set(3);
         assert_eq!(n.get(), 1);
+    }
+
+    #[test]
+    fn notify_runs_without_change() {
+        let s = State::new(true);
+        let n = Rc::new(Cell::new(0));
+        let m = n.clone();
+        s.subscribe(move || m.set(m.get() + 1));
+        s.notify();
+        s.notify();
+        assert_eq!(n.get(), 2);
     }
 
     #[test]

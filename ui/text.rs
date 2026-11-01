@@ -1,10 +1,10 @@
-// Text: fontconfig picks the font files (once per family), HarfBuzz shapes and hands out glyph
-// outlines, which tiny-skia fills. Unhinted, grayscale, fractional positioning: the same output GTK4
+// Text: fontconfig picks the font files at build time (settings.rs FONTS), HarfBuzz shapes and
+// hands out glyph outlines, which tiny-skia fills. Unhinted, grayscale, fractional positioning: the same output GTK4
 // gives at scale 2.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::rc::Rc;
 
 use tiny_skia::{Path, PathBuilder};
@@ -66,6 +66,8 @@ mod ffi {
         pub fn hb_blob_destroy(blob: *mut hb_blob);
         pub fn hb_face_create(blob: *mut hb_blob, index: c_uint) -> *mut hb_face;
         pub fn hb_face_get_upem(face: *mut hb_face) -> c_uint;
+        pub fn hb_face_get_glyph_count(face: *mut hb_face) -> c_uint;
+        pub fn hb_face_destroy(face: *mut hb_face);
         pub fn hb_font_create(face: *mut hb_face) -> *mut hb_font;
         pub fn hb_font_set_scale(font: *mut hb_font, x: c_int, y: c_int);
         pub fn hb_font_get_h_extents(font: *mut hb_font, ext: *mut hb_font_extents) -> c_int;
@@ -88,46 +90,14 @@ mod ffi {
         pub fn hb_ot_color_has_png(face: *mut hb_face) -> c_int;
         pub fn hb_ot_color_glyph_reference_png(font: *mut hb_font, glyph: u32) -> *mut hb_blob;
     }
-
-    pub type FcConfig = c_void;
-    pub type FcPattern = c_void;
-    #[repr(C)]
-    pub struct FcFontSet {
-        pub nfont: c_int,
-        pub sfont: c_int,
-        pub fonts: *mut *mut FcPattern,
-    }
-
-    #[link(name = "fontconfig")]
-    unsafe extern "C" {
-        pub fn FcInitLoadConfigAndFonts() -> *mut FcConfig;
-        pub fn FcNameParse(name: *const u8) -> *mut FcPattern;
-        pub fn FcConfigSubstitute(c: *mut FcConfig, p: *mut FcPattern, kind: c_int) -> c_int;
-        pub fn FcDefaultSubstitute(p: *mut FcPattern);
-        pub fn FcFontSort(c: *mut FcConfig, p: *mut FcPattern, trim: c_int, csp: *mut c_void, r: *mut c_int)
-        -> *mut FcFontSet;
-        pub fn FcPatternGetString(p: *mut FcPattern, obj: *const c_char, n: c_int, s: *mut *mut u8) -> c_int;
-        pub fn FcPatternGetInteger(p: *mut FcPattern, obj: *const c_char, n: c_int, i: *mut c_int) -> c_int;
-        pub fn FcPatternDestroy(p: *mut FcPattern);
-        pub fn FcFontSetDestroy(s: *mut FcFontSet);
-        pub fn FcConfigDestroy(c: *mut FcConfig);
-        pub fn FcFini();
-    }
 }
 use ffi::*;
 
-/// How many fallback fonts per family fontconfig returns.
-const FALLBACKS: usize = 6;
-
-type ColorGlyph = Option<Rc<(tiny_skia::Pixmap, hb_glyph_extents)>>;
-
-pub struct Face {
+struct Face {
     font: *mut hb_font,
     upem: f32,
     png: bool,
     outlines: RefCell<HashMap<u32, Option<Rc<Path>>>>,
-    /// decoded color bitmaps (emoji), drawn on every paint of their text
-    pngs: RefCell<HashMap<u32, ColorGlyph>>,
 }
 
 impl Face {
@@ -137,13 +107,17 @@ impl Face {
             let blob = hb_blob_create_from_file(c.as_ptr());
             let face = hb_face_create(blob, index);
             hb_blob_destroy(blob);
-            let upem = hb_face_get_upem(face) as f32;
-            if upem <= 1.0 {
+            // an unreadable file still makes an (empty) face
+            if hb_face_get_glyph_count(face) == 0 {
+                hb_face_destroy(face);
                 return None;
             }
+            let upem = hb_face_get_upem(face) as f32;
+            let png = hb_ot_color_has_png(face) != 0;
             let font = hb_font_create(face);
+            hb_face_destroy(face); // the font holds its own reference
             hb_font_set_scale(font, upem as c_int, upem as c_int);
-            Some(Face { font, upem, png: hb_ot_color_has_png(face) != 0, outlines: RefCell::default(), pngs: RefCell::default() })
+            Some(Face { font, upem, png, outlines: RefCell::default() })
         }
     }
 
@@ -162,20 +136,9 @@ impl Face {
         path
     }
 
-    /// Embedded color bitmap (CBDT, e.g. Noto Color Emoji) and its extents in font units, cached.
-    fn color_png(&self, glyph: u32) -> ColorGlyph {
-        if !self.png {
-            return None;
-        }
-        if let Some(p) = self.pngs.borrow().get(&glyph) {
-            return p.clone();
-        }
-        let p = self.decode_png(glyph).map(Rc::new);
-        self.pngs.borrow_mut().insert(glyph, p.clone());
-        p
-    }
-
-    fn decode_png(&self, glyph: u32) -> Option<(tiny_skia::Pixmap, hb_glyph_extents)> {
+    /// Embedded color bitmap (CBDT, e.g. Noto Color Emoji) resampled to `scale` device px per font
+    /// unit, and its top-left in device px from the pen.
+    fn color_png(&self, glyph: u32, scale: f32) -> Option<(tiny_skia::Pixmap, f32, f32)> {
         unsafe {
             let blob = hb_ot_color_glyph_reference_png(self.font, glyph);
             let mut len = 0;
@@ -183,9 +146,15 @@ impl Face {
             let bytes = if data.is_null() { &[][..] } else { std::slice::from_raw_parts(data.cast::<u8>(), len as usize) };
             let pix = crate::ui::image::decode_png(bytes);
             hb_blob_destroy(blob);
+            let pix = pix?;
             let mut ext = hb_glyph_extents::default();
             hb_font_get_glyph_extents(self.font, glyph, &mut ext);
-            Some((pix?, ext))
+            let (w, h) = (ext.width as f32 * scale, -ext.height as f32 * scale);
+            let mut out = tiny_skia::Pixmap::new(w.round().max(1.0) as u32, h.round().max(1.0) as u32)?;
+            let t = tiny_skia::Transform::from_scale(out.width() as f32 / pix.width() as f32, out.height() as f32 / pix.height() as f32);
+            let pp = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+            out.draw_pixmap(0, 0, pix.as_ref(), &pp, t, None);
+            Some((out, ext.x_bearing as f32 * scale, -ext.y_bearing as f32 * scale))
         }
     }
 
@@ -236,92 +205,71 @@ fn draw_glyph(font: *mut hb_font, glyph: u32) -> Option<Path> {
 }
 
 /// A family resolved to its primary face plus fontconfig's fallback chain.
-pub struct Family {
+struct Family {
     faces: Vec<Rc<Face>>,
     /// fontconfig 90-synthetic.conf: bold requested from a face no heavier than medium
     embolden: Vec<bool>,
 }
 
 thread_local! {
-    static FAMILIES: RefCell<HashMap<String, Rc<Family>>> = RefCell::default();
-    static FILES: RefCell<HashMap<(String, u32), Option<Rc<Face>>>> = RefCell::default();
+    static FAMILIES: RefCell<HashMap<(&'static str, i32), Rc<Family>>> = RefCell::default();
+    static FILES: RefCell<HashMap<(&'static str, u32), Option<Rc<Face>>>> = RefCell::default();
 }
 
-/// Resolves `pattern` (fontconfig syntax, e.g. "Sora:weight=400") once and caches it.
-pub fn family(pattern: &str) -> Rc<Family> {
-    if let Some(f) = FAMILIES.with(|m| m.borrow().get(pattern).cloned()) {
+/// (family, fontconfig weight, file, index, embolden), in fallback order.
+type FontRow = (&'static str, i32, &'static str, u32, bool);
+
+/// The fallback chains fontconfig sorted at build time (package.nix). The checked-in settings.rs has
+/// none: dev builds take the same rows, tab-separated, from the dev shell's FLURRY_FONTS.
+fn font_rows() -> &'static [FontRow] {
+    static DEV: std::sync::OnceLock<Vec<FontRow>> = std::sync::OnceLock::new();
+    if !crate::settings::FONTS.is_empty() {
+        return crate::settings::FONTS;
+    }
+    DEV.get_or_init(|| {
+        let rows = option_env!("FLURRY_FONTS").unwrap_or_default().lines();
+        rows.filter_map(|l| {
+            let mut f = l.split('\t');
+            Some((f.next()?, f.next()?.parse().ok()?, f.next()?, f.next()?.parse().ok()?, f.next() == Some("True")))
+        })
+        .collect()
+    })
+}
+
+/// Resolves `name` at fontconfig `weight` (the nearest one in the table) once and caches it.
+fn family(name: &'static str, weight: i32) -> Rc<Family> {
+    if let Some(f) = FAMILIES.with(|m| m.borrow().get(&(name, weight)).cloned()) {
         return f;
     }
-    let requested: i32 = pattern.rsplit("weight=").next().and_then(|w| w.parse().ok()).unwrap_or(80);
+    let rows = font_rows().iter().filter(|r| r.0 == name);
+    let nearest = rows.clone().map(|r| r.1).min_by_key(|w| (w - weight).abs());
     let mut faces = vec![];
     let mut embolden = vec![];
-    for (file, index, weight) in fc_sort(pattern) {
-        let key = (file, index);
-        let face = FILES.with(|m| m.borrow_mut().entry(key.clone()).or_insert_with(|| Face::open(&key.0, key.1).map(Rc::new)).clone());
+    for &(_, _, file, index, bold) in rows.filter(|r| Some(r.1) == nearest) {
+        let face = FILES.with(|m| m.borrow_mut().entry((file, index)).or_insert_with(|| Face::open(file, index).map(Rc::new)).clone());
         if let Some(f) = face {
             faces.push(f);
-            embolden.push(requested >= 200 && weight <= 100);
+            embolden.push(bold);
         }
     }
     let fam = Rc::new(Family { faces, embolden });
-    FAMILIES.with(|m| m.borrow_mut().insert(pattern.into(), fam.clone()));
+    FAMILIES.with(|m| m.borrow_mut().insert((name, weight), fam.clone()));
     fam
-}
-
-thread_local! {
-    /// Loaded on the first family and kept until `release_fontconfig`: loading it is most of a lookup.
-    static FC: std::cell::Cell<*mut FcConfig> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-}
-
-fn fc_sort(pattern: &str) -> Vec<(String, u32, i32)> {
-    let mut out = vec![];
-    let Ok(name) = CString::new(pattern) else { return out };
-    unsafe {
-        let cfg = FC.with(|c| {
-            if c.get().is_null() {
-                c.set(FcInitLoadConfigAndFonts());
-            }
-            c.get()
-        });
-        let pat = FcNameParse(name.as_ptr().cast());
-        FcConfigSubstitute(cfg, pat, 0);
-        FcDefaultSubstitute(pat);
-        let mut res = 0;
-        let set = FcFontSort(cfg, pat, 1, std::ptr::null_mut(), &mut res);
-        if !set.is_null() {
-            let set_ref = &*set;
-            for i in 0..(set_ref.nfont as usize).min(FALLBACKS) {
-                let p = *set_ref.fonts.add(i);
-                let mut file: *mut u8 = std::ptr::null_mut();
-                let mut index = 0;
-                if FcPatternGetString(p, c"file".as_ptr(), 0, &mut file) == 0 {
-                    FcPatternGetInteger(p, c"index".as_ptr(), 0, &mut index);
-                    let mut weight = 80;
-                    FcPatternGetInteger(p, c"weight".as_ptr(), 0, &mut weight);
-                    out.push((CStr::from_ptr(file.cast()).to_string_lossy().into_owned(), index as u32, weight));
-                }
-            }
-            FcFontSetDestroy(set);
-        }
-        FcPatternDestroy(pat);
-    }
-    out
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Font {
-    /// fontconfig pattern without size, e.g. "Sora:weight=400"
+    /// fontconfig family name, e.g. "Sora"
     pub family: &'static str,
     /// CSS weight (400 regular, 500 medium, 700 bold)
     pub weight: u16,
     pub size: f32,
-    pub letter_spacing: f32,
 }
 
 impl Font {
-    fn pattern(&self) -> String {
-        let fc = match self.weight { 0..=449 => 80, 450..=599 => 100, _ => 200 };
-        format!("{}:weight={fc}", self.family)
+    /// fontconfig weight
+    fn fc_weight(&self) -> i32 {
+        match self.weight { 0..=449 => 80, 450..=599 => 100, _ => 200 }
     }
 }
 
@@ -340,9 +288,8 @@ pub struct Line {
 }
 
 /// Shaped and broken text, in px.
-#[derive(Clone)]
 pub struct Layout {
-    family: Option<Rc<Family>>,
+    family: Rc<Family>,
     pub size: f32,
     pub lines: Vec<Line>,
     pub ascent: f32,
@@ -354,7 +301,7 @@ impl Layout {
     pub fn content_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut s = std::hash::DefaultHasher::new();
-        self.family.as_ref().map(Rc::as_ptr).hash(&mut s);
+        Rc::as_ptr(&self.family).hash(&mut s);
         self.size.to_bits().hash(&mut s);
         self.line_height.to_bits().hash(&mut s);
         for l in &self.lines {
@@ -385,47 +332,59 @@ struct Run {
     glyphs: Vec<(usize, u32, f32, f32, f32, usize)>, // face, glyph, advance, x_off, y_off, byte cluster
 }
 
-fn shape_run(fam: &Family, size: f32, spacing: f32, text: &str) -> Run {
+/// Combining marks, ZWJ, variation selectors, skin tones and tags: shaped with what precedes them.
+fn joins_previous(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05C7 | 0x064B..=0x065F | 0x0900..=0x0903 | 0x093A..=0x094F
+        | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200D | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F
+        | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0xE0100..=0xE01EF)
+}
+
+fn shape_run(fam: &Family, size: f32, text: &str) -> Run {
     // Split into runs per face: first face that has the char, like Pango's fallback.
     let mut glyphs = vec![];
+    if fam.faces.is_empty() {
+        return Run { glyphs };
+    }
     let face_for = |c: char| fam.faces.iter().position(|f| f.has(c)).unwrap_or(0);
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut i = 0;
     while i < chars.len() {
         let face = face_for(chars[i].1);
         let mut j = i + 1;
-        while j < chars.len() && (chars[j].1.is_whitespace() || face_for(chars[j].1) == face) {
+        while j < chars.len() && (chars[j].1.is_whitespace() || joins_previous(chars[j].1) || face_for(chars[j].1) == face) {
             j += 1;
         }
         let begin = chars[i].0;
         let end = if j < chars.len() { chars[j].0 } else { text.len() };
-        shape_face(&fam.faces[face], face, size, spacing, &text[begin..end], begin, &mut glyphs);
+        shape_face(&fam.faces[face], face, size, &text[begin..end], begin, &mut glyphs);
         i = j;
     }
     Run { glyphs }
 }
 
-fn shape_face(
-    f: &Face, idx: usize, size: f32, spacing: f32, s: &str, base: usize, out: &mut Vec<(usize, u32, f32, f32, f32, usize)>,
-) {
+fn shape_face(f: &Face, idx: usize, size: f32, s: &str, base: usize, out: &mut Vec<(usize, u32, f32, f32, f32, usize)>) {
     let scale = size / f.upem;
     unsafe {
         let buf = hb_buffer_create();
         hb_buffer_add_utf8(buf, s.as_ptr().cast(), s.len() as c_int, 0, s.len() as c_int);
         hb_buffer_guess_segment_properties(buf);
         hb_shape(f.font, buf, std::ptr::null(), 0);
-        let mut n = 0;
-        let infos = std::slice::from_raw_parts(hb_buffer_get_glyph_infos(buf, &mut n), n as usize);
-        let pos = std::slice::from_raw_parts(hb_buffer_get_glyph_positions(buf, &mut n), n as usize);
-        for (info, p) in infos.iter().zip(pos) {
-            out.push((
-                idx,
-                info.codepoint,
-                p.x_advance as f32 * scale + spacing,
-                p.x_offset as f32 * scale,
-                -p.y_offset as f32 * scale,
-                base + info.cluster as usize,
-            ));
+        let (mut n, mut m) = (0, 0);
+        let (infos, pos) = (hb_buffer_get_glyph_infos(buf, &mut n), hb_buffer_get_glyph_positions(buf, &mut m));
+        if !infos.is_null() && !pos.is_null() && n > 0 {
+            let infos = std::slice::from_raw_parts(infos, n.min(m) as usize);
+            let pos = std::slice::from_raw_parts(pos, n.min(m) as usize);
+            for (info, p) in infos.iter().zip(pos) {
+                out.push((
+                    idx,
+                    info.codepoint,
+                    p.x_advance as f32 * scale,
+                    p.x_offset as f32 * scale,
+                    -p.y_offset as f32 * scale,
+                    base + info.cluster as usize,
+                ));
+            }
         }
         hb_buffer_destroy(buf);
     }
@@ -443,20 +402,31 @@ const LAYOUT_CACHE: usize = 512;
 
 /// Lays out `text`; `max_width` triggers wrapping (Wrap::Word) or ellipsizing (`ellipsize`).
 pub fn layout(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool) -> Rc<Layout> {
+    layout_spaced(text, font, max_width, wrap, ellipsize, None, None)
+}
+
+/// `layout` with CSS line-height `px` (extra space split above/below), then a Pango line-height
+/// `factor` on top.
+pub fn layout_spaced(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool, px: Option<f32>, factor: Option<f32>) -> Rc<Layout> {
     let key = crate::ui::node::hash(&(
         text,
         font.family,
         font.weight,
         font.size.to_bits(),
-        font.letter_spacing.to_bits(),
         max_width.map(f32::to_bits),
         wrap == Wrap::Word,
         ellipsize,
+        px.map(f32::to_bits),
+        factor.map(f32::to_bits),
     ));
     if let Some(l) = LAYOUTS.with(|c| c.borrow().get(&key).filter(|(t, _)| t == text).map(|(_, l)| l.clone())) {
         return l;
     }
-    let l = Rc::new(layout_uncached(text, font, max_width, wrap, ellipsize));
+    let mut l = layout_uncached(text, font, max_width, wrap, ellipsize);
+    let h = px.unwrap_or(l.line_height) * factor.unwrap_or(1.0);
+    l.ascent += (h - l.line_height) / 2.0;
+    l.line_height = h;
+    let l = Rc::new(l);
     LAYOUTS.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() >= LAYOUT_CACHE {
@@ -468,19 +438,27 @@ pub fn layout(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellip
 }
 
 fn layout_uncached(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool) -> Layout {
-    let fam = family(&font.pattern());
+    let fam = family(font.family, font.fc_weight());
     let (ascent, descent) = fam.faces.first().map(|f| f.extents()).unwrap_or((0.8, 0.2));
     let (ascent, descent) = (ascent * font.size, descent * font.size);
+    // no tab stops or carriage returns: tabs are spaces, CRs are dropped
+    let clean;
+    let text = if text.contains(['\r', '\t']) {
+        clean = text.replace('\r', "").replace('\t', " ");
+        &clean
+    } else {
+        text
+    };
     let mut lines = vec![];
     for para in text.split('\n') {
-        let run = shape_run(&fam, font.size, font.letter_spacing, para);
+        let run = shape_run(&fam, font.size, para);
         match (max_width, wrap) {
             (Some(max), Wrap::Word) => wrap_run(para, &run, max, &mut lines),
             (Some(max), Wrap::None) if ellipsize => lines.push(ellipsize_run(&fam, font, &run, max)),
             _ => lines.push(to_line(&run.glyphs)),
         }
     }
-    Layout { family: Some(fam), size: font.size, lines, ascent, line_height: (ascent + descent).ceil() }
+    Layout { family: fam, size: font.size, lines, ascent, line_height: (ascent + descent).ceil() }
 }
 
 fn to_line(glyphs: &[(usize, u32, f32, f32, f32, usize)]) -> Line {
@@ -534,41 +512,62 @@ fn ellipsize_run(fam: &Family, font: &Font, run: &Run, max: f32) -> Line {
     if full.width <= max {
         return full;
     }
-    let dots = shape_run(fam, font.size, font.letter_spacing, "…");
+    let dots = shape_run(fam, font.size, "…");
     let dots_w: f32 = dots.glyphs.iter().map(|g| g.2).sum();
+    let g = &run.glyphs;
     let mut keep = 0;
     let mut x = 0.0;
-    while keep < run.glyphs.len() && x + run.glyphs[keep].2 + dots_w <= max {
-        x += run.glyphs[keep].2;
+    while keep < g.len() && x + g[keep].2 + dots_w <= max {
+        x += g[keep].2;
         keep += 1;
     }
-    let mut glyphs = run.glyphs[..keep].to_vec();
+    // never split a cluster (base + marks, ligatures)
+    while keep > 0 && keep < g.len() && g[keep].5 == g[keep - 1].5 {
+        keep -= 1;
+    }
+    let mut glyphs = g[..keep].to_vec();
     glyphs.extend(dots.glyphs);
     to_line(&glyphs)
 }
 
+thread_local! {
+    /// (face, glyph, device px per font unit) -> color bitmap at that size and its offset from the pen
+    static EMOJI: RefCell<HashMap<(usize, u32, u32), Option<Rc<(tiny_skia::Pixmap, f32, f32)>>>> = RefCell::default();
+}
+
 /// Draws `layout` with its first baseline at (x, y + ascent), in `color`.
 pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, color: tiny_skia::Color, ts: tiny_skia::Transform) {
-    let Some(fam) = &layout.family else { return };
+    let fam = &layout.family;
     let mut paint = tiny_skia::Paint::default();
     paint.set_color(color);
     paint.anti_alias = true;
+    let axis = ts.kx == 0.0 && ts.ky == 0.0;
+    let dev_scale = (ts.sx * ts.sx + ts.ky * ts.ky).sqrt();
     for (i, line) in layout.lines.iter().enumerate() {
         let baseline = y + layout.ascent + i as f32 * layout.line_height;
+        // lines outside the target (long text) cost nothing; a line's slack covers overhangs
+        if axis {
+            let top = ts.sy * (baseline - layout.ascent - layout.line_height) + ts.ty;
+            let bottom = ts.sy * (baseline - layout.ascent + 2.0 * layout.line_height) + ts.ty;
+            if top.max(bottom) < 0.0 || top.min(bottom) > pixmap.height() as f32 {
+                continue;
+            }
+        }
         for g in &line.glyphs {
             let face = &fam.faces[g.face];
             let s = layout.size / face.upem;
-            if let Some(cg) = face.color_png(g.id) {
-                let (png, ext) = &*cg;
-                let w = ext.width as f32 * s;
-                let h = -ext.height as f32 * s;
-                let px = x + g.x + ext.x_bearing as f32 * s;
-                let py = baseline + g.y - ext.y_bearing as f32 * s;
-                let sx = w / png.width() as f32;
-                let sy = h / png.height() as f32;
-                let t = ts.pre_translate(px, py).pre_scale(sx, sy);
-                let pp = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, opacity: color.alpha(), ..Default::default() };
-                pixmap.draw_pixmap(0, 0, png.as_ref(), &pp, t, None);
+            if face.png
+                && let Some(cg) = emoji(face, g.id, s * dev_scale)
+            {
+                let (png, ox, oy) = &*cg;
+                if axis && ts.sx == ts.sy && ts.sx > 0.0 {
+                    let (px, py) = (ts.sx * (x + g.x) + ts.tx + ox, ts.sy * (baseline + g.y) + ts.ty + oy);
+                    crate::ui::node::blit(pixmap, png.as_ref(), px.round() as i32, py.round() as i32, color.alpha());
+                } else {
+                    let t = ts.pre_translate(x + g.x, baseline + g.y).pre_scale(1.0 / dev_scale, 1.0 / dev_scale).pre_translate(*ox, *oy);
+                    let pp = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, opacity: color.alpha(), ..Default::default() };
+                    pixmap.draw_pixmap(0, 0, png.as_ref(), &pp, t, None);
+                }
             } else if let Some(path) = face.outline(g.id) {
                 let t = ts.pre_translate(x + g.x, baseline + g.y).pre_scale(s, s);
                 if t.kx == 0.0 && t.ky == 0.0 && t.sx == t.sy && t.sx > 0.0 {
@@ -586,25 +585,42 @@ pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, 
     }
 }
 
+/// A color glyph pre-scaled to the device size it is drawn at, cached (bounded, cleared when full).
+fn emoji(face: &Rc<Face>, glyph: u32, scale: f32) -> Option<Rc<(tiny_skia::Pixmap, f32, f32)>> {
+    let key = (Rc::as_ptr(face) as usize, glyph, scale.to_bits());
+    if let Some(e) = EMOJI.with(|c| c.borrow().get(&key).cloned()) {
+        return e;
+    }
+    let e = face.color_png(glyph, scale).map(Rc::new);
+    EMOJI.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 256 {
+            c.clear();
+        }
+        c.insert(key, e.clone());
+    });
+    e
+}
+
 /// A rasterized glyph's coverage and where its top-left sits relative to the pen's whole pixel.
-struct Mask {
-    alpha: Vec<u8>,
-    w: usize,
-    h: usize,
+struct Coverage {
+    mask: tiny_skia::Mask,
     x: i32,
     y: i32,
 }
 
 thread_local! {
     /// (face, glyph, device scale, embolden, quarter-pixel phase x/y) -> coverage
-    static GLYPHS: RefCell<HashMap<(usize, u32, u32, bool, u8, u8), Option<Rc<Mask>>>> = RefCell::default();
+    static GLYPHS: RefCell<HashMap<(usize, u32, u32, bool, u8, u8), Option<Rc<Coverage>>>> = RefCell::default();
 }
 
 /// Draws an outline glyph from its cached coverage mask: rasterizing every glyph every frame was
 /// most of a text-heavy window's paint time. Positions snap to quarter pixels.
 fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, path: &Path, embolden: bool, t: tiny_skia::Transform, color: tiny_skia::Color) {
-    let (px, py) = (t.tx.floor(), t.ty.floor());
-    let (fx, fy) = (((t.tx - px) * 4.0).round() as u8, ((t.ty - py) * 4.0).round() as u8);
+    // snapped first, then split: a phase of 4/4 is the next pixel's 0, not a separate cache entry
+    let (qx, qy) = ((t.tx * 4.0).round(), (t.ty * 4.0).round());
+    let (px, py) = ((qx / 4.0).floor(), (qy / 4.0).floor());
+    let (fx, fy) = ((qx - px * 4.0) as u8, (qy - py * 4.0) as u8);
     let key = (Rc::as_ptr(face) as usize, glyph, t.sx.to_bits(), embolden, fx, fy);
     let mask = GLYPHS.with(|c| c.borrow().get(&key).cloned()).unwrap_or_else(|| {
         let m = rasterize(face, path, embolden, t.sx, fx as f32 / 4.0, fy as f32 / 4.0).map(Rc::new);
@@ -618,18 +634,20 @@ fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, path: 
         m
     });
     let Some(m) = mask else { return };
+    let (mw, mh) = (m.mask.width() as i32, m.mask.height() as i32);
+    let alpha = m.mask.data();
     let c = color.premultiply().to_color_u8();
     let (cr, cg, cb, ca) = (c.red() as u32, c.green() as u32, c.blue() as u32, c.alpha() as u32);
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
     let (ox, oy) = (px as i32 + m.x, py as i32 + m.y);
-    let (x0, x1) = (ox.max(0), (ox + m.w as i32).min(pw));
-    let (y0, y1) = (oy.max(0), (oy + m.h as i32).min(ph));
+    let (x0, x1) = (ox.max(0), (ox + mw).min(pw));
+    let (y0, y1) = (oy.max(0), (oy + mh).min(ph));
     if x0 >= x1 || y0 >= y1 {
         return;
     }
     let data = pm.data_mut();
     for y in y0..y1 {
-        let src = &m.alpha[(y - oy) as usize * m.w..];
+        let src = &alpha[((y - oy) * mw) as usize..];
         let row = &mut data[(y * pw) as usize * 4..];
         for x in x0..x1 {
             let a = src[(x - ox) as usize] as u32;
@@ -648,7 +666,7 @@ fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, path: 
     }
 }
 
-fn rasterize(face: &Face, path: &Path, embolden: bool, scale: f32, fx: f32, fy: f32) -> Option<Mask> {
+fn rasterize(face: &Face, path: &Path, embolden: bool, scale: f32, fx: f32, fy: f32) -> Option<Coverage> {
     let pad = if embolden { face.upem / 48.0 } else { 0.0 };
     let b = path.bounds();
     let s = scale; // font units -> device px already folded into `scale` by the caller's transform
@@ -656,17 +674,13 @@ fn rasterize(face: &Face, path: &Path, embolden: bool, scale: f32, fx: f32, fy: 
     let top = ((b.top() - pad) * s + fy).floor() - 1.0;
     let w = ((b.right() + pad) * s + fx).ceil() + 1.0 - left;
     let h = ((b.bottom() + pad) * s + fy).ceil() + 1.0 - top;
-    let mut p = tiny_skia::Pixmap::new(w.max(1.0) as u32, h.max(1.0) as u32)?;
-    let mut paint = tiny_skia::Paint::default();
-    paint.set_color(tiny_skia::Color::BLACK);
-    paint.anti_alias = true;
+    let mut mask = tiny_skia::Mask::new(w.max(1.0) as u32, h.max(1.0) as u32)?;
     let t = tiny_skia::Transform::from_translate(fx - left, fy - top).pre_scale(s, s);
-    p.fill_path(path, &paint, tiny_skia::FillRule::Winding, t, None);
-    if embolden {
-        let stroke = tiny_skia::Stroke { width: face.upem / 24.0, ..Default::default() };
-        p.stroke_path(path, &paint, &stroke, t, None);
+    mask.fill_path(path, tiny_skia::FillRule::Winding, true, t);
+    if embolden && let Some(grown) = path.stroke(&tiny_skia::Stroke { width: face.upem / 24.0, ..Default::default() }, s) {
+        mask.fill_path(&grown, tiny_skia::FillRule::Winding, true, t);
     }
-    Some(Mask { alpha: p.data().iter().skip(3).step_by(4).copied().collect(), w: p.width() as usize, h: p.height() as usize, x: left as i32, y: top as i32 })
+    Some(Coverage { mask, x: left as i32, y: top as i32 })
 }
 
 /// Average char width, used for GTK's max-width-chars (pango approximate_char_width).
@@ -684,15 +698,3 @@ pub fn approx_char_width(font: &Font) -> f32 {
     CHAR_WIDTHS.with(|c| c.borrow_mut().insert(key, w));
     w
 }
-
-/// Releases fontconfig's caches once every family is resolved.
-pub fn release_fontconfig() {
-    FC.with(|c| {
-        let cfg = c.replace(std::ptr::null_mut());
-        if !cfg.is_null() {
-            unsafe { FcConfigDestroy(cfg) };
-        }
-    });
-    unsafe { FcFini() };
-}
-

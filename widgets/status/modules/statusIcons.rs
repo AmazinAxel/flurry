@@ -14,33 +14,18 @@ pub fn network_icon() -> State<&'static str> {
     NETWORK_ICON.with(Clone::clone)
 }
 
-fn apply_state(state: &str) {
-    network_icon().set(match state {
+fn icon_for(state: &str) -> &'static str {
+    match state {
         "connected" | "roaming" => "network-wireless-symbolic",
         "connecting" | "disconnecting" => "network-wireless-acquiring-symbolic",
         _ => "network-wireless-offline-symbolic",
-    });
+    }
 }
 
+/// Follows the shared iwd station state.
 pub fn start() {
-    iwd::on_properties_changed(|_, iface, changed| {
-        if iface == iwd::STATION
-            && let Some(s) = crate::lib::dbus::prop_str(changed, "State")
-        {
-            apply_state(&s);
-        }
-    });
-    crate::ui::runtime::spawn(async {
-        if let Ok(objs) = iwd::objects().await {
-            let state = objs.values().find_map(|i| i.get(iwd::STATION)).and_then(|p| crate::lib::dbus::prop_str(p, "State")).unwrap_or_default();
-            apply_state(&state);
-        }
-    });
-}
-
-thread_local! {
-    /// overlay visible={Boolean(battery.percentage)} is evaluated once when the bar is built
-    static HAS_BATTERY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    iwd::start();
+    iwd::state().subscribe(|| network_icon().set(iwd::state().with(|s| icon_for(s))));
 }
 
 fn img(base: &Style, name: &'static str) -> Node {
@@ -52,15 +37,7 @@ fn img(base: &Style, name: &'static str) -> Node {
 /// Battery percentage, or the full icon from 99%; hidden without a battery.
 pub fn battery_percent(base: &Style) -> Node {
     let b = battery().peek();
-    // visible={Boolean(battery.percentage)}: decided once, as soon as UPower has answered
-    let has = HAS_BATTERY.with(|h| match h.get() {
-        Some(v) => v,
-        None if b.loaded => {
-            h.set(Some(b.percentage != 0.0));
-            b.percentage != 0.0
-        }
-        None => false,
-    });
+    let has = b.present;
     let pct = (b.percentage * 100.0).round() as i64;
     if pct >= 99 {
         return img(base, "battery-level-100-symbolic").show(has);
@@ -85,20 +62,4 @@ pub fn status(base: &Style) -> Node {
         img(base, "notifications-disabled-symbolic").show(streaming_mode().peek()),
     ])
     .align(Align::Center, Align::Center)
-}
-
-/// Icon names from UPower are dynamic; intern them for the 'static icon API.
-pub fn leak(s: &str) -> &'static str {
-    thread_local! {
-        static INTERN: std::cell::RefCell<std::collections::HashSet<&'static str>> = Default::default();
-    }
-    INTERN.with(|i| {
-        let mut i = i.borrow_mut();
-        if let Some(x) = i.get(s) {
-            return *x;
-        }
-        let x: &'static str = Box::leak(s.to_string().into_boxed_str());
-        i.insert(x);
-        x
-    })
 }

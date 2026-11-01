@@ -20,7 +20,7 @@ pub struct Wallpaper {
 
 impl PartialEq for Wallpaper {
     fn eq(&self, o: &Self) -> bool {
-        self.path == o.path && Rc::ptr_eq(&self.shm, &o.shm)
+        Rc::ptr_eq(&self.shm, &o.shm)
     }
 }
 
@@ -35,13 +35,17 @@ pub fn current() -> State<Option<Wallpaper>> {
     CURRENT.with(Clone::clone)
 }
 
+/// Images under `dir`: only regular files (symlinks followed) named like a jpeg or png, so a
+/// video or a FIFO is never read.
 fn list_files(dir: &str, out: &mut Vec<String>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = format!("{dir}/{}", e.file_name().to_string_lossy());
         if e.file_type().is_ok_and(|t| t.is_dir()) {
             list_files(&p, out);
-        } else {
+        } else if p.rsplit_once('.').is_some_and(|(_, x)| ["jpg", "jpeg", "png"].iter().any(|e| x.eq_ignore_ascii_case(e)))
+            && std::fs::metadata(&p).is_ok_and(|m| m.is_file())
+        {
             out.push(p);
         }
     }
@@ -53,20 +57,23 @@ fn random(n: usize) -> usize {
     (x % n as u64) as usize
 }
 
-fn pick() -> Option<String> {
+/// A random wallpaper other than `cur`, read and decoded straight into shared memory; a few
+/// candidates are tried in case one is broken. Runs on a worker thread (listing included).
+fn load(cur: Option<String>) -> Option<(String, ShmPixels)> {
     let mut files = vec![];
     list_files(&format!("{}/Wallpapers", crate::lib::xdg::home_dir()), &mut files);
-    let cur = current().with(|c| c.as_ref().map(|c| c.path.clone()));
     files.retain(|f| Some(f) != cur.as_ref());
-    (!files.is_empty()).then(|| files.swap_remove(random(files.len())))
-}
-
-/// Reads and decodes straight into shared memory; runs on a worker thread.
-fn decode(path: &str) -> Option<ShmPixels> {
-    image::decode_into(&std::fs::read(path).ok()?, |w, h, fill| {
-        let mut p = ShmPixels::new(w, h)?;
-        fill(p.data()).then_some(p)
-    })
+    for _ in 0..3 {
+        if files.is_empty() {
+            break;
+        }
+        let path = files.swap_remove(random(files.len()));
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if let Some(p) = image::decode_into(&bytes, ShmPixels::new, ShmPixels::data) {
+            return Some((path, p));
+        }
+    }
+    None
 }
 
 /// Swaps in another random wallpaper at once: the next one is always decoded ahead of time, which
@@ -89,17 +96,12 @@ fn preload() {
     if LOADING.with(|l| l.replace(true)) {
         return;
     }
-    let Some(path) = pick() else {
-        LOADING.with(|l| l.set(false));
-        SHOW_NEXT.with(|s| s.set(false));
-        return;
-    };
+    let cur = current().with(|c| c.as_ref().map(|c| c.path.clone()));
     runtime::spawn(async move {
-        let p = path.clone();
-        let pixels = runtime::blocking(move || decode(&p)).await.flatten();
+        let loaded = runtime::blocking(move || load(cur)).await.flatten();
         LOADING.with(|l| l.set(false));
         let show = SHOW_NEXT.with(|s| s.replace(false));
-        let Some(pixels) = pixels else { return };
+        let Some((path, pixels)) = loaded else { return };
         let w = Wallpaper { path, shm: ShmImage::from_pixels(pixels) };
         if show {
             current().set(Some(w));

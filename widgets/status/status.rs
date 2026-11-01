@@ -7,7 +7,7 @@ use crate::lib::menuWindow::GAP;
 const TOP_HEIGHT: f32 = 220.0;
 /// Text size of the controls under the wallpaper.
 const CONTROL_FONT: f32 = 19.0;
-use crate::lib::mediaPlayer::{PLAYLISTS, is_playing, playlist_index, song};
+use crate::lib::mediaPlayer::{is_playing, playlist, song};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Background, Node, Sides, Style};
 use crate::widgets::status::modules::{mpris::track, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
@@ -17,13 +17,15 @@ pub fn volume_icon() -> &'static str {
     audio::default_speaker().map(|s| s.volume_icon()).unwrap_or("audio-volume-muted-symbolic")
 }
 
+/// The playlist's style color name from settings (anything unknown is blue2).
 fn playlist_color() -> tiny_skia::Color {
-    match PLAYLISTS[playlist_index().peek()] {
-        "Study" => red(),
-        "Focus" => blue3(),
-        "Synthwave" => purple(),
-        "Liked" => blue4(),
-        "SynthAmbient" => yellow(),
+    match playlist().map(|(_, c)| c) {
+        Some("red") => red(),
+        Some("yellow") => yellow(),
+        Some("purple") => purple(),
+        Some("blue1") => blue1(),
+        Some("blue3") => blue3(),
+        Some("blue4") => blue4(),
         _ => blue2(),
     }
 }

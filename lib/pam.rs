@@ -36,6 +36,7 @@ const PAM_PROMPT_ECHO_OFF: c_int = 1;
 const PAM_PROMPT_ECHO_ON: c_int = 2;
 const PAM_ERROR_MSG: c_int = 3;
 const PAM_TEXT_INFO: c_int = 4;
+const PAM_CONV_ERR: c_int = 19;
 
 pub enum Event {
     Info,
@@ -45,6 +46,8 @@ pub enum Event {
 
 struct ConvData {
     password: Option<CString>,
+    /// the secret answers one prompt only
+    answered: bool,
     out: std::fs::File,
 }
 
@@ -67,10 +70,26 @@ extern "C" fn conv(n: c_int, msgs: *mut *const PamMessage, resp: *mut *mut PamRe
         let text = if m.msg.is_null() { String::new() } else { unsafe { CStr::from_ptr(m.msg) }.to_string_lossy().into_owned() };
         let r = unsafe { &mut *out.add(i) };
         match m.style {
-            PAM_PROMPT_ECHO_OFF | PAM_PROMPT_ECHO_ON => {
+            PAM_PROMPT_ECHO_OFF if !d.answered => {
                 // the secret, or an empty answer when there is none (fprint skip)
+                d.answered = true;
                 let s = d.password.as_ref().map(|p| p.as_ptr()).unwrap_or(c"".as_ptr());
                 r.resp = unsafe { libc::strdup(s) };
+            }
+            PAM_PROMPT_ECHO_OFF | PAM_PROMPT_ECHO_ON => {
+                // a second secret or a visible answer (username, OTP...): never the password
+                for j in 0..i {
+                    let r = unsafe { &mut *out.add(j) };
+                    if !r.resp.is_null() {
+                        unsafe {
+                            let len = libc::strlen(r.resp);
+                            std::ptr::write_bytes(r.resp, 0, len);
+                            libc::free(r.resp.cast());
+                        }
+                    }
+                }
+                unsafe { libc::free(out.cast()) };
+                return PAM_CONV_ERR;
             }
             PAM_ERROR_MSG => report(&mut d.out, 2, &text),
             PAM_TEXT_INFO => report(&mut d.out, 1, &text),
@@ -103,7 +122,7 @@ pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(E
     let password = password.and_then(|p| CString::new(p).ok());
     std::thread::spawn(move || {
         let out = std::fs::File::from(wr);
-        let mut data = ConvData { password, out };
+        let mut data = ConvData { password, answered: false, out };
         let c = PamConv { conv, data: (&raw mut data).cast() };
         let user = user();
         let mut h = std::ptr::null_mut();

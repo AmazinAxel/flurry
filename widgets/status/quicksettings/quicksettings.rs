@@ -12,16 +12,20 @@ use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, alpha, blurre
 use crate::widgets::status::quicksettings::sound::{self, apply_selection, name_substitute, node_name, selected};
 use crate::widgets::status::status::volume_icon;
 
+/// Slider horizontal padding and the trough's end caps, shared by drawing and hit testing.
+const PAD_X: f32 = SPACE_M;
+const CAP: f32 = 10.0;
+
 /// `window scale` look: trough @light1 5px with the 10px end caps as shadows, @blue2 highlight,
 /// a 19px diamond knob (9px + 5px @blue2 border, rotated 45deg).
 pub fn slider(base: &Style, id: &str, value: f64) -> Node {
     let paint = Rc::new(move |pm: &mut tiny_skia::PixmapMut, r: Rect, ts: Transform| {
-        // r is the content box of `scale.horizontal` (padding 17/12 already removed); trough margin 0 10
-        let Some(trough) = Rect::from_xywh(r.x() + 10.0, r.y() + (r.height() - 5.0) / 2.0, (r.width() - 20.0).max(1.0), 5.0) else { return };
-        if let Some(l) = Rect::from_xywh(trough.x() - 10.0, trough.y(), 10.0, 5.0) {
+        // r is the content box (padding already removed); trough margin 0 CAP
+        let Some(trough) = Rect::from_xywh(r.x() + CAP, r.y() + (r.height() - 5.0) / 2.0, (r.width() - 2.0 * CAP).max(1.0), 5.0) else { return };
+        if let Some(l) = Rect::from_xywh(trough.x() - CAP, trough.y(), CAP, 5.0) {
             fill_rect(pm, l, blue2(), ts);
         }
-        if let Some(rr) = Rect::from_xywh(trough.right(), trough.y(), 10.0, 5.0) {
+        if let Some(rr) = Rect::from_xywh(trough.right(), trough.y(), CAP, 5.0) {
             fill_rect(pm, rr, light1(), ts);
         }
         fill_rect(pm, trough, light1(), ts);
@@ -45,14 +49,14 @@ pub fn slider(base: &Style, id: &str, value: f64) -> Node {
             }
         }
     });
-    let s = Style { padding: Sides::vh(SPACE_L, SPACE_M), min_height: 5.0, ..base.inherit() };
+    let s = Style { padding: Sides::vh(SPACE_L, PAD_X), min_height: 5.0, ..base.inherit() };
     Node::new(Kind::Custom { width: 0.0, height: 5.0, key: None, paint }, s).expand(true, false).id(id)
 }
 
 /// Value for a pointer x inside the slider's border box.
 pub fn slider_value(r: Rect, x: f32) -> f64 {
-    let left = r.x() + 12.0 + 10.0;
-    let width = (r.width() - 24.0 - 20.0).max(1.0);
+    let left = r.x() + PAD_X + CAP;
+    let width = (r.width() - 2.0 * (PAD_X + CAP)).max(1.0);
     ((x - left) / width).clamp(0.0, 1.0) as f64
 }
 
@@ -109,7 +113,9 @@ pub fn set_slider(id: &str, value: f64) {
         "volume" => {
             if let Some(s) = audio::default_speaker() {
                 audio::set_volume(&s, value);
-                audio::set_mute(&s, false);
+                if s.mute {
+                    audio::set_mute(&s, false);
+                }
             }
         }
         "brightness" => set_brightness(value),
