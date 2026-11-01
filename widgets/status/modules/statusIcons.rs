@@ -49,8 +49,8 @@ fn img(base: &Style, name: &'static str) -> Node {
     Node::icon(s, name, 36.0)
 }
 
-/// Battery icon with the percentage over it; hidden without a battery.
-pub fn battery_icon(base: &Style) -> Node {
+/// Battery percentage, or the full icon from 99%; hidden without a battery.
+pub fn battery_percent(base: &Style) -> Node {
     let b = battery().peek();
     // visible={Boolean(battery.percentage)}: decided once, as soon as UPower has answered
     let has = HAS_BATTERY.with(|h| match h.get() {
@@ -62,17 +62,14 @@ pub fn battery_icon(base: &Style) -> Node {
         None => false,
     });
     let pct = (b.percentage * 100.0).round() as i64;
-    let low = pct < 99;
-    let mut bat_icon = img(base, if b.icon.is_empty() { "battery-missing-symbolic" } else { leak(&b.icon) });
-    bat_icon.style.color = blue3();
-    if low {
-        bat_icon.style.opacity = 0.4;
+    if pct >= 99 {
+        return img(base, "battery-level-100-symbolic").show(has);
     }
     let mut pct_style = base.inherit();
     pct_style.font.size = 24.0;
     pct_style.font.weight = 700;
     pct_style.color = if b.charging() { green() } else { alpha(blue1(), 0.9) };
-    Node::overlay(base.inherit(), vec![bat_icon, Node::label(pct_style, pct.to_string()).show(low)]).show(has)
+    Node::label(pct_style, pct.to_string()).align(Align::Center, Align::Center).show(has)
 }
 
 pub fn status(base: &Style) -> Node {
@@ -82,7 +79,7 @@ pub fn status(base: &Style) -> Node {
     // one evenly spaced column, centered on the row whatever is shown
     Node::vbox(base.inherit(), SPACE_M, vec![
         Node::icon(rec, "media-record-symbolic", 36.0).show(crate::widgets::record::service::is_rec().peek()),
-        battery_icon(base),
+        battery_percent(base),
         img(base, network_icon().peek()),
         img(base, "bluetooth-active-symbolic").show(bt().with(|b| b.powered())),
         img(base, "notifications-disabled-symbolic").show(streaming_mode().peek()),

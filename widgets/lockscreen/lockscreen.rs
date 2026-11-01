@@ -19,7 +19,7 @@ use crate::ui::node::{Align, Background, Kind, LabelSpec, Node, Sides, Style, al
 use crate::ui::runtime::{self, Timer};
 use crate::ui::wayland::{self, KeyEvent, Keymode, LockEvent, Surface};
 use crate::ui::window;
-use crate::widgets::status::modules::statusIcons::battery_icon;
+use crate::widgets::status::modules::statusIcons::battery_percent;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Failed {
@@ -160,7 +160,7 @@ fn build(_w: f32, _h: f32) -> Node {
     if let Kind::Label(LabelSpec { line_height, .. }) = &mut clock.kind {
         *line_height = Some(0.75);
     }
-    let mut bat = battery_icon(&base).align(Align::Start, Align::End);
+    let mut bat = battery_percent(&base).align(Align::Start, Align::End);
     bat.style.margin = Sides::all(SPACE_L);
     Node::overlay(base.inherit(), vec![clock, bat])
 }

@@ -1,6 +1,6 @@
-// UPower DisplayDevice: percentage, state, icon, presence.
+// UPower DisplayDevice: percentage, state, presence.
 
-use crate::lib::dbus::{self, PropMap, SignalFilter, get_all, prop_bool, prop_f64, prop_i64, prop_str};
+use crate::lib::dbus::{self, PropMap, SignalFilter, get_all, prop_bool, prop_f64, prop_i64};
 use crate::lib::state::State;
 
 const DEST: &str = "org.freedesktop.UPower";
@@ -12,7 +12,6 @@ pub struct Battery {
     pub percentage: f64,
     /// UPower state: 1 charging, 2 discharging, 3 empty, 4 fully charged, 5 pending charge, 6 pending discharge
     pub state: i64,
-    pub icon: String,
     pub present: bool,
     /// GetAll answered (the status bar decides once whether to show the battery)
     pub loaded: bool,
@@ -43,9 +42,6 @@ fn apply(p: &PropMap) {
         }
         if let Some(v) = prop_i64(p, "State") {
             b.state = v;
-        }
-        if let Some(v) = prop_str(p, "IconName") {
-            b.icon = v;
         }
         if let Some(v) = prop_bool(p, "IsPresent") {
             b.present = v;
