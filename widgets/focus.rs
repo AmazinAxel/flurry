@@ -10,7 +10,7 @@ use crate::lib::searchDialog::search_entry;
 use crate::lib::state::State;
 use crate::lib::style::*;
 use crate::ui::entry;
-use crate::ui::node::{Background, Kind, Node, Sides, Style, fill_rect, rgba};
+use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, fill_rect, rgba};
 use crate::ui::runtime::{self, Timer};
 use crate::ui::wayland::{Anchor, Layer};
 use crate::ui::window::{self, Spec, Win};
@@ -141,14 +141,15 @@ pub fn focus_task() -> Rc<Win> {
         l = l.border(Sides::trbl(0.0, BORDER, BORDER, BORDER), blue3());
         l.font.size = 32.0;
         l.font.weight = 700;
-        l.padding = Sides::vh(SPACE_S, SPACE_M);
         l.background = Background::Color(dark1());
+        let text = Style { padding: Sides::vh(SPACE_S, SPACE_M), ..l.inherit() };
         let wait = break_wait().peek();
         let progress = BREAK_START.with(|s| s.get()).map_or(0.0, |s| s.elapsed().as_secs_f64() / 10.0);
-        Node::vbox(base.inherit(), 0.0, vec![
-            Node::label(l, focus_text().peek()),
-            levelbar(&base, progress, blue3(), rgba(255, 255, 255, 0.12), 6.0).show(wait),
-        ])
+        // the bar overlays the card's bottom edge, so the card keeps its size
+        Node::vbox(base.inherit(), 0.0, vec![Node::overlay(l, vec![
+            Node::label(text, focus_text().peek()),
+            levelbar(&base, progress, blue3(), rgba(255, 255, 255, 0.12), 6.0).align(Align::Fill, Align::End).show(wait),
+        ])])
     });
     let fw = Rc::downgrade(&w);
     focus_text().subscribe(move || {

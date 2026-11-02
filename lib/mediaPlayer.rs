@@ -188,23 +188,26 @@ fn mpd(cmds: &[&str]) -> runtime::Receiver<Vec<String>> {
     rx
 }
 
-fn load_playlist() {
+/// One command list, so `watch` wakes only after all of it and never sees the emptied queue.
+fn load_playlist(play: bool) {
     let mut cmds = vec![];
     if !STARTED.with(|s| s.replace(true)) && MPD_CROSSFADE != 0 {
         cmds.push(format!("crossfade {MPD_CROSSFADE}"));
     }
     if let Some((name, _)) = playlist() {
         cmds.extend(["clear".to_string(), format!("add {}", quote(name)), "shuffle".into()]);
+        if play {
+            cmds.push("play".into());
+        }
     }
     if !cmds.is_empty() {
-        let refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
-        mpd(&refs);
+        mpd(&[&format!("command_list_begin\n{}\ncommand_list_end", cmds.join("\n"))]);
     }
 }
 
 fn start() {
     if !STARTED.with(Cell::get) {
-        load_playlist();
+        load_playlist(false);
     }
 }
 
@@ -233,10 +236,7 @@ pub fn chng_playlist(next: bool) {
     }
     let i = playlist_index();
     i.set((i.peek() + if next { 1 } else { n - 1 }) % n);
-    mpd(&["pause 1"]);
-    is_playing().set(false);
-    load_playlist();
-    play_pause();
+    load_playlist(true);
 }
 
 /// Quickstatus media block scroll: accumulate and send whole volume steps.

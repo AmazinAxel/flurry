@@ -31,13 +31,27 @@ fn playlist_color() -> tiny_skia::Color {
 }
 
 /// Play/pause on the left with the mpd song, or the MPRIS track while mpd is paused;
-/// just a centered button when there is neither.
+/// just a centered button when there is neither. Always as tall as title plus artist.
 fn media(base: &Style) -> Node {
+    let info = |title: String, artist: String| {
+        let mut t = base.inherit();
+        t.font.size = 22.0;
+        t.font.weight = 700;
+        let a = Style { font: font(SORA, 18.0), ..base.inherit() };
+        let show_artist = !artist.is_empty();
+        Node::vbox(Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() }, SPACE_S, vec![
+            Node::label(t, title).xalign(0.0).ellipsize(),
+            Node::label(a, artist).xalign(0.0).ellipsize().show(show_artist),
+        ])
+        .expand(true, false)
+        .align(Align::Fill, Align::Center)
+    };
     let playlist = playlist_color();
     let playing = is_playing().peek();
     let bar = Style {
         background: Background::Color(playlist),
         margin: Sides::vh(SPACE_M, 0.0),
+        min_height: info(" ".into(), " ".into()).measure_h(f32::MAX).1,
         ..base.inherit()
     }
     .border(Sides::all(BORDER), lighter(playlist));
@@ -45,20 +59,10 @@ fn media(base: &Style) -> Node {
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
     let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
     let Some((title, artist)) = text else {
-        return Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0)]).expand(true, false).align(Align::Center, Align::Fill).id("mediaBtn")])
+        return Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).expand(true, false).align(Align::Center, Align::Fill).id("mediaBtn")])
             .id("media");
     };
-    let mut t = base.inherit();
-    t.font.size = 22.0;
-    t.font.weight = 700;
-    let a = Style { font: font(SORA, 18.0), ..base.inherit() };
-    let info = Node::vbox(Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() }, SPACE_S, vec![
-        Node::label(t, title).xalign(0.0).ellipsize(),
-        Node::label(a, artist.clone()).xalign(0.0).ellipsize().show(!artist.is_empty()),
-    ])
-    .expand(true, false)
-    .align(Align::Fill, Align::Center);
-    Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).id("mediaBtn"), info]).id("media")
+    Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).id("mediaBtn"), info(title, artist)]).id("media")
 }
 
 /// Wallpaper part (clock | icons | date on one GAP grid, as tall as each other) and the controls under it.

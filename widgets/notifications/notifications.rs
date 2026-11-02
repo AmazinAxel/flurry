@@ -24,6 +24,8 @@ thread_local! {
     static LIST: State<Vec<Notification>> = State::new(vec![]);
     /// the shortest usable output height: the cards scroll past it instead of outgrowing the output
     static MAX_HEIGHT: Cell<f32> = const { Cell::new(f32::MAX) };
+    /// a foot notification was activated; foot marks its window urgent in response
+    static AWAIT_URGENT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Dropped for good (settings filters).
@@ -103,6 +105,16 @@ pub fn notifications() {
             ww.redraw();
         })
     });
+    sway::subscribe(&["window"], |ev| match ev.get("change").str() {
+        Some("urgent") if ev.get("container").get("urgent").bool() == Some(true) && AWAIT_URGENT.with(|a| a.take()) => {
+            if let Some(id) = ev.get("container").get("id").int() {
+                sway::command(&format!("[con_id={id}] focus"));
+            }
+        }
+        // foot's window was already focused, so no urgent event is coming
+        Some("focus") => AWAIT_URGENT.with(|a| a.set(false)),
+        _ => {}
+    });
     notifd::on_notified(|id, _| {
         let Some(n) = notifd::get(id) else { return };
         // dropped unseen: expired, not dismissed by the user
@@ -153,9 +165,11 @@ fn safe_app_id(app: &str) -> bool {
 pub fn invoke_oldest_notification(i: usize) {
     let Some(n) = oldest() else { return };
     let Some((action, _)) = n.actions.get(i).cloned() else { return };
-    notifd::invoke(n.id, &action);
     let app = if n.desktop_entry.is_empty() { &n.app_name } else { &n.desktop_entry };
-    if action == "default" && safe_app_id(app) {
+    let foot = action == "default" && app.starts_with("foot");
+    AWAIT_URGENT.with(|a| a.set(foot));
+    notifd::invoke(n.id, &action);
+    if action == "default" && !foot && safe_app_id(app) {
         sway::command(&format!("[app_id=\"{app}\"] focus"));
     }
 }
