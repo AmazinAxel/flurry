@@ -362,11 +362,16 @@ fn prepare_unlock() {
 
 const FPRINT_BACKOFF_MIN: u64 = 2000;
 const FPRINT_BACKOFF_MAX: u64 = 60_000;
+/// an attempt that failed sooner than this never reached the reader (none, busy): back off;
+/// a longer one is pam_fprintd's idle verify timeout and retries at once
+const FPRINT_QUICK_FAIL: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct Fprint {
     /// attempts that ended on a mismatch (PAM_AUTH_ERR/PAM_MAXTRIES)
     mismatches: Cell<u32>,
     running: Cell<bool>,
+    /// when the running attempt started
+    started: Cell<Option<std::time::Instant>>,
     flash: RefCell<Option<Timer>>,
     /// next delay after a non-mismatch failure (no reader, device busy, ...)
     backoff: Cell<u64>,
@@ -419,6 +424,7 @@ impl Fprint {
             return;
         }
         self.running.set(true);
+        self.started.set(Some(std::time::Instant::now()));
         let me = self.clone();
         pam::authenticate("flurry-fprint", None, move |ev| match ev {
             pam::Event::Info => {}
@@ -449,7 +455,16 @@ impl Fprint {
                         auth_failed().set(Failed::Password);
                     }
                 } else if is_locked() {
-                    me.schedule();
+                    if me.started.take().is_none_or(|t| t.elapsed() < FPRINT_QUICK_FAIL) {
+                        me.schedule();
+                    } else {
+                        me.backoff.set(FPRINT_BACKOFF_MIN);
+                        if DISPLAY_OFF.with(Cell::get) {
+                            me.paused.set(true);
+                        } else {
+                            me.retry();
+                        }
+                    }
                 }
             }
         });
@@ -461,6 +476,7 @@ pub fn start() {
         FPRINT.with(|f| *f.borrow_mut() = Some(Rc::new(Fprint {
             mismatches: Cell::new(0),
             running: Cell::new(false),
+            started: Cell::new(None),
             flash: RefCell::default(),
             backoff: Cell::new(FPRINT_BACKOFF_MIN),
             wait: RefCell::default(),

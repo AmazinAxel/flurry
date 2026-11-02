@@ -167,6 +167,11 @@ impl Win {
                     if !w.visible() {
                         let gone = w.surfaces.take();
                         drop(gone);
+                        // nothing modal (keys, a dim) left up, only the bar: its caches go too
+                        let modal = |w: &Win| w.visible() && (w.spec.borrow().keymode != Keymode::None || w.spec.borrow().dim.is_some());
+                        if !WINDOWS.with(|ws| ws.borrow().values().any(|w| modal(w))) {
+                            super::node::trim_caches();
+                        }
                     }
                 }
             })));

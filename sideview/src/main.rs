@@ -687,7 +687,7 @@ fn main() {
             for ev in state.events.drain(..) {
                 let real = match &ev {
                     InputEvent::MouseButton(e) => e.action == MouseButtonAction::Down,
-                    InputEvent::Keyboard(e) => e.event.state == KeyState::Down,
+                    InputEvent::Keyboard(e) => e.event.state == KeyState::Down && !e.event.repeat,
                     _ => false,
                 };
                 if real && visible {

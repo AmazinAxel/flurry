@@ -1342,21 +1342,12 @@ pub fn paste(cb: impl FnOnce(String) + 'static) {
                 Err(e) => {
                     let mut d = e.into_bytes();
                     let s = String::from_utf8_lossy(&d).into_owned();
-                    wipe(&mut d);
+                    super::entry::wipe_bytes(&mut d); // pasted text may be a secret
                     cb(s);
                 }
             }
         }
     });
-}
-
-/// Zeroes all of `v`'s buffer (spare capacity too) and empties it: pasted text may be a secret.
-fn wipe(v: &mut Vec<u8>) {
-    let p = v.as_mut_ptr();
-    for i in 0..v.capacity() {
-        unsafe { std::ptr::write_volatile(p.add(i), 0) };
-    }
-    v.clear();
 }
 
 /// A pipe whose write end `send` hands to the selection's owner.
@@ -1399,7 +1390,7 @@ struct Bytes(Vec<u8>);
 
 impl Drop for Bytes {
     fn drop(&mut self) {
-        wipe(&mut self.0);
+        super::entry::wipe_bytes(&mut self.0);
     }
 }
 

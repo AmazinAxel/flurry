@@ -19,6 +19,7 @@ pub mod iwd;
 pub mod notifd;
 pub mod apps;
 pub mod pam;
+pub mod random;
 pub mod xdg;
 pub mod backgroundSection;
 pub mod inputControl;

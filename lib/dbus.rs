@@ -18,7 +18,7 @@ type MethodHandler = Rc<dyn Fn(&Message) -> Option<Message>>;
 type ReplyCb = Box<dyn FnOnce(Result<Message, String>)>;
 
 /// a call unanswered this long gets Err (libdbus' default reply timeout)
-const REPLY_TIMEOUT_MS: u64 = 25_000;
+pub const REPLY_TIMEOUT_MS: u64 = 25_000;
 
 thread_local! {
     static DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -225,10 +225,15 @@ impl Bus {
 
     /// Sends a method call; `cb` gets the reply or an error string.
     pub fn call_cb(&self, msg: Message, cb: impl FnOnce(Result<Message, String>) + 'static) {
+        self.call_cb_timeout(msg, REPLY_TIMEOUT_MS, cb);
+    }
+
+    /// `call_cb` for a call left unanswered longer than usual (one waiting on the user).
+    pub fn call_cb_timeout(&self, msg: Message, ms: u64, cb: impl FnOnce(Result<Message, String>) + 'static) {
         match self.ch.send(msg) {
             Ok(serial) => {
                 let replies = Rc::downgrade(&self.replies);
-                let t = runtime::timeout(REPLY_TIMEOUT_MS, move || {
+                let t = runtime::timeout(ms, move || {
                     let entry = replies.upgrade().and_then(|r| r.borrow_mut().remove(&serial));
                     if let Some((cb, _)) = entry {
                         cb(Err("timeout".into()));

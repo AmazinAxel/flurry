@@ -77,7 +77,23 @@ pub fn copy_entry(id: u64, mime: &str) {
         mimes.insert(0, mime); // paste the ACTUAL file
     }
     set(offer(&mimes, &data));
-    record(mime, data);
+    promote(id);
+}
+
+/// Moves the entry to the top under its own id (older entries' ids aren't the content hash).
+fn promote(id: u64) {
+    crate::ui::runtime::spawn(async move {
+        let disk = DISK.with(Clone::clone);
+        let _turn = disk.lock().await;
+        let index = with_history(|h| {
+            let i = h.iter().position(|e| e.id == id).filter(|&i| i > 0)?;
+            h[..=i].rotate_right(1);
+            Some(format_index(h))
+        });
+        let Some(index) = index else { return };
+        changed();
+        crate::ui::runtime::blocking(move || write_atomic(&format!("{}/index", dir()), index.as_bytes())).await;
+    });
 }
 
 // ---------------------------------------------------------------- history
@@ -100,8 +116,6 @@ thread_local! {
     static DISK: Rc<crate::ui::runtime::Queue> = Rc::default();
     /// bumped by wipe: a record started before it is dropped
     static WIPES: Cell<u64> = const { Cell::new(0) };
-    /// bumped per selection: a slow read of an older one is dropped
-    static SEQ: Cell<u64> = const { Cell::new(0) };
 }
 
 fn dir() -> String {
@@ -167,21 +181,9 @@ fn changed() {
     }
 }
 
-fn image_dims(b: &[u8]) -> Option<(u32, u32)> {
-    match b {
-        [0x89, b'P', b'N', b'G', ..] if b.len() >= 24 => Some((u32::from_be_bytes(b[16..20].try_into().ok()?), u32::from_be_bytes(b[20..24].try_into().ok()?))),
-        [0xff, 0xd8, ..] => {
-            let mut d = zune_jpeg::JpegDecoder::new(b);
-            d.decode_headers().ok()?;
-            d.dimensions().map(|(w, h)| (w as u32, h as u32))
-        }
-        _ => None,
-    }
-}
-
 fn preview(mime: &str, data: &[u8]) -> Option<String> {
     if mime.starts_with("image/") {
-        return image_dims(data).map(|(w, h)| format!("{w}x{h}"));
+        return crate::ui::image::dims(data).map(|(w, h)| format!("{w}x{h}"));
     }
     let text = String::from_utf8_lossy(&data[..data.len().min(4096)]).split_whitespace().collect::<Vec<_>>().join(" ");
     match text.char_indices().nth(100) {
@@ -290,10 +292,6 @@ pub fn watch(on_change: impl Fn() + 'static) {
     ON_CHANGE.with(|c| *c.borrow_mut() = Some(Rc::new(on_change)));
     cleanup();
     wayland::on_selection(|mimes| {
-        let seq = SEQ.with(|s| {
-            s.set(s.get() + 1);
-            s.get()
-        });
         let has = |m: &str| mimes.iter().any(|x| x == m);
         // secrets aren't kept; flurry's own copies were recorded already
         if has(SECRET_HINT) || has(wayland::OWN_MIME) {
@@ -302,9 +300,7 @@ pub fn watch(on_change: impl Fn() + 'static) {
         let Some(mime) = TEXT.into_iter().chain(["text/uri-list", "image/png", "image/jpeg"]).find(|m| has(m)) else { return };
         let stored = if TEXT.contains(&mime) { "text/plain" } else { mime };
         wayland::read_selection(mime, MAX_BYTES, 5000, move |data| {
-            if let Some(d) = data
-                && SEQ.with(Cell::get) == seq
-            {
+            if let Some(d) = data {
                 record(stored, d);
             }
         });

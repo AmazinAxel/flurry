@@ -239,8 +239,12 @@ pub fn start() {
             }
         } else {
             refocus();
-            // signal levels change without a signal
+            // the list shows from the cache now; signal levels change without a signal, so
+            // iwd's are re-read too and the rows update in place once they land
             queue_refresh();
+            runtime::spawn(async {
+                iwd::refresh().await;
+            });
         }
     });
 }

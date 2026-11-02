@@ -1256,7 +1256,6 @@ thread_local! {
 }
 
 /// Drops every cached shadow, blur, layout and glyph: for when nothing but the bar is on screen.
-#[allow(dead_code)] // until the window layer calls it
 pub fn trim_caches() {
     SHADOWS.with(|s| *s.borrow_mut() = LayerCache::new(SHADOW_BUDGET));
     BLURRED.with(|b| *b.borrow_mut() = Blurred::default());

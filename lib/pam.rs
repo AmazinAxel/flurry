@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
+use crate::ui::entry::wipe_bytes;
 use crate::ui::runtime;
 
 #[repr(C)]
@@ -110,14 +111,6 @@ thread_local! {
         let pw = libc::getpwuid(libc::getuid());
         if pw.is_null() { CString::default() } else { CStr::from_ptr((*pw).pw_name).to_owned() }
     };
-}
-
-fn wipe_bytes(v: &mut Vec<u8>) {
-    let p = v.as_mut_ptr();
-    for i in 0..v.capacity() {
-        unsafe { std::ptr::write_volatile(p.add(i), 0) };
-    }
-    v.clear();
 }
 
 /// The password as a C string without leaving unwiped copies behind (no realloc for the nul).

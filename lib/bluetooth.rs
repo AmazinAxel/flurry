@@ -233,8 +233,12 @@ pub fn start() {
 }
 
 fn call(path: &str, iface: &str, member: &str, done: impl FnOnce(bool) + 'static) {
+    call_timeout(path, iface, member, dbus::REPLY_TIMEOUT_MS, done);
+}
+
+fn call_timeout(path: &str, iface: &str, member: &str, ms: u64, done: impl FnOnce(bool) + 'static) {
     let Some(bus) = dbus::system() else { return done(false) };
-    bus.call_cb(method(BLUEZ, path, iface, member), move |r| done(r.is_ok()));
+    bus.call_cb_timeout(method(BLUEZ, path, iface, member), ms, move |r| done(r.is_ok()));
 }
 
 fn set_flag(path: &str, f: impl FnOnce(&mut Device)) {
@@ -259,6 +263,8 @@ pub fn disconnect(path: &str) {
     call(path, "org.bluez.Device1", "Disconnect", |_| {});
 }
 
+const PAIR_TIMEOUT_MS: u64 = 120_000;
+
 /// `done` gets whether pairing succeeded; the code shown for it goes either way. Ignored (no `done`)
 /// while a Pair call for the device is in flight.
 pub fn pair(path: &str, done: impl FnOnce(bool) + 'static) {
@@ -267,7 +273,8 @@ pub fn pair(path: &str, done: impl FnOnce(bool) + 'static) {
     }
     set_flag(path, |d| d.pairing = true);
     let p = path.to_string();
-    call(path, "org.bluez.Device1", "Pair", move |ok| {
+    // past the usual reply timeout: bluez answers once the user confirms the code
+    call_timeout(path, "org.bluez.Device1", "Pair", PAIR_TIMEOUT_MS, move |ok| {
         set_flag(&p, |d| d.pairing = false);
         if bt().with(|b| b.pairing.as_ref().is_some_and(|x| x.device == p)) {
             answer(false);
@@ -307,21 +314,6 @@ pub fn toggle_power() {
 
 const AGENT: &str = "org.bluez.Agent1";
 const AGENT_PATH: &str = "/org/flurry/BluezAgent";
-
-/// Uniform in 0..1_000_000; None if the kernel gives no randomness.
-fn random_code() -> Option<u32> {
-    // samples at or above the last whole multiple of 10^6 would favour the low codes: drawn again
-    const LIMIT: u32 = u32::MAX - u32::MAX % 1_000_000;
-    // EINTR, a short read or a rejected sample retries; a rejection is ~0.02% likely, so 16 is plenty
-    for _ in 0..16 {
-        let mut x = 0u32;
-        let n = unsafe { libc::getrandom((&raw mut x).cast(), 4, 0) };
-        if n == 4 && x < LIMIT {
-            return Some(x % 1_000_000);
-        }
-    }
-    None
-}
 
 fn show(device: &str, code: String, confirm: bool) {
     let p = Pairing { device: device.into(), code, confirm };
@@ -375,7 +367,7 @@ fn export_agent(bus: &Rc<dbus::Bus>) {
         }),
         ("RequestPinCode", |m| {
             let dev: dbus::Path = m.read1().ok()?;
-            let Some(code) = random_code() else { return Some(rejected(m)) };
+            let Some(code) = crate::lib::random::below(1_000_000) else { return Some(rejected(m)) };
             let code = format!("{code:06}");
             show(&dev, code.clone(), false);
             Some(m.method_return().append1(code))

@@ -67,7 +67,11 @@ fn next_word(s: &str, i: usize) -> usize {
 
 /// Zeroes a secret's whole buffer (spare capacity holds deleted bytes too); empties the string.
 pub fn wipe(s: &mut String) {
-    let v = unsafe { s.as_mut_vec() };
+    wipe_bytes(unsafe { s.as_mut_vec() });
+}
+
+/// `wipe` for bytes.
+pub fn wipe_bytes(v: &mut Vec<u8>) {
     let p = v.as_mut_ptr();
     for i in 0..v.capacity() {
         unsafe { std::ptr::write_volatile(p.add(i), 0) };

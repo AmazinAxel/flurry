@@ -238,7 +238,8 @@ fn describe(item: &Item) -> String {
 fn placeholder(base: &Style, item: &Item) -> Option<Node> {
     let (w, h) = item.image.as_deref()?.split_once('x')?;
     let (w, h): (f32, f32) = (w.parse().ok()?, h.parse().ok()?);
-    if w < 1.0 || h < 1.0 {
+    // past THUMB_PIXELS the decode is refused: no thumbnail to hold room for
+    if w < 1.0 || h < 1.0 || (w as u64).saturating_mul(h as u64) > image::THUMB_PIXELS {
         return None;
     }
     let k = device_scale();

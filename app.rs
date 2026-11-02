@@ -101,24 +101,15 @@ fn serve(sock: UnixDatagram) {
     });
 }
 
+thread_local! {
+    /// the sync reminder last sent: not sent again while it's still up
+    static SYNC_NOTE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// Checked at startup, then once a day (a one-shot timer chain, no polling).
 fn reminders() {
     let _ = runtime::timeout(86_400_000, reminders);
-    // lastSync: unix ms
-    let last_sync = format!("{}/flurry/lastSync", xdg::state_dir());
-    let last: u64 = std::fs::read_to_string(&last_sync).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    let now = lib::time::now_secs() * 1000;
-    if !settings::SYNC_COMMAND.is_empty() && now.saturating_sub(last) > 7 * 86_400_000 {
-        let argv: Vec<String> = settings::SYNC_COMMAND.iter().map(|s| s.to_string()).collect();
-        lib::notifd::send_local("Sync", "Sync system", "", &[("1".into(), "Update & Sync".into())], move |action| {
-            if action == "1" {
-                if let Some(dir) = std::path::Path::new(&last_sync).parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let _ = std::fs::write(&last_sync, (lib::time::now_secs() * 1000).to_string());
-                lib::apps::launch(&argv);
-            }
-        });
+    if sync_reminder() {
         return;
     }
     let downloads = xdg::user_dir("DOWNLOAD");
@@ -135,6 +126,33 @@ fn reminders() {
             lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), argv)]);
         }
     });
+}
+
+/// Reminds to sync when the last one is over a week old (wall clock, so time asleep counts);
+/// true when due.
+fn sync_reminder() -> bool {
+    // lastSync: unix ms
+    let last_sync = format!("{}/flurry/lastSync", xdg::state_dir());
+    let last: u64 = std::fs::read_to_string(&last_sync).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let now = lib::time::now_secs() * 1000;
+    if settings::SYNC_COMMAND.is_empty() || now.saturating_sub(last) <= 7 * 86_400_000 {
+        return false;
+    }
+    if SYNC_NOTE.with(|n| n.get()).and_then(lib::notifd::get).is_some_and(|n| n.app_name == "Sync") {
+        return true;
+    }
+    let argv: Vec<String> = settings::SYNC_COMMAND.iter().map(|s| s.to_string()).collect();
+    let id = lib::notifd::send_local("Sync", "Sync system", "", &[("1".into(), "Update & Sync".into())], move |action| {
+        if action == "1" {
+            if let Some(dir) = std::path::Path::new(&last_sync).parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&last_sync, (lib::time::now_secs() * 1000).to_string());
+            lib::apps::launch(&argv);
+        }
+    });
+    SYNC_NOTE.with(|n| n.set(Some(id)));
+    true
 }
 
 /// `du -sb`: apparent size of everything under `p`.
@@ -208,6 +226,12 @@ fn main() {
         service::start();
         lib::apps::reload();
         reminders();
+        // monotonic timers stand still while suspended: a resume re-checks too
+        lib::logind::sleeping().subscribe(|| {
+            if !lib::logind::sleeping().peek() {
+                sync_reminder();
+            }
+        });
         service::start_clipping_service();
         unsafe { libc::malloc_trim(0) };
     };

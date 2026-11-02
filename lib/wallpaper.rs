@@ -51,38 +51,6 @@ fn list_files(dir: &str, out: &mut Vec<String>) {
     }
 }
 
-/// 8 random bytes; None if the kernel won't give them (a few retries on EINTR or a short read).
-fn random_u64() -> Option<u64> {
-    let mut b = [0u8; 8];
-    let mut got = 0;
-    for _ in 0..8 {
-        let r = unsafe { libc::getrandom(b[got..].as_mut_ptr().cast(), 8 - got, 0) };
-        if r > 0 {
-            got += r as usize;
-            if got == 8 {
-                return Some(u64::from_ne_bytes(b));
-            }
-        } else if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return None;
-        }
-    }
-    None
-}
-
-/// Uniform in 0..n (rejection sampling, no modulo bias).
-fn random(n: usize) -> Option<usize> {
-    let n = n as u64;
-    // the largest multiple of n: values from it up are rejected (less than half the range)
-    let limit = u64::MAX - u64::MAX % n;
-    for _ in 0..16 {
-        let x = random_u64()?;
-        if x < limit {
-            return Some((x % n) as usize);
-        }
-    }
-    None
-}
-
 /// Device pixel sizes of the active outputs (sway's logical rects at their scale): a wallpaper
 /// never needs more than covering the largest.
 fn output_sizes() -> Vec<(f64, f64)> {
@@ -118,7 +86,7 @@ fn load(cur: Option<String>) -> Option<(String, ShmPixels)> {
         if files.is_empty() {
             break;
         }
-        let Some(i) = random(files.len()) else { break };
+        let Some(i) = crate::lib::random::below(files.len() as u64).map(|i| i as usize) else { break };
         let path = files.swap_remove(i);
         let Ok(bytes) = std::fs::read(&path) else { continue };
         let fit = |w, h| cover_size(w, h, &outputs);
@@ -210,6 +178,5 @@ mod tests {
         assert_eq!(cover_size(6000, 4000, &[(2560.0, 1440.0), (1920.0, 1080.0)]), (2560, 1707));
         assert_eq!(cover_size(1000, 1000, &[(2560.0, 1440.0)]), (1000, 1000));
         assert_eq!(cover_size(6000, 4000, &[]), (6000, 4000));
-        assert!(random(3).is_some_and(|i| i < 3));
     }
 }

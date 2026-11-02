@@ -140,6 +140,18 @@ fn decode_pixels(bytes: &[u8], max: u64) -> Option<(Vec<u8>, u32, u32)> {
     }
 }
 
+/// The upright size (EXIF orientation 5-8 swaps it) from the header alone, of any size.
+pub fn dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] if bytes.len() >= 24 => Some((u32::from_be_bytes(bytes[16..20].try_into().ok()?), u32::from_be_bytes(bytes[20..24].try_into().ok()?))),
+        [0xff, 0xd8, ..] => {
+            let (w, h, o) = jpeg_dims(&mut jpeg_decoder(bytes), u64::MAX)?;
+            Some(if o >= 5 { (h, w) } else { (w, h) })
+        }
+        _ => None,
+    }
+}
+
 /// Sniffs the format from the header; at most THUMB_PIXELS.
 pub fn decode(bytes: &[u8]) -> Option<Pixmap> {
     let (px, w, h) = decode_pixels(bytes, THUMB_PIXELS)?;
