@@ -1,7 +1,8 @@
 // Child processes on the poll loop: async exec, stdin piping,
-// line-streamed stdout/stderr, signals. std spawns through posix_spawn (vfork), the cheapest path.
+// line-streamed stdout/stderr, signals. std spawns through posix_spawn (vfork), the cheapest path,
+// except with pre_exec (spawn_lines), which forces fork+exec.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
@@ -48,10 +49,19 @@ fn read_stream(fd: OwnedFd, chunk: impl Fn(&[u8]) + 'static, done: impl FnOnce()
 }
 
 /// Resolves to the exit code once `child` exits (-1 if killed by a signal).
-fn wait(mut child: Child) -> runtime::Receiver<i32> {
+fn wait(child: Child) -> runtime::Receiver<i32> {
+    let fd = pidfd(child.id()).map(Rc::new);
+    wait_fd(child, fd)
+}
+
+fn wait_fd(mut child: Child, fd: Option<Rc<OwnedFd>>) -> runtime::Receiver<i32> {
     let (tx, rx) = runtime::oneshot();
-    let Some(fd) = pidfd(child.id()) else {
-        tx.send(child.wait().ok().and_then(|s| s.code()).unwrap_or(-1));
+    let Some(fd) = fd else {
+        // no pidfd (old kernel): wait on a thread so the loop never blocks
+        runtime::spawn(async move {
+            let code = runtime::blocking(move || child.wait().ok().and_then(|s| s.code()).unwrap_or(-1)).await;
+            tx.send(code.unwrap_or(-1));
+        });
         return rx;
     };
     let raw = fd.as_raw_fd();
@@ -84,20 +94,47 @@ pub async fn output(argv: &[&str], stdin: Option<&[u8]>) -> Option<Output> {
     let mut c = command(argv)?;
     c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().ok()?;
-    if let (Some(data), Some(mut si)) = (stdin, child.stdin.take()) {
-        // inputs are small (passwords, clipboard text); a blocking write is fine
-        let _ = si.write_all(data);
+    if let (Some(data), Some(si)) = (stdin, child.stdin.take()) {
+        write_stdin(si, data);
     }
     let out = Rc::new(RefCell::new((Vec::new(), Vec::new())));
-    let (tx_o, rx_o) = runtime::oneshot::<()>();
-    let (tx_e, rx_e) = runtime::oneshot::<()>();
+    let (tx, rx) = runtime::oneshot::<()>();
+    let tx = Rc::new(tx);
+    // (stdout, stderr) still open; tx fires once both hit EOF
+    let open = Rc::new(Cell::new((true, true)));
+    let eof = |stdout: bool| {
+        let (open, tx) = (open.clone(), tx.clone());
+        move || {
+            let (o, e) = open.get();
+            let now = if stdout { (false, e) } else { (o, false) };
+            open.set(now);
+            if now == (false, false) {
+                tx.send(());
+            }
+        }
+    };
+    let (so, se): (OwnedFd, OwnedFd) = (child.stdout.take()?.into(), child.stderr.take()?.into());
+    let (so_raw, se_raw) = (so.as_raw_fd(), se.as_raw_fd());
     let o = out.clone();
-    read_stream(child.stdout.take()?.into(), move |b| o.borrow_mut().0.extend_from_slice(b), move || tx_o.send(()));
+    read_stream(so, move |b| o.borrow_mut().0.extend_from_slice(b), eof(true));
     let o = out.clone();
-    read_stream(child.stderr.take()?.into(), move |b| o.borrow_mut().1.extend_from_slice(b), move || tx_e.send(()));
+    read_stream(se, move |b| o.borrow_mut().1.extend_from_slice(b), eof(false));
     let code = wait(child).await.unwrap_or(-1);
-    rx_o.await;
-    rx_e.await;
+    // a grandchild can hold the pipes open long after: stop reading shortly after the child exits
+    let t = {
+        let tx = tx.clone();
+        runtime::timeout(200, move || tx.send(()))
+    };
+    rx.await;
+    t.cancel();
+    // unwatching closes a still-open pipe (an EOF'd one is closed already, its number maybe reused)
+    let (o, e) = open.get();
+    if o {
+        runtime::unwatch(so_raw);
+    }
+    if e {
+        runtime::unwatch(se_raw);
+    }
     let (so, se) = std::mem::take(&mut *out.borrow_mut());
     Some(Output { code, stdout: String::from_utf8_lossy(&so).into_owned(), stderr: String::from_utf8_lossy(&se).into_owned() })
 }
@@ -105,17 +142,47 @@ pub async fn output(argv: &[&str], stdin: Option<&[u8]>) -> Option<Output> {
 /// execAsync: stdout (trailing newline trimmed) on success, stderr on failure.
 pub async fn exec(argv: &[&str]) -> Result<String, String> {
     match output(argv, None).await {
-        Some(o) if o.code == 0 => Ok(o.stdout.trim_end_matches('\n').to_string()),
-        Some(o) => Err(o.stderr.trim_end().to_string()),
+        Some(mut o) if o.code == 0 => {
+            o.stdout.truncate(o.stdout.trim_end_matches('\n').len());
+            Ok(o.stdout)
+        }
+        Some(mut o) => {
+            o.stderr.truncate(o.stderr.trim_end().len());
+            Err(o.stderr)
+        }
         None => Err(format!("failed to spawn {}", argv.first().unwrap_or(&""))),
     }
 }
 
-/// execAsync with a command string, split like GLib's g_shell_parse_argv.
-pub async fn exec_str(cmd: &str) -> Result<String, String> {
-    let argv = shell_split(cmd);
-    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    exec(&refs).await
+/// Writes `data` without blocking the loop: what fits in the pipe now, the rest from a thread.
+fn write_stdin(mut si: std::process::ChildStdin, data: &[u8]) {
+    let raw = si.as_raw_fd();
+    nonblock(raw);
+    let mut n = 0;
+    while n < data.len() {
+        match si.write(&data[n..]) {
+            Ok(0) => return,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => return,
+        }
+    }
+    if n < data.len() {
+        unsafe { libc::fcntl(raw, libc::F_SETFL, libc::fcntl(raw, libc::F_GETFL) & !libc::O_NONBLOCK) };
+        let rest = data[n..].to_vec();
+        std::thread::spawn(move || {
+            let _ = si.write_all(&rest);
+        });
+    }
+}
+
+/// Exit code (-1 if killed by a signal); None if it couldn't start. No stdio.
+pub async fn status(argv: &[&str]) -> Option<i32> {
+    let mut c = command(argv)?;
+    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let child = c.spawn().ok()?;
+    Some(wait(child).await.unwrap_or(-1))
 }
 
 /// Pipes `input` to stdin; true on exit status 0.
@@ -127,11 +194,24 @@ pub async fn run_input(argv: &[&str], input: &[u8]) -> bool {
 /// A running process with line-streamed output.
 pub struct Proc {
     pub pid: u32,
+    pidfd: Option<Rc<OwnedFd>>,
+    exited: Rc<Cell<bool>>,
 }
 
 impl Proc {
+    /// No-op once the child exited (the pidfd can't hit a reused pid).
     pub fn signal(&self, sig: i32) {
-        unsafe { libc::kill(self.pid as libc::pid_t, sig) };
+        if self.exited.get() {
+            return;
+        }
+        match &self.pidfd {
+            Some(fd) => unsafe {
+                libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0);
+            },
+            None => unsafe {
+                libc::kill(self.pid as libc::pid_t, sig);
+            },
+        }
     }
 }
 
@@ -152,96 +232,37 @@ pub fn spawn_lines(
 ) -> Option<Proc> {
     let mut c = command(argv)?;
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    // long-lived helpers (gpu-screen-recorder, ffmpeg) must not outlive the shell
+    // long-lived helpers (gpu-screen-recorder, ffmpeg) must not outlive the shell; a shell that
+    // died before prctl ran would never deliver the signal, so the child checks it's still ours
+    let parent = unsafe { libc::getpid() };
     unsafe {
-        std::os::unix::process::CommandExt::pre_exec(&mut c, || {
+        std::os::unix::process::CommandExt::pre_exec(&mut c, move || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
             Ok(())
         });
     }
     let mut child = c.spawn().ok()?;
     let pid = child.id();
+    let pidfd = pidfd(pid).map(Rc::new);
+    let exited = Rc::new(Cell::new(false));
     read_stream(child.stdout.take()?.into(), lines(stdout), || {});
     read_stream(child.stderr.take()?.into(), lines(stderr), || {});
-    let rx = wait(child);
-    runtime::spawn(async move { exit(rx.await.unwrap_or(-1)) });
-    Some(Proc { pid })
-}
-
-/// g_shell_parse_argv: whitespace splits, single quotes literal, double quotes with backslash escapes.
-pub fn shell_split(s: &str) -> Vec<String> {
-    let mut out = vec![];
-    let mut cur = String::new();
-    let mut has = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                has = true;
-                for c in chars.by_ref() {
-                    if c == '\'' {
-                        break;
-                    }
-                    cur.push(c);
-                }
-            }
-            '"' => {
-                has = true;
-                while let Some(c) = chars.next() {
-                    match c {
-                        '"' => break,
-                        '\\' if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => cur.push(chars.next().unwrap()),
-                        _ => cur.push(c),
-                    }
-                }
-            }
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
-                    has = true;
-                }
-            }
-            c if c.is_whitespace() => {
-                if has {
-                    out.push(std::mem::take(&mut cur));
-                    has = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                has = true;
-            }
-        }
-    }
-    if has {
-        out.push(cur);
-    }
-    out
-}
-
-/// Runs with stdout written to `path` (binary-safe); true on exit status 0.
-pub async fn to_file(argv: &[&str], path: &str) -> bool {
-    let Some(mut c) = command(argv) else { return false };
-    let Ok(f) = std::fs::File::create(path) else { return false };
-    c.stdin(Stdio::null()).stdout(f).stderr(Stdio::null());
-    match c.spawn() {
-        Ok(child) => wait(child).await == Some(0),
-        Err(_) => false,
-    }
+    let rx = wait_fd(child, pidfd.clone());
+    let e = exited.clone();
+    runtime::spawn(async move {
+        let code = rx.await.unwrap_or(-1);
+        e.set(true);
+        exit(code)
+    });
+    Some(Proc { pid, pidfd, exited })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn splits_like_glib() {
-        assert_eq!(
-            shell_split(r#"footclient -e fish -c 'sys-sync; echo "Press a key"; read'"#),
-            vec!["footclient", "-e", "fish", "-c", r#"sys-sync; echo "Press a key"; read"#]
-        );
-        assert_eq!(shell_split(r#"nemo "/home/x y/Downloads""#), vec!["nemo", "/home/x y/Downloads"]);
-    }
 
     #[test]
     fn exec_collects_stdout_and_status() {

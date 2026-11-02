@@ -8,7 +8,6 @@ use crate::lib::style::*;
 use crate::ui::node::{Kind, Node, Sides, Style, fill_rect};
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{Spec, Win};
-use crate::widgets::status::modules::statusIcons::leak;
 
 thread_local! {
     static OSD: RefCell<(&'static str, f64)> = const { RefCell::new(("", 0.0)) };
@@ -54,7 +53,7 @@ pub fn osd() {
 
     let b = brightness();
     let s1 = show.clone();
-    b.subscribe(move || s1(leak("display-brightness-symbolic"), brightness().peek()));
+    b.subscribe(move || s1("display-brightness-symbolic", brightness().peek()));
 
     // volume/mute changes and default speaker switches, after the first sync; a default that is
     // briefly unknown (new sink not bound yet) keeps the last one so the switch still shows

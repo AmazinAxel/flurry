@@ -17,7 +17,6 @@ thread_local! {
     static REC_QUALITY: State<&'static str> = State::new("Ultra");
     static REC: RefCell<Option<(Proc, String, OnExit)>> = const { RefCell::new(None) };
     static CLIPPER: RefCell<Option<Proc>> = const { RefCell::new(None) };
-    static CLIPPER_GEN: Cell<u32> = const { Cell::new(0) };
 }
 
 pub fn is_rec() -> State<bool> {
@@ -35,7 +34,6 @@ fn videos() -> String {
 }
 
 fn stop_clipper() {
-    CLIPPER_GEN.with(|g| g.set(g.get() + 1));
     if let Some(p) = CLIPPER.with(|c| c.borrow_mut().take()) {
         p.signal(libc::SIGINT);
     }
@@ -47,14 +45,10 @@ fn locked() -> bool {
 
 pub fn start_clipping_service() {
     stop_clipper();
-    let generation = CLIPPER_GEN.with(Cell::get);
-    if battery().peek().on_battery() || locked() {
+    if battery().peek().on_battery() || locked() || is_rec().peek() {
         return;
     }
     let Some(monitor) = sway::focused_output() else { return };
-    if generation != CLIPPER_GEN.with(Cell::get) || is_rec().peek() {
-        return;
-    }
     let clips = format!("{}/Clips", videos());
     let pid = std::rc::Rc::new(Cell::new(0u32));
     let p2 = pid.clone();
@@ -109,42 +103,62 @@ pub fn start_rec() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let file = format!("{}/Captures/{}.mp4", videos(), format(now, "%Y-%m-%d_%H-%M-%S"));
     let audio = if rec_mic().peek() { "default_output|default_input" } else { "default_output" };
-    is_rec().set(true);
     let Some(monitor) = sway::focused_output() else {
-        is_rec().set(false);
+        start_clipping_service();
         return;
     };
-    if !is_rec().peek() {
-        return;
-    }
     let q = rec_quality().peek().to_lowercase();
     let on_exit: OnExit = Default::default();
     let hook = on_exit.clone();
+    let pid = std::rc::Rc::new(Cell::new(0u32));
+    let p2 = pid.clone();
     let exit = move |_| {
         if let Some(f) = hook.borrow_mut().take() {
             f();
         }
+        // ended on its own (crash, bad args): not recording anymore
+        let ours = REC.with(|r| {
+            let mut r = r.borrow_mut();
+            let ours = r.as_ref().is_some_and(|(p, _, _)| p.pid == p2.get());
+            if ours {
+                *r = None;
+            }
+            ours
+        });
+        if ours {
+            is_rec().set(false);
+            start_clipping_service();
+        }
     };
-    if let Some(p) = process::spawn_lines(&["gpu-screen-recorder", "-a", audio, "-q", &q, "-w", &monitor, "-o", &file], |_| {}, |_| {}, exit) {
-        REC.with(|r| *r.borrow_mut() = Some((p, file, on_exit)));
+    match process::spawn_lines(&["gpu-screen-recorder", "-a", audio, "-q", &q, "-w", &monitor, "-o", &file], |_| {}, |_| {}, exit) {
+        Some(p) => {
+            pid.set(p.pid);
+            REC.with(|r| *r.borrow_mut() = Some((p, file, on_exit)));
+            is_rec().set(true);
+        }
+        None => start_clipping_service(),
     }
 }
 
 pub fn save_clip() {
-    match CLIPPER.with(|c| c.borrow().as_ref().map(|p| p.pid)) {
-        None => start_clipping_service(),
-        Some(pid) => unsafe {
-            libc::kill(pid as i32, libc::SIGUSR1);
-        },
+    let saved = CLIPPER.with(|c| c.borrow().as_ref().map(|p| p.signal(libc::SIGUSR1)).is_some());
+    if !saved {
+        start_clipping_service();
     }
 }
 
 pub fn stop_rec() {
-    if let Some((p, file, on_exit)) = REC.with(|r| r.borrow_mut().take()) {
-        // copy the file once the recorder has finalized it
-        *on_exit.borrow_mut() = Some(Box::new(move || copy_uri(&file)));
-        p.signal(libc::SIGINT);
-    }
     is_rec().set(false);
-    start_clipping_service();
+    let Some((p, file, on_exit)) = REC.with(|r| r.borrow_mut().take()) else {
+        start_clipping_service();
+        return;
+    };
+    // once the recorder has finalized the file: copy it, then the clipper takes the GPU again
+    *on_exit.borrow_mut() = Some(Box::new(move || {
+        copy_uri(&file);
+        if CLIPPER.with(|c| c.borrow().is_none()) {
+            start_clipping_service();
+        }
+    }));
+    p.signal(libc::SIGINT);
 }

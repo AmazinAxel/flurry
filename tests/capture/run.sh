@@ -3,6 +3,7 @@
 # Isolation: fake HOME, own runtime dir, own session bus, mocked system bus (iwd/bluez/upower/logind),
 # fake backlight, no pipewire, no PAM configs, fake gpu-screen-recorder. Never touches the live session.
 # usage: tests/capture/run.sh [flurry-binary] [out-dir]
+# flurry-binary: the `flurry` client (result/bin/flurry, target/release/flurry); it starts the sibling flurry-shell
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -12,7 +13,7 @@ if [[ ${1:-} != __inner ]]; then
   out=$(realpath -m "${2:-$here/../golden}")
   mkdir -p "$out"
   tools='with import <nixpkgs> {}; buildEnv { name = "flurry-capture"; paths = [
-    grim wtype imagemagick cliphist dbus bubblewrap libnotify (python3.withPackages (p: [ p.python-dbusmock ])) ]; }'
+    grim wtype imagemagick dbus bubblewrap libnotify (python3.withPackages (p: [ p.python-dbusmock ])) ]; }'
   exec nix shell --impure --expr "$tools" -c dbus-run-session -- "$0" __inner "$flurry" "$out"
 fi
 
@@ -27,7 +28,7 @@ chmod 700 "$tmp/run"
 ln -s "$HOME/.local/share/fonts" "$H/.local/share/fonts"
 ln -s "$HOME/.config/gtk-4.0" "$H/.config/gtk-4.0"
 magick -size 2560x1600 gradient:'#2e3440-#5e81ac' -swirl 90 "$H/Wallpapers/dark.jpg"
-date -d '2026-10-27 12:00:00' +%s000 > "$H/.local/state/flurry/lastSync"
+date +%s000 > "$H/.local/state/flurry/lastSync" # just synced: no reminder in the shots
 for e in github.com mail.example.org web/forum.example.net web/shop.example.com; do : > "$H/.password-store/$e.gpg"; done
 
 # Fake backlight
@@ -41,11 +42,14 @@ export MPD_HOST=127.0.0.1 MPD_PORT=1 # refused: never the live mpd
 # Safety: everything below must talk to the private session bus from dbus-run-session, never the live one
 [[ ${DBUS_SESSION_BUS_ADDRESS:-} == *"/run/user/"* || -z ${DBUS_SESSION_BUS_ADDRESS:-} ]] && { echo "refusing: not on a private session bus" >&2; exit 1; }
 unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME WAYLAND_DISPLAY SWAYSOCK DISPLAY I3SOCK
-mkdir -p "$H/.cache/cliphist"
-printf 'hello from the clipboard' | cliphist store
-printf 'https://example.org/a/very/long/link/that/should/wrap/inside/the/clipboard/list/item' | cliphist store
-printf 'second line\nthird line' | cliphist store
-magick -size 320x200 gradient:"#bf616a-#5e81ac" png:- | cliphist store
+# clipboard history: entry files plus the index (newest first)
+C=$H/.cache/flurry/clipboard url=https://example.org/a/very/long/link/that/should/wrap/inside/the/clipboard/list/item
+mkdir -p "$C"
+printf 'hello from the clipboard' > "$C/1"
+printf '%s' "$url" > "$C/2"
+printf 'second line\nthird line' > "$C/3"
+magick -size 320x200 gradient:"#bf616a-#5e81ac" "png:$C/4.png"
+printf '4\timage/png\t320x200\n3\ttext/plain\tsecond line third line\n2\ttext/plain\t%s\n1\ttext/plain\thello from the clipboard\n' "$url" > "$C/index"
 
 mkdir -p "$tmp/bin"
 printf '#!/bin/sh\nexit 0\n' > "$tmp/bin/gpu-screen-recorder"
@@ -87,7 +91,7 @@ bwrap --die-with-parent --dev-bind / / --bind "$tmp/backlight" /sys/class/backli
   PATH="$tmp/bin:$PATH" sway -c "$tmp/sway.conf" > "$tmp/sway.log" 2>&1 &
 for _ in $(seq 50); do ls "$tmp/run"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.1; done
 export SWAYSOCK=$(ls "$tmp/run"/sway-ipc.*.sock) WAYLAND_DISPLAY=wayland-1
-printf '#!/bin/sh\nexec %s > %s 2>&1\n' "$flurry" "$tmp/flurry.log" > "$tmp/bin/start-flurry"
+printf '#!/usr/bin/env bash\nexec %q > %q 2>&1\n' "$flurry" "$tmp/flurry.log" > "$tmp/bin/start-flurry"
 chmod +x "$tmp/bin/start-flurry"
 swaymsg "exec $tmp/bin/start-flurry" >/dev/null
 sleep 4

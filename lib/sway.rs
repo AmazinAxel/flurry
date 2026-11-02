@@ -44,14 +44,19 @@ thread_local! {
 }
 
 /// Blocking round trip on a short-lived local socket; sway replies within microseconds.
+/// A stuck sway costs at most the 1s timeout, not the whole loop.
 fn roundtrip(kind: u32, payload: &str) -> Option<Json> {
     SOCK.with(|s| {
         let mut s = s.borrow_mut();
         for attempt in 0..2 {
             if s.is_none() {
-                *s = connect();
+                *s = connect().filter(|c| {
+                    let t = Some(std::time::Duration::from_secs(1));
+                    c.set_read_timeout(t).is_ok() && c.set_write_timeout(t).is_ok()
+                });
             }
             let sock = s.as_mut()?;
+            let mut timed_out = false;
             let ok = sock.write_all(&encode(kind, payload)).is_ok();
             let mut buf = vec![];
             let mut chunk = [0u8; 65536];
@@ -61,16 +66,22 @@ fn roundtrip(kind: u32, payload: &str) -> Option<Json> {
                         break Some(body);
                     }
                     match sock.read(&mut chunk) {
-                        Ok(0) | Err(_) => break None,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            timed_out = matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut);
+                            break None;
+                        }
+                        _ => break None,
                     }
                 })
                 .flatten();
             if let Some(body) = reply {
                 return json::parse(&body);
             }
+            // a late reply would answer the next request: start over on a fresh socket
             *s = None;
-            if attempt == 1 {
+            if attempt == 1 || timed_out {
                 return None;
             }
         }
@@ -90,6 +101,10 @@ pub fn tree() -> Option<Json> {
     roundtrip(4, "")
 }
 
+pub fn workspaces() -> Option<Json> {
+    roundtrip(1, "")
+}
+
 /// Subscribes to `events`; `cb` gets each event body.
 pub fn subscribe(events: &[&str], cb: impl Fn(&Json) + 'static) {
     let Some(mut s) = connect() else { return };
@@ -105,12 +120,14 @@ pub fn subscribe(events: &[&str], cb: impl Fn(&Json) + 'static) {
         let mut chunk = [0u8; 65536];
         loop {
             match s.borrow_mut().read(&mut chunk) {
-                Ok(0) => {
+                Ok(n) if n > 0 => buf.borrow_mut().extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // EOF or a reset socket: poll() would report it forever
+                _ => {
                     runtime::unwatch(fd);
                     return;
                 }
-                Ok(n) => buf.borrow_mut().extend_from_slice(&chunk[..n]),
-                Err(_) => break,
             }
         }
         while let Some((kind, body)) = decode(&mut buf.borrow_mut()) {

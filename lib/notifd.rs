@@ -2,14 +2,24 @@
 // resident, expire timeouts, close reasons).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use crate::lib::dbus::{self, Message, PropMap, RefArg};
+use ::dbus::arg::{ArgType, Iter};
+
+use crate::lib::dbus::{self, Message};
 use crate::ui::runtime;
 
 const PATH: &str = "/org/freedesktop/Notifications";
 const IFACE: &str = "org.freedesktop.Notifications";
+/// kept notifications; the oldest expires past this
+const MAX: usize = 100;
+/// summary/body byte cap
+const MAX_TEXT: usize = 4096;
+/// action pairs kept (the rest are ignored), and their key/label byte caps
+const MAX_ACTIONS: usize = 3;
+const MAX_ACTION_KEY: usize = 64;
+const MAX_ACTION_LABEL: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notification {
@@ -21,6 +31,10 @@ pub struct Notification {
     pub resident: bool,
     pub desktop_entry: String,
     pub time: i64,
+    /// sent by flurry itself (send_local)
+    pub local: bool,
+    /// unique bus name of the D-Bus client that sent it ("" when local): only it may replace or close it
+    sender: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -33,8 +47,15 @@ pub enum Reason {
 type Notified = Rc<dyn Fn(u32, bool)>;
 type Resolved = Rc<dyn Fn(u32, Reason)>;
 
+#[derive(Default)]
+struct Store {
+    map: HashMap<u32, Notification>,
+    /// ids, oldest first
+    order: VecDeque<u32>,
+}
+
 thread_local! {
-    static NOTIFS: RefCell<Vec<Notification>> = const { RefCell::new(Vec::new()) };
+    static NOTIFS: RefCell<Store> = RefCell::default();
     static NEXT_ID: Cell<u32> = const { Cell::new(1) };
     static ON_NOTIFIED: RefCell<Vec<Notified>> = const { RefCell::new(Vec::new()) };
     static ON_RESOLVED: RefCell<Vec<Resolved>> = const { RefCell::new(Vec::new()) };
@@ -52,15 +73,21 @@ pub fn on_resolved(f: impl Fn(u32, Reason) + 'static) {
 }
 
 pub fn get(id: u32) -> Option<Notification> {
-    NOTIFS.with(|n| n.borrow().iter().find(|x| x.id == id).cloned())
+    NOTIFS.with(|n| n.borrow().map.get(&id).cloned())
+}
+
+fn exists(id: u32) -> bool {
+    NOTIFS.with(|n| n.borrow().map.contains_key(&id))
 }
 
 pub fn resolve(id: u32, reason: Reason) {
     let removed = NOTIFS.with(|n| {
         let mut n = n.borrow_mut();
-        let before = n.len();
-        n.retain(|x| x.id != id);
-        before != n.len()
+        let removed = n.map.remove(&id).is_some();
+        if removed {
+            n.order.retain(|x| *x != id);
+        }
+        removed
     });
     if !removed {
         return;
@@ -94,43 +121,125 @@ pub fn invoke(id: u32, action: &str) {
     }
 }
 
-fn hint_str(h: &PropMap, k: &str) -> String {
-    h.get(k).and_then(|v| v.0.as_str()).unwrap_or("").to_string()
+/// `s` cut to MAX_TEXT bytes on a char boundary.
+fn cap(s: &str) -> String {
+    cap_at(s, MAX_TEXT)
 }
 
-/// Adds a notification (the Notify method body); returns its id.
-pub fn add(app_name: &str, replaces_id: u32, summary: &str, body: &str, actions: &[String], hints: &PropMap, expire_timeout: i32) -> u32 {
-    let replaced = get(replaces_id).is_some() && replaces_id != 0;
-    let id = if replaced {
-        replaces_id
-    } else {
-        NEXT_ID.with(|n| {
-            let id = n.get();
-            n.set(id + 1);
-            id
-        })
-    };
+fn cap_at(s: &str, max: usize) -> String {
+    let mut n = s.len().min(max);
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    s[..n].into()
+}
+
+/// desktop-entry is used in sway criteria: only [A-Za-z0-9._-], else empty.
+fn sanitize_entry(s: &str) -> String {
+    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) { s.into() } else { String::new() }
+}
+
+#[derive(Default)]
+struct Hints {
+    resident: bool,
+    desktop_entry: String,
+}
+
+/// Reads only `resident` and `desktop-entry` from an a{sv} hints argument; None if it isn't one.
+fn read_hints(it: &mut Iter) -> Option<Hints> {
+    if &*it.signature() != "a{sv}" {
+        return None;
+    }
+    let mut h = Hints::default();
+    let mut a = it.recurse(ArgType::Array)?;
+    while a.arg_type() == ArgType::DictEntry {
+        let mut e = a.recurse(ArgType::DictEntry)?;
+        let k: &str = e.read().ok()?;
+        if k == "resident" || k == "desktop-entry" {
+            let mut v = e.recurse(ArgType::Variant)?;
+            match (k, v.arg_type()) {
+                ("desktop-entry", ArgType::String) => h.desktop_entry = sanitize_entry(v.get::<&str>()?),
+                ("resident", ArgType::Boolean) => h.resident = v.get::<bool>()?,
+                ("resident", _) => h.resident = v.get_refarg().and_then(|r| r.as_i64()).is_some_and(|v| v != 0),
+                _ => {}
+            }
+        }
+        a.next();
+    }
+    it.next();
+    Some(h)
+}
+
+/// Reads at most MAX_ACTIONS (key, label) pairs off an `as` argument, capped; None if it isn't one.
+fn read_actions(it: &mut Iter) -> Option<Vec<(String, String)>> {
+    if &*it.signature() != "as" {
+        return None;
+    }
+    let mut a = it.recurse(ArgType::Array)?;
+    let mut actions = vec![];
+    while actions.len() < MAX_ACTIONS {
+        let Some(key) = a.get::<&str>() else { break };
+        a.next();
+        let Some(label) = a.get::<&str>() else { break };
+        a.next();
+        actions.push((cap_at(key, MAX_ACTION_KEY), cap_at(label, MAX_ACTION_LABEL)));
+    }
+    it.next();
+    Some(actions)
+}
+
+/// The next id not in use, without taking it (ids wrap past u32::MAX, skipping 0); at most MAX are
+/// in use, so this ends.
+fn free_id() -> u32 {
+    NEXT_ID.with(|n| {
+        while exists(n.get()) {
+            n.set(n.get().checked_add(1).unwrap_or(1));
+        }
+        n.get()
+    })
+}
+
+fn next_id() -> u32 {
+    let id = free_id();
+    NEXT_ID.with(|n| n.set(id.checked_add(1).unwrap_or(1)));
+    id
+}
+
+/// Adds a notification (the Notify method body); returns its id. `sender` is "" for local ones.
+#[allow(clippy::too_many_arguments)]
+fn add(app_name: &str, replaces_id: u32, summary: &str, body: &str, actions: Vec<(String, String)>, hints: Hints, expire_timeout: i32, sender: &str) -> u32 {
+    // only the sender may replace its notification: a D-Bus client can't take over a local one (its
+    // actions would run under the client's label) or another client's
+    let replaced = replaces_id != 0 && NOTIFS.with(|n| n.borrow().map.get(&replaces_id).is_some_and(|x| x.sender == sender));
+    let id = if replaced { replaces_id } else { next_id() };
+    if !replaced {
+        while let Some(oldest) = NOTIFS.with(|n| {
+            let n = n.borrow();
+            (n.map.len() >= MAX).then(|| n.order.front().copied()).flatten()
+        }) {
+            resolve(oldest, Reason::Expired);
+        }
+    }
     let n = Notification {
         id,
-        app_name: app_name.into(),
-        summary: summary.into(),
-        body: body.into(),
-        actions: actions.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect(),
-        resident: hints.get("resident").and_then(|v| v.0.as_i64()).is_some_and(|v| v != 0),
-        desktop_entry: hint_str(hints, "desktop-entry"),
-        time: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+        app_name: cap(app_name),
+        summary: cap(summary),
+        body: cap(body),
+        actions,
+        resident: hints.resident,
+        desktop_entry: hints.desktop_entry,
+        time: crate::lib::time::now_secs() as i64,
+        local: sender.is_empty(),
+        sender: sender.into(),
     };
-    NOTIFS.with(|list| {
-        let mut list = list.borrow_mut();
-        match list.iter_mut().find(|x| x.id == id) {
-            Some(slot) => *slot = n,
-            None => list.push(n),
+    NOTIFS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.map.insert(id, n).is_none() {
+            s.order.push_back(id);
         }
     });
-    for f in ON_NOTIFIED.with(|l| l.borrow().clone()) {
-        f(id, replaced);
-    }
-    // default-timeout -1, ignore-timeout false; a replacement restarts (or clears) the timer
+    // default-timeout -1, ignore-timeout false; a replacement restarts (or clears) the timer.
+    // Set before the listeners, which may resolve it right away.
     let timer = (expire_timeout > 0).then(|| runtime::timeout(expire_timeout as u64, move || resolve(id, Reason::Expired)));
     if let Some(old) = EXPIRY.with(|e| {
         let mut e = e.borrow_mut();
@@ -141,44 +250,94 @@ pub fn add(app_name: &str, replaces_id: u32, summary: &str, body: &str, actions:
     }) {
         old.cancel();
     }
+    for f in ON_NOTIFIED.with(|l| l.borrow().clone()) {
+        f(id, replaced);
+    }
     id
 }
 
 /// notify-send replacement for flurry's own notifications; `on_action` gets the invoked action id.
 pub fn send_local(app_name: &str, summary: &str, body: &str, actions: &[(String, String)], on_action: impl Fn(&str) + 'static) -> u32 {
-    let flat: Vec<String> = actions.iter().flat_map(|(a, b)| [a.clone(), b.clone()]).collect();
     // registered before add() so a handler sees it if the notification is hidden right away
-    let id = NEXT_ID.with(Cell::get);
+    let id = free_id();
     LOCAL_ACTIONS.with(|a| a.borrow_mut().insert(id, Rc::new(on_action)));
-    let got = add(app_name, 0, summary, body, &flat, &PropMap::new(), -1);
+    let got = add(app_name, 0, summary, body, actions.to_vec(), Hints::default(), -1, "");
     debug_assert_eq!(got, id);
     got
+}
+
+fn invalid_args(m: &Message) -> Option<Message> {
+    Some(Message::error(m, &"org.freedesktop.DBus.Error.InvalidArgs".into(), c"invalid arguments"))
 }
 
 pub fn start() {
     let Some(bus) = dbus::session() else { return };
     bus.export(IFACE, "Notify", |m: &Message| {
         let mut it = m.iter_init();
-        let app: String = it.read().ok()?;
-        let replaces: u32 = it.read().ok()?;
-        let _icon: String = it.read().ok()?;
-        let summary: String = it.read().ok()?;
-        let body: String = it.read().ok()?;
-        let actions: Vec<String> = it.read().ok()?;
-        let hints: PropMap = it.read().ok()?;
-        let timeout: i32 = it.read().ok()?;
-        let id = add(&app, replaces, &summary, &body, &actions, &hints, timeout);
-        Some(m.method_return().append1(id))
+        let parsed = (|| {
+            let sender = m.sender()?;
+            let app: &str = it.read().ok()?;
+            let replaces: u32 = it.read().ok()?;
+            let _icon: &str = it.read().ok()?;
+            let summary: &str = it.read().ok()?;
+            let body: &str = it.read().ok()?;
+            let actions = read_actions(&mut it)?;
+            let hints = read_hints(&mut it)?;
+            let timeout: i32 = it.read().ok()?;
+            Some(add(app, replaces, summary, body, actions, hints, timeout, &sender))
+        })();
+        match parsed {
+            Some(id) => Some(m.method_return().append1(id)),
+            None => invalid_args(m),
+        }
     });
     bus.export(IFACE, "CloseNotification", |m| {
-        let id: u32 = m.read1().ok()?;
+        let Ok(id) = m.read1::<u32>() else { return invalid_args(m) };
+        // another client's (or a local) notification reads as missing
+        let sender = m.sender();
+        if !NOTIFS.with(|n| n.borrow().map.get(&id).is_some_and(|x| sender.as_deref() == Some(x.sender.as_str()))) {
+            return Some(Message::error(m, &"org.freedesktop.Notifications.Error.NotFound".into(), c"no such notification"));
+        }
         resolve(id, Reason::Closed);
         Some(m.method_return())
     });
-    bus.export(IFACE, "GetCapabilities", |m| {
-        let caps: Vec<&str> = vec!["action-icons", "actions", "body", "body-hyperlinks", "body-images", "body-markup", "icon-static", "persistence", "sound"];
-        Some(m.method_return().append1(caps))
-    });
+    bus.export(IFACE, "GetCapabilities", |m| Some(m.method_return().append1(vec!["actions", "body", "persistence"])));
     bus.export(IFACE, "GetServerInformation", |m| Some(m.method_return().append2("notifd", "flurry").append2("0.1", "1.2")));
-    bus.request_name(IFACE);
+    bus.request_name(IFACE, |ok| {
+        if !ok {
+            eprintln!("flurry: another notification daemon owns {IFACE}");
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_on_char_boundary() {
+        let s = "é".repeat(3000);
+        let c = cap(&s);
+        assert!(c.len() <= MAX_TEXT && c.len().is_multiple_of(2));
+        assert_eq!(cap("hi"), "hi");
+    }
+
+    #[test]
+    fn ids_skip_used_and_wrap() {
+        NEXT_ID.with(|n| n.set(u32::MAX));
+        let a = add("t", 0, "a", "", vec![], Hints::default(), -1, "");
+        assert_eq!(a, u32::MAX);
+        assert_eq!(free_id(), 1);
+        NEXT_ID.with(|n| n.set(a));
+        assert_eq!(next_id(), 1, "in-use id skipped");
+        // a different sender can't replace it
+        assert_ne!(add("t", a, "b", "", vec![], Hints::default(), -1, ":1.5"), a);
+        assert_eq!(add("t", a, "c", "", vec![], Hints::default(), -1, ""), a);
+    }
+
+    #[test]
+    fn entry_sanitized() {
+        assert_eq!(sanitize_entry("org.gnome.Nautilus"), "org.gnome.Nautilus");
+        assert_eq!(sanitize_entry("x\"] kill"), "");
+    }
 }

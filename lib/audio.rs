@@ -94,18 +94,24 @@ struct PortInfo {
     channel: String,
 }
 
+type Global<'a> = pw::registry::GlobalObject<&'a spa::utils::dict::DictRef>;
+
 struct Pw {
-    _main: pw::main_loop::MainLoop,
-    _context: pw::context::Context,
-    core: pw::core::Core,
+    // fields (and tuples) drop in order: listeners first, a hook before the object it hangs on, then
+    // proxies, registry, core, context and the loop they all live on
+    _core_listener: pw::core::Listener,
+    _registry_listener: Option<pw::registry::Listener>,
+    /// link proxies from the last `link` call, kept until the next (object.linger keeps the links)
+    pending_links: Vec<pw::link::Link>,
+    metadata: Option<(pw::metadata::MetadataListener, pw::metadata::Metadata)>,
+    nodes: HashMap<u32, (pw::node::NodeListener, pw::node::Node)>,
+    devices: HashMap<u32, (pw::device::DeviceListener, pw::device::Device, Vec<Route>)>,
     registry: Rc<pw::registry::Registry>,
-    nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
-    devices: HashMap<u32, (pw::device::Device, pw::device::DeviceListener, Vec<Route>)>,
-    metadata: Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>,
+    core: pw::core::Core,
+    _context: pw::context::Context,
+    _main: pw::main_loop::MainLoop,
     ports: HashMap<u32, PortInfo>,
     links: HashMap<u32, (u32, u32)>, // id -> (output node, input node)
-    pending_links: Vec<pw::link::Link>,
-    _registry_listener: Option<pw::registry::Listener>,
 }
 
 thread_local! {
@@ -163,10 +169,10 @@ pub fn start() {
             let get = |k: &str| props.and_then(|p| p.get(k)).map(String::from);
             match g.type_ {
                 pw::types::ObjectType::Node if get("media.class").as_deref() == Some("Audio/Sink") => {
-                    bind_node(&reg, g.id, &get);
+                    bind_node(&reg, g, &get);
                 }
-                pw::types::ObjectType::Device if get("media.class").as_deref() == Some("Audio/Device") => bind_device(&reg, g.id),
-                pw::types::ObjectType::Metadata if get("metadata.name").as_deref() == Some("default") => bind_metadata(&reg, g.id),
+                pw::types::ObjectType::Device if get("media.class").as_deref() == Some("Audio/Device") => bind_device(&reg, g),
+                pw::types::ObjectType::Metadata if get("metadata.name").as_deref() == Some("default") => bind_metadata(&reg, g),
                 pw::types::ObjectType::Port => {
                     let node = get("node.id").and_then(|v| v.parse().ok());
                     if let Some(node) = node {
@@ -226,6 +232,7 @@ pub fn start() {
                     if let Some(fd) = fd {
                         runtime::unwatch(fd);
                     }
+                    ROUTE_READS.with(|r| r.borrow_mut().clear());
                     speakers().set(vec![]);
                     default_name().set(None);
                     ready().set(false);
@@ -234,21 +241,21 @@ pub fn start() {
             }
         })
         .register();
-    std::mem::forget(core_listener);
 
     PW.with(|p| {
         *p.borrow_mut() = Some(Pw {
-            _main: main,
-            _context: context,
-            core,
-            registry,
+            _core_listener: core_listener,
+            _registry_listener: Some(listener),
+            pending_links: vec![],
+            metadata: None,
             nodes: HashMap::new(),
             devices: HashMap::new(),
-            metadata: None,
+            registry,
+            core,
+            _context: context,
+            _main: main,
             ports: HashMap::new(),
             links: HashMap::new(),
-            pending_links: vec![],
-            _registry_listener: Some(listener),
         })
     });
     // the loop is dispatched without holding PW: its callbacks (registry, params) borrow PW themselves
@@ -260,7 +267,8 @@ pub fn start() {
     }
 }
 
-fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option<String>) {
+fn bind_node(reg: &pw::registry::Registry, g: &Global, get: &dyn Fn(&str) -> Option<String>) {
+    let id = g.id;
     let sink = Sink {
         id,
         name: get("node.name").unwrap_or_default(),
@@ -270,7 +278,7 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
         profile_device: get("card.profile.device").and_then(|v| v.parse().ok()),
         ..Default::default()
     };
-    let Ok(node) = reg.bind::<pw::node::Node, _>(&global_props(id)) else { return };
+    let Ok(node) = reg.bind::<pw::node::Node, _>(g) else { return };
     let listener = node
         .add_listener_local()
         // registry globals omit card.profile.device: without it no Route matched and volume went to
@@ -287,7 +295,7 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
             let unread = speakers().with(|l| l.iter().any(|s| s.id == id && !s.known));
             if let (Some(dev), Some(_), true) = (device, pd, unread) {
                 with(|p| {
-                    if let Some((d, _, _)) = p.devices.get(&dev) {
+                    if let Some((_, d, _)) = p.devices.get(&dev) {
                         d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
                         if let Ok(seq) = p.core.sync(0) {
                             ROUTE_READS.with(|r| r.borrow_mut().push((seq, id)));
@@ -306,7 +314,7 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
                 let device = speakers().with(|l| l.iter().find(|s| s.id == id && s.profile_device.is_some()).and_then(|s| s.device));
                 if let Some(dev) = device {
                     with(|p| {
-                        if let Some((d, _, _)) = p.devices.get(&dev) {
+                        if let Some((_, d, _)) = p.devices.get(&dev) {
                             d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
                         }
                     });
@@ -319,17 +327,12 @@ fn bind_node(reg: &pw::registry::Registry, id: u32, get: &dyn Fn(&str) -> Option
         l.retain(|s| s.id != id);
         l.push(sink);
     });
-    with(|p| p.nodes.insert(id, (node, listener)));
+    with(|p| p.nodes.insert(id, (listener, node)));
 }
 
-fn global_props(id: u32) -> pw::registry::GlobalObject<pw::properties::Properties> {
-    pw::registry::GlobalObject { id, permissions: pw::permissions::PermissionFlags::all(), type_: pw::types::ObjectType::Node, version: 3, props: None }
-}
-
-fn bind_device(reg: &pw::registry::Registry, id: u32) {
-    let mut g = global_props(id);
-    g.type_ = pw::types::ObjectType::Device;
-    let Ok(dev) = reg.bind::<pw::device::Device, _>(&g) else { return };
+fn bind_device(reg: &pw::registry::Registry, g: &Global) {
+    let id = g.id;
+    let Ok(dev) = reg.bind::<pw::device::Device, _>(g) else { return };
     let listener = dev
         .add_listener_local()
         .param(move |_, _, _, _, pod| {
@@ -366,13 +369,11 @@ fn bind_device(reg: &pw::registry::Registry, id: u32) {
         })
         .register();
     dev.subscribe_params(&[spa::param::ParamType::Route]);
-    with(|p| p.devices.insert(id, (dev, listener, vec![])));
+    with(|p| p.devices.insert(id, (listener, dev, vec![])));
 }
 
-fn bind_metadata(reg: &pw::registry::Registry, id: u32) {
-    let mut g = global_props(id);
-    g.type_ = pw::types::ObjectType::Metadata;
-    let Ok(md) = reg.bind::<pw::metadata::Metadata, _>(&g) else { return };
+fn bind_metadata(reg: &pw::registry::Registry, g: &Global) {
+    let Ok(md) = reg.bind::<pw::metadata::Metadata, _>(g) else { return };
     let listener = md
         .add_listener_local()
         .property(|subject, key, _, value| {
@@ -383,7 +384,7 @@ fn bind_metadata(reg: &pw::registry::Registry, id: u32) {
             0
         })
         .register();
-    with(|p| p.metadata = Some((md, listener)));
+    with(|p| p.metadata = Some((listener, md)));
 }
 
 fn deserialize(bytes: &[u8]) -> Option<Value> {
@@ -423,7 +424,7 @@ fn apply(sink: &Sink, channels: Option<Vec<f32>>, mute: Option<bool>) {
     let props = props_object(channels, mute);
     with(|p| {
         let route = sink.device.zip(sink.profile_device).and_then(|(dev, pd)| {
-            p.devices.get(&dev).and_then(|(d, _, routes)| routes.iter().find(|r| r.device == pd).map(|r| (d, r.clone())))
+            p.devices.get(&dev).and_then(|(_, d, routes)| routes.iter().find(|r| r.device == pd).map(|r| (d, r.clone())))
         });
         if let Some((dev, r)) = route {
             let obj = Object {
@@ -441,7 +442,7 @@ fn apply(sink: &Sink, channels: Option<Vec<f32>>, mute: Option<bool>) {
             {
                 dev.set_param(spa::param::ParamType::Route, 0, pod);
             }
-        } else if let Some((node, _)) = p.nodes.get(&sink.id)
+        } else if let Some((_, node)) = p.nodes.get(&sink.id)
             && let Some(bytes) = serialize(Value::Object(props))
             && let Some(pod) = Pod::from_bytes(&bytes)
         {
@@ -482,7 +483,7 @@ pub fn set_mute(sink: &Sink, mute: bool) {
 pub fn set_default(sink: &Sink) {
     let value = format!("{{\"name\":{}}}", crate::lib::json::quote(&sink.name));
     with(|p| {
-        if let Some((md, _)) = &p.metadata {
+        if let Some((_, md)) = &p.metadata {
             md.set_property(0, "default.configured.audio.sink", Some("Spa:String:JSON"), Some(&value));
         }
     });
@@ -494,6 +495,7 @@ pub fn link(output: &str, input: &str, connect: bool) {
     let Some(o) = list.iter().find(|s| s.name == output).map(|s| s.id) else { return };
     let Some(i) = list.iter().find(|s| s.name == input).map(|s| s.id) else { return };
     with(|p| {
+        p.pending_links.clear();
         if !connect {
             let ids: Vec<u32> = p.links.iter().filter(|(_, (a, b))| *a == o && *b == i).map(|(id, _)| *id).collect();
             for id in ids {

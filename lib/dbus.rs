@@ -1,8 +1,8 @@
 // libdbus channels on the shared poll loop: async method calls, signal subscriptions, name watching,
 // and exported methods (the notification daemon).
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -15,14 +15,34 @@ use crate::ui::runtime;
 
 type Handler = Rc<dyn Fn(&Message)>;
 type MethodHandler = Rc<dyn Fn(&Message) -> Option<Message>>;
+type ReplyCb = Box<dyn FnOnce(Result<Message, String>)>;
+
+/// a call unanswered this long gets Err (libdbus' default reply timeout)
+pub const REPLY_TIMEOUT_MS: u64 = 25_000;
+
+thread_local! {
+    static DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returned by an exported method that answers later (it keeps the reply built from the call);
+/// any other None gets InvalidArgs.
+pub fn deferred() -> Option<Message> {
+    DEFERRED.with(|d| d.set(true));
+    None
+}
 
 pub struct Bus {
     ch: Channel,
-    replies: RefCell<HashMap<u32, Box<dyn FnOnce(Result<Message, String>)>>>,
-    signals: RefCell<Vec<(u64, SignalFilter, Handler)>>,
+    /// pending calls by serial, each with its timeout
+    replies: Rc<RefCell<HashMap<u32, (ReplyCb, runtime::Timer)>>>,
+    signals: RefCell<Vec<(SignalFilter, Handler)>>,
     methods: RefCell<HashMap<(String, String), MethodHandler>>,
-    seq: Cell<u64>,
+    /// well-known name -> unique owner ("" while unowned), for names used as a filter sender
+    owners: Rc<RefCell<HashMap<String, String>>>,
+    rules: RefCell<HashSet<String>>,
 }
+
+const DBUS: &str = "org.freedesktop.DBus";
 
 #[derive(Default, Clone)]
 pub struct SignalFilter {
@@ -30,24 +50,45 @@ pub struct SignalFilter {
     pub path: Option<String>,
     pub interface: Option<String>,
     pub member: Option<String>,
+    pub arg0: Option<String>,
+    pub arg0namespace: Option<String>,
 }
 
 impl SignalFilter {
     fn rule(&self) -> String {
         let mut r = String::from("type='signal'");
-        for (k, v) in [("sender", &self.sender), ("path", &self.path), ("interface", &self.interface), ("member", &self.member)] {
+        for (k, v) in [
+            ("sender", &self.sender),
+            ("path", &self.path),
+            ("interface", &self.interface),
+            ("member", &self.member),
+            ("arg0", &self.arg0),
+            ("arg0namespace", &self.arg0namespace),
+        ] {
             if let Some(v) = v {
                 r += &format!(",{k}='{v}'");
             }
         }
         r
     }
-    fn matches(&self, m: &Message) -> bool {
-        let eq = |want: &Option<String>, got: Option<String>| want.as_ref().is_none_or(|w| got.as_deref() == Some(w));
-        // sender is matched by the bus (unique name), not here
-        eq(&self.path, m.path().map(|p| p.to_string()))
-            && eq(&self.interface, m.interface().map(|p| p.to_string()))
-            && eq(&self.member, m.member().map(|p| p.to_string()))
+    /// Signals carry the sender's unique name, so a well-known `sender` matches only its tracked owner.
+    fn matches(&self, m: &Message, owners: &HashMap<String, String>) -> bool {
+        let eq = |want: &Option<String>, got: Option<&str>| want.as_deref().is_none_or(|w| got == Some(w));
+        let sender = self.sender.as_deref().is_none_or(|s| {
+            let got = m.sender();
+            let want = if s.starts_with(':') || s == DBUS { Some(s) } else { owners.get(s).map(String::as_str).filter(|o| !o.is_empty()) };
+            want.is_some() && got.as_deref() == want
+        });
+        let arg0 = if self.arg0.is_some() || self.arg0namespace.is_some() { m.get1::<&str>() } else { None };
+        let ns = self.arg0namespace.as_deref().is_none_or(|ns| {
+            arg0.is_some_and(|a| a.strip_prefix(ns).is_some_and(|rest| rest.is_empty() || rest.starts_with('.')))
+        });
+        sender
+            && ns
+            && eq(&self.arg0, arg0)
+            && eq(&self.path, m.path().as_deref())
+            && eq(&self.interface, m.interface().as_deref())
+            && eq(&self.member, m.member().as_deref())
     }
 }
 
@@ -72,10 +113,11 @@ fn get(slot: &'static std::thread::LocalKey<RefCell<Option<Rc<Bus>>>>, kind: Bus
     ch.set_watch_enabled(true);
     let bus = Rc::new(Bus {
         ch,
-        replies: RefCell::default(),
+        replies: Rc::default(),
         signals: RefCell::default(),
         methods: RefCell::default(),
-        seq: Cell::new(0),
+        owners: Rc::default(),
+        rules: RefCell::default(),
     });
     let fd = bus.ch.watch().fd;
     let weak = Rc::downgrade(&bus);
@@ -101,6 +143,12 @@ impl Bus {
         if self.ch.read_write(Some(Duration::ZERO)).is_err() {
             // bus gone (logout): stop watching or poll() would spin on the hung-up fd
             runtime::unwatch(self.ch.watch().fd);
+            // no reply will come
+            let pending: Vec<_> = self.replies.borrow_mut().drain().map(|(_, v)| v).collect();
+            for (cb, t) in pending {
+                t.cancel();
+                cb(Err("disconnected".into()));
+            }
         }
         self.dispatch();
     }
@@ -110,7 +158,8 @@ impl Bus {
             match msg.msg_type() {
                 MessageType::MethodReturn | MessageType::Error => {
                     let Some(serial) = msg.get_reply_serial() else { continue };
-                    let Some(cb) = self.replies.borrow_mut().remove(&serial) else { continue };
+                    let Some((cb, t)) = self.replies.borrow_mut().remove(&serial) else { continue };
+                    t.cancel();
                     if msg.msg_type() == MessageType::Error {
                         let err = msg.read1::<&str>().map(String::from).unwrap_or_default();
                         let name = msg.as_result().err().and_then(|e| e.name().map(String::from)).unwrap_or_default();
@@ -120,8 +169,21 @@ impl Bus {
                     }
                 }
                 MessageType::Signal => {
+                    // flurry subscribes to no directed signals; they'd bypass the match rules
+                    if msg.destination().is_some() {
+                        continue;
+                    }
+                    if msg.sender().as_deref() == Some(DBUS)
+                        && msg.member().as_deref() == Some("NameOwnerChanged")
+                        && let Ok((name, _, new)) = msg.read3::<&str, &str, &str>()
+                        && let Some(o) = self.owners.borrow_mut().get_mut(name)
+                    {
+                        *o = new.into();
+                    }
+                    let owners = self.owners.borrow();
                     let handlers: Vec<Handler> =
-                        self.signals.borrow().iter().filter(|(_, f, _)| f.matches(&msg)).map(|(_, _, h)| h.clone()).collect();
+                        self.signals.borrow().iter().filter(|(f, _)| f.matches(&msg, &owners)).map(|(_, h)| h.clone()).collect();
+                    drop(owners);
                     for h in handlers {
                         h(&msg);
                     }
@@ -133,11 +195,22 @@ impl Bus {
                     );
                     let handler = self.methods.borrow().get(&key).cloned();
                     let reply = match handler {
-                        Some(h) => h(&msg),
+                        Some(h) => {
+                            DEFERRED.with(|d| d.set(false));
+                            let r = h(&msg);
+                            match r {
+                                None if !DEFERRED.with(|d| d.replace(false)) => Some(Message::error(
+                                    &msg,
+                                    &"org.freedesktop.DBus.Error.InvalidArgs".into(),
+                                    c"invalid arguments",
+                                )),
+                                r => r,
+                            }
+                        }
                         None => Some(Message::error(
                             &msg,
                             &"org.freedesktop.DBus.Error.UnknownMethod".into(),
-                            &std::ffi::CString::new("unknown method").unwrap(),
+                            c"unknown method",
                         )),
                     };
                     if let Some(r) = reply
@@ -152,9 +225,21 @@ impl Bus {
 
     /// Sends a method call; `cb` gets the reply or an error string.
     pub fn call_cb(&self, msg: Message, cb: impl FnOnce(Result<Message, String>) + 'static) {
+        self.call_cb_timeout(msg, REPLY_TIMEOUT_MS, cb);
+    }
+
+    /// `call_cb` for a call left unanswered longer than usual (one waiting on the user).
+    pub fn call_cb_timeout(&self, msg: Message, ms: u64, cb: impl FnOnce(Result<Message, String>) + 'static) {
         match self.ch.send(msg) {
             Ok(serial) => {
-                self.replies.borrow_mut().insert(serial, Box::new(cb));
+                let replies = Rc::downgrade(&self.replies);
+                let t = runtime::timeout(ms, move || {
+                    let entry = replies.upgrade().and_then(|r| r.borrow_mut().remove(&serial));
+                    if let Some((cb, _)) = entry {
+                        cb(Err("timeout".into()));
+                    }
+                });
+                self.replies.borrow_mut().insert(serial, (Box::new(cb), t));
             }
             Err(()) => cb(Err("send failed".into())),
         }
@@ -172,13 +257,49 @@ impl Bus {
         let _ = self.ch.send(msg);
     }
 
-    pub fn subscribe(&self, filter: SignalFilter, h: impl Fn(&Message) + 'static) -> u64 {
-        let rule = filter.rule();
-        self.send(method("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch").append1(rule));
-        let id = self.seq.get() + 1;
-        self.seq.set(id);
-        self.signals.borrow_mut().push((id, filter, Rc::new(h)));
-        id
+    fn add_match(&self, rule: String) {
+        if self.rules.borrow_mut().insert(rule.clone()) {
+            self.send(method(DBUS, "/org/freedesktop/DBus", DBUS, "AddMatch").append1(rule));
+        }
+    }
+
+    /// Starts tracking the unique owner of a well-known name (rule first, so no change is missed).
+    fn track(&self, name: &str) {
+        if self.owners.borrow().contains_key(name) {
+            return;
+        }
+        self.owners.borrow_mut().insert(name.into(), String::new());
+        let f = SignalFilter {
+            sender: Some(DBUS.into()),
+            interface: Some(DBUS.into()),
+            member: Some("NameOwnerChanged".into()),
+            arg0: Some(name.into()),
+            ..Default::default()
+        };
+        self.add_match(f.rule());
+        let (owners, name) = (self.owners.clone(), name.to_string());
+        let msg = method(DBUS, "/org/freedesktop/DBus", DBUS, "GetNameOwner").append1(name.as_str());
+        self.call_cb(msg, move |r| {
+            // a NameOwnerChanged seen before this reply is older than it
+            let o = r.ok().and_then(|m| m.read1::<&str>().ok().map(String::from)).unwrap_or_default();
+            owners.borrow_mut().insert(name, o);
+        });
+    }
+
+    /// Unique name currently owning `well_known` (tracked once some filter uses it as sender).
+    pub fn owner_of(&self, well_known: &str) -> Option<String> {
+        self.owners.borrow().get(well_known).filter(|o| !o.is_empty()).cloned()
+    }
+
+    pub fn subscribe(&self, filter: SignalFilter, h: impl Fn(&Message) + 'static) {
+        if let Some(s) = filter.sender.as_deref()
+            && !s.starts_with(':')
+            && s != DBUS
+        {
+            self.track(s);
+        }
+        self.add_match(filter.rule());
+        self.signals.borrow_mut().push((filter, Rc::new(h)));
     }
 
     /// Calls `appeared`/`vanished` as `name` gets/loses an owner (Gio.bus_watch_name).
@@ -188,9 +309,10 @@ impl Bus {
         let (a, v) = (appeared.clone(), vanished.clone());
         self.subscribe(
             SignalFilter {
-                sender: Some("org.freedesktop.DBus".into()),
-                interface: Some("org.freedesktop.DBus".into()),
+                sender: Some(DBUS.into()),
+                interface: Some(DBUS.into()),
                 member: Some("NameOwnerChanged".into()),
+                arg0: Some(name.into()),
                 ..Default::default()
             },
             move |m| {
@@ -208,9 +330,11 @@ impl Bus {
         });
     }
 
-    pub fn request_name(&self, name: &str) {
+    /// `done` gets whether flurry owns `name` (primary or already owner).
+    pub fn request_name(&self, name: &str, done: impl FnOnce(bool) + 'static) {
         // DO_NOT_QUEUE | REPLACE_EXISTING
-        self.send(method("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName").append2(name, 6u32));
+        let msg = method(DBUS, "/org/freedesktop/DBus", DBUS, "RequestName").append2(name, 6u32);
+        self.call_cb(msg, move |r| done(matches!(r.ok().and_then(|m| m.read1::<u32>().ok()), Some(1 | 4))));
     }
 
     pub fn export(&self, interface: &str, member: &str, h: impl Fn(&Message) -> Option<Message> + 'static) {

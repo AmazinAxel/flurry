@@ -29,7 +29,6 @@ pub const SPACE_L: f32 = 16.0;
 /// Gap of the windows sway tiles: edge-anchored widgets line up with them.
 pub const SWAY_GAP: f32 = 5.0;
 /// Blur of every bloom.
-
 pub const BLOOM: f32 = 8.0;
 
 /// `c` a sixth of the way to white: a border that reads against its own fill.
@@ -48,7 +47,7 @@ pub fn glow(blur: f32, c: Color) -> Shadow {
 }
 
 pub fn font(family: &'static str, size: f32) -> Font {
-    Font { family, weight: 400, size, letter_spacing: 0.0 }
+    Font { family, weight: 400, size }
 }
 
 pub const SORA: &str = "Sora";

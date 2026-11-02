@@ -1,16 +1,17 @@
 // MPD client and playlist control (lib/mediaPlayer.tsx).
 
 use std::cell::{Cell, RefCell};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::os::fd::AsRawFd;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::lib::state::State;
+use crate::settings::{MPD_CROSSFADE, PLAYLISTS};
 use crate::ui::runtime;
-
-// These playlists match with the folder names in ~/Music
-pub const PLAYLISTS: [&str; 6] = ["Study", "Focus", "Synthwave", "Liked", "SynthAmbient", "Ambient"];
 
 thread_local! {
     static PLAYING: State<bool> = State::new(false);
@@ -29,20 +30,55 @@ pub fn is_playing() -> State<bool> {
 pub fn playlist_index() -> State<usize> {
     INDEX.with(Clone::clone)
 }
+/// Current playlist as (name, style color name); None when no playlists are configured.
+pub fn playlist() -> Option<(&'static str, &'static str)> {
+    PLAYLISTS.get(playlist_index().peek()).copied()
+}
 /// Current mpd song as (title, artist).
 pub fn song() -> State<(String, String)> {
     SONG.with(Clone::clone)
 }
 
 struct Conn {
-    s: TcpStream,
+    /// the TCP or unix socket; File only for its Read/Write on the fd
+    s: File,
     buf: Vec<u8>,
 }
 
-fn address() -> String {
-    let host = std::env::var("MPD_HOST").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "127.0.0.1".into());
+/// MPD_HOST: `[password@]host`, host being a name, an IPv6 address (bracketed or not), a socket path
+/// or `@name` (abstract socket).
+fn parse_host(h: &str) -> (Option<&str>, &str) {
+    match h.split_once('@') {
+        Some((pw, host)) if !pw.is_empty() && !host.is_empty() => (Some(pw), host),
+        _ => (None, h),
+    }
+}
+
+/// `"s"` with mpd's escaping.
+fn quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Connects on a thread (DNS and connect may block); returns the socket and the password if any.
+async fn open() -> Option<(File, Option<String>)> {
+    let env = std::env::var("MPD_HOST").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "127.0.0.1".into());
     let port = std::env::var("MPD_PORT").ok().and_then(|p| p.parse::<u16>().ok()).filter(|p| *p != 0).unwrap_or(6600);
-    format!("{host}:{port}")
+    runtime::blocking(move || {
+        let (pw, host) = parse_host(&env);
+        let fd: OwnedFd = if host.starts_with('/') {
+            UnixStream::connect(host).ok()?.into()
+        } else if let Some(name) = host.strip_prefix('@') {
+            use std::os::linux::net::SocketAddrExt;
+            UnixStream::connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name).ok()?).ok()?.into()
+        } else {
+            let addr = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+            let s = addr.to_socket_addrs().ok()?.find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())?;
+            s.into()
+        };
+        Some((File::from(fd), pw.map(String::from)))
+    })
+    .await
+    .flatten()
 }
 
 async fn read_line(c: &Rc<RefCell<Option<Conn>>>) -> Option<String> {
@@ -71,10 +107,15 @@ async fn read_line(c: &Rc<RefCell<Option<Conn>>>) -> Option<String> {
 }
 
 async fn connect(c: &Rc<RefCell<Option<Conn>>>) -> Option<()> {
-    let s = TcpStream::connect(address()).ok()?;
-    s.set_nonblocking(true).ok()?;
+    let (s, pw) = open().await?;
+    let fd = s.as_raw_fd();
+    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) };
     *c.borrow_mut() = Some(Conn { s, buf: vec![] });
-    read_line(c).await.map(|_| ()) // greeting
+    read_line(c).await?; // greeting
+    if let Some(pw) = pw {
+        exchange(c, &format!("password {}", quote(&pw))).await?;
+    }
+    Some(())
 }
 
 async fn exchange(c: &Rc<RefCell<Option<Conn>>>, cmd: &str) -> Option<Vec<String>> {
@@ -148,12 +189,17 @@ fn mpd(cmds: &[&str]) -> runtime::Receiver<Vec<String>> {
 }
 
 fn load_playlist() {
-    let mut cmds = vec!["clear".to_string(), format!("add \"{}\"", PLAYLISTS[playlist_index().peek()]), "shuffle".into()];
-    if !STARTED.with(|s| s.replace(true)) {
-        cmds.insert(0, "crossfade 2".into());
+    let mut cmds = vec![];
+    if !STARTED.with(|s| s.replace(true)) && MPD_CROSSFADE != 0 {
+        cmds.push(format!("crossfade {MPD_CROSSFADE}"));
     }
-    let refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
-    mpd(&refs);
+    if let Some((name, _)) = playlist() {
+        cmds.extend(["clear".to_string(), format!("add {}", quote(name)), "shuffle".into()]);
+    }
+    if !cmds.is_empty() {
+        let refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
+        mpd(&refs);
+    }
 }
 
 fn start() {
@@ -182,6 +228,9 @@ pub fn play_pause() {
 
 pub fn chng_playlist(next: bool) {
     let n = PLAYLISTS.len();
+    if n == 0 {
+        return;
+    }
     let i = playlist_index();
     i.set((i.peek() + if next { 1 } else { n - 1 }) % n);
     mpd(&["pause 1"]);
@@ -201,5 +250,20 @@ pub fn media_scroll(dy: f64, wheel: bool) {
     });
     if n != 0 {
         mpd(&[&format!("volume {n}")]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mpd_host_forms() {
+        assert_eq!(parse_host("localhost"), (None, "localhost"));
+        assert_eq!(parse_host("pw@[::1]"), (Some("pw"), "[::1]"));
+        assert_eq!(parse_host("/run/mpd/socket"), (None, "/run/mpd/socket"));
+        assert_eq!(parse_host("@mpd"), (None, "@mpd"));
+        assert_eq!(parse_host("pw@@mpd"), (Some("pw"), "@mpd"));
+        assert_eq!(quote(r#"a"b\c"#), r#""a\"b\\c""#);
     }
 }

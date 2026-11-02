@@ -1,7 +1,7 @@
 // Volume slider and output selector with multi-sink combining (widgets/status/quicksettings/sound.tsx).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::lib::audio::{self, Sink};
 use crate::lib::state::State;
@@ -12,7 +12,7 @@ const COMBINED: &str = "combined-bt-sink";
 thread_local! {
     static SELECTED: State<Vec<String>> = State::new(vec![]);
     static LINKED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    static WATCHED: RefCell<HashMap<String, bool>> = RefCell::default();
+    static WATCHED: RefCell<HashSet<String>> = RefCell::default();
     static FIRST_WIRE: Cell<bool> = const { Cell::new(true) };
 }
 
@@ -120,29 +120,21 @@ fn wire() {
     let mut fresh: Option<Sink> = None;
     WATCHED.with(|w| {
         let mut w = w.borrow_mut();
-        w.retain(|n, _| present.contains(n));
+        w.retain(|n| present.contains(n));
         for s in &all {
-            let name = node_name(s);
-            if w.contains_key(&name) {
-                continue;
-            }
-            w.insert(name, true);
-            if is_bluetooth(s) {
+            if w.insert(node_name(s)) && is_bluetooth(s) {
                 fresh = Some(s.clone());
             }
         }
     });
     let linked = LINKED.with(|l| l.borrow().clone());
     let survivors: Vec<String> = linked.iter().filter(|n| present.contains(n)).cloned().collect();
-    let collapsed = survivors.len() != linked.len();
-    if collapsed {
-        LINKED.with(|l| l.borrow_mut().clear());
-        for n in &survivors {
-            link(n, false);
+    if survivors.len() != linked.len() {
+        // apply_selection relinks only what changes
+        LINKED.with(|l| *l.borrow_mut() = survivors.clone());
+        if !survivors.is_empty() {
+            return apply_selection(&survivors);
         }
-    }
-    if collapsed && !survivors.is_empty() {
-        return apply_selection(&survivors);
     }
     if let Some(f) = fresh
         && !was_first
@@ -181,7 +173,7 @@ pub fn switch_to_bluetooth_sink(address: &str) {
     let take = move || -> bool {
         match speakers().into_iter().find(|s| s.name.contains(&wanted)) {
             Some(s) => {
-                audio::set_default(&s);
+                apply_selection(&[node_name(&s)]);
                 true
             }
             None => false,

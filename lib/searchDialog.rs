@@ -22,14 +22,12 @@ pub struct SearchSpec<T> {
 }
 
 /// `.searchableDialog entry` inside a BackgroundSection header.
-pub fn search_entry(base: &Style, entry: &EntryRef, focused: bool) -> Node {
+pub fn search_entry(base: &Style, entry: &EntryRef) -> Node {
     let mut s = crate::lib::backgroundSection::header_style(base);
     s.font.size = 24.0;
     s.padding = Sides::trbl(0.0, SPACE_M, 0.0, SPACE_L);
     s.min_height = 36.0;
-    let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
-    let _ = focused;
-    Node::hbox(s.clone(), 0.0, vec![entry::text_node(entry, s.inherit(), look)]).focusable("entry")
+    Node::hbox(s.clone(), 0.0, vec![entry::text_node(entry, s.inherit(), look(&s))]).focusable("entry")
 }
 
 /// Graphite `entry` (passSave fields, wifi password) with flurry's square corners.
@@ -41,8 +39,12 @@ pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str) -> Node {
     s = s.border(Sides::all(BORDER), dark4());
     // Graphite entry text; :focus-within never matches (GTK does not consider layer windows active)
     s.color = rgba(255, 255, 255, 0.7);
-    let look = Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false };
-    Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look)]).focusable(id).expand(true, false)
+    Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look(&s))]).focusable(id).expand(true, false)
+}
+
+/// Entry text in the style's color, with the Graphite selection.
+fn look(s: &Style) -> Look {
+    Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false }
 }
 
 pub fn hex_sel() -> tiny_skia::Color {
@@ -84,7 +86,7 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
 
     let build = {
         let (entry, items, selected, spec) = (entry.clone(), items.clone(), selected.clone(), spec.clone());
-        move |v: &window::View| {
+        move |_: &window::View| {
             let base = window();
             let list = items.borrow();
             let sel = *selected.borrow();
@@ -99,7 +101,7 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
                 })
                 .collect();
             let content = Node::vbox(base.inherit(), BORDER, rows).show(!list.is_empty());
-            let header = search_entry(&base, &entry, v.focused("entry"));
+            let header = search_entry(&base, &entry);
             background_section(&base, header, Some(content), 700.0, 500.0)
         }
     };
@@ -138,7 +140,8 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
         let (items, selected, spec) = (items.clone(), selected.clone(), spec.clone());
         Rc::new(move || {
             let top = selected.borrow().and_then(|i| items.borrow().get(i).cloned());
-            if let Some(t) = top {
+            // insensitive rows are shown, not activated
+            if let Some(t) = top.filter(|t| spec.sensitive.as_ref().is_none_or(|f| f(t))) {
                 (spec.activate)(&t);
             }
         })
@@ -152,6 +155,3 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
         ..Default::default()
     })
 }
-
-#[allow(dead_code)]
-fn unused(_: Background) {}

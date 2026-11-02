@@ -7,9 +7,11 @@ use std::rc::Rc;
 
 use tiny_skia::Rect;
 
-use super::node::{Kind, Node};
+use super::node::Node;
 use super::wayland::{self, Anchor, KeyEvent, Keymode, Layer, LayerSpec, PointerEvent, Surface};
 use crate::lib::state::State;
+use wayland_client::Proxy;
+use wayland_client::backend::ObjectId;
 
 #[derive(Clone)]
 pub struct Spec {
@@ -48,29 +50,29 @@ pub struct View {
     pub focus: Option<String>,
 }
 
-impl View {
-    pub fn focused(&self, id: &str) -> bool {
-        self.focus.as_deref() == Some(id)
-    }
-}
-
 pub type Build = Rc<dyn Fn(&View) -> Node>;
 pub type KeyHandler = Rc<dyn Fn(&KeyEvent) -> bool>;
 
 pub struct Win {
     pub spec: RefCell<Spec>,
     build: Build,
-    surfaces: RefCell<Vec<(String, Surface)>>,
-    visible: Cell<bool>,
+    /// keyed by output (None: the one surface of a window that isn't per monitor)
+    surfaces: RefCell<Vec<(Option<ObjectId>, Rc<Surface>)>>,
     pub focus: RefCell<Option<String>>,
-    focusables: RefCell<Vec<(String, Rect)>>,
-    rects: RefCell<Vec<(String, Rect)>>,
+    /// id'd nodes of the last render: id, rect, focusable
+    rects: RefCell<Vec<(String, Rect, bool)>>,
     key: RefCell<Option<KeyHandler>>,
     pointer: RefCell<Option<Rc<dyn Fn(PointerEvent, &str)>>>,
     on_show: RefCell<Vec<Rc<dyn Fn()>>>,
     pub visibility: State<bool>,
     image: RefCell<Option<Rc<wayland::ShmImage>>>,
+    /// frees the surfaces of a window hidden for a while
+    reap: Cell<Option<super::runtime::Timer>>,
 }
+
+/// Hidden this long, a window's surfaces and buffers are freed (showing it again then builds a
+/// first frame, as at startup).
+const REAP_MS: u64 = 60_000;
 
 thread_local! {
     static WINDOWS: RefCell<HashMap<&'static str, Rc<Win>>> = RefCell::default();
@@ -107,15 +109,14 @@ impl Win {
             spec: RefCell::new(spec.clone()),
             build: Rc::new(build),
             surfaces: RefCell::default(),
-            visible: Cell::new(false),
             focus: RefCell::default(),
-            focusables: RefCell::default(),
             rects: RefCell::default(),
             key: RefCell::default(),
             pointer: RefCell::default(),
             on_show: RefCell::default(),
             visibility: State::new(false),
             image: RefCell::default(),
+            reap: Cell::new(None),
         });
         if spec.per_monitor {
             let weak = Rc::downgrade(&w);
@@ -132,29 +133,61 @@ impl Win {
     }
 
     pub fn visible(&self) -> bool {
-        self.visible.get()
+        self.visibility.peek()
     }
 
     pub fn set_visible(self: &Rc<Self>, v: bool) {
-        if self.visible.replace(v) == v {
+        if self.visible() == v {
             return;
         }
+        // first, so everything below (and anything it calls back into) sees the new state
+        self.visibility.set(v);
+        if let Some(t) = self.reap.take() {
+            t.cancel();
+        }
         if v {
-            for f in self.on_show.borrow().clone() {
+            let on_show = self.on_show.borrow().clone();
+            for f in on_show {
                 f();
             }
             // kept from the last show: back up with their last frame, repainting only what changed
             self.surfaces.borrow_mut().retain(|(_, s)| s.alive());
-            for (_, s) in self.surfaces.borrow().iter() {
+            for s in self.surfaces() {
                 s.remap();
             }
             self.sync_outputs();
         } else {
-            for (_, s) in self.surfaces.borrow().iter() {
+            for s in self.surfaces() {
                 s.unmap();
             }
+            let weak = Rc::downgrade(self);
+            self.reap.set(Some(super::runtime::timeout(REAP_MS, move || {
+                if let Some(w) = weak.upgrade() {
+                    w.reap.set(None);
+                    if !w.visible() {
+                        let gone = w.surfaces.take();
+                        drop(gone);
+                        // the last hidden window gone and nothing modal (keys, a dim) up, only the bar: the
+                        // caches go too (never while another hidden window could reopen on them)
+                        let busy = |w: &Win| {
+                            if w.visible() {
+                                w.spec.borrow().keymode != Keymode::None || w.spec.borrow().dim.is_some()
+                            } else {
+                                !w.surfaces.borrow().is_empty()
+                            }
+                        };
+                        if !WINDOWS.with(|ws| ws.borrow().values().any(|w| busy(w))) {
+                            super::node::trim_caches();
+                        }
+                    }
+                }
+            })));
         }
-        self.visibility.set(v);
+    }
+
+    /// The surfaces, collected: what's called on them may call back into the window.
+    fn surfaces(&self) -> Vec<Rc<Surface>> {
+        self.surfaces.borrow().iter().map(|(_, s)| s.clone()).collect()
     }
 
     pub fn show(self: &Rc<Self>) {
@@ -177,24 +210,24 @@ impl Win {
     fn sync_outputs(self: &Rc<Self>) {
         let spec = self.spec.borrow().clone();
         let outputs = wayland::outputs();
-        let wanted: Vec<(String, Option<_>)> = if spec.per_monitor {
-            outputs.iter().map(|o| (o.name.clone(), Some(o.wl.clone()))).collect()
+        let wanted: Vec<(Option<ObjectId>, String, Option<_>)> = if spec.per_monitor {
+            outputs.iter().map(|o| (Some(o.wl.id()), o.name.clone(), Some(o.wl.clone()))).collect()
         } else {
-            vec![(String::new(), None)]
+            vec![(None, String::new(), None)]
         };
-        self.surfaces.borrow_mut().retain(|(n, s)| s.alive() && wanted.iter().any(|(w, _)| w == n));
-        for (name, output) in wanted {
-            if self.surfaces.borrow().iter().any(|(n, _)| *n == name) {
+        self.surfaces.borrow_mut().retain(|(k, s)| s.alive() && wanted.iter().any(|(w, _, _)| w == k));
+        for (key, name, output) in wanted {
+            if self.surfaces.borrow().iter().any(|(k, _)| *k == key) {
                 continue;
             }
-            let surface = self.create(&spec, name.clone(), output);
-            self.surfaces.borrow_mut().push((name, surface));
+            let surface = Rc::new(self.create(&spec, name, output));
+            self.surfaces.borrow_mut().push((key, surface));
         }
     }
 
     fn create(self: &Rc<Self>, spec: &Spec, output_name: String, output: Option<wayland_client::protocol::wl_output::WlOutput>) -> Surface {
         let weak = Rc::downgrade(self);
-        let build: wayland::BuildFn = Rc::new(move |_, _| {
+        let build: wayland::BuildFn = Rc::new(move || {
             let Some(win) = weak.upgrade() else { return Node::label(Default::default(), "") };
             let view = View { focus: win.focus.borrow().clone() };
             (win.build)(&view)
@@ -237,12 +270,10 @@ impl Win {
         let weak = Rc::downgrade(self);
         s.after_render(move |node| {
             if let Some(w) = weak.upgrade() {
-                let mut list = vec![];
-                collect_focusables(node, &mut list);
-                *w.focusables.borrow_mut() = list;
-                let mut all = vec![];
-                collect_ids(node, &mut all);
-                *w.rects.borrow_mut() = all;
+                let mut rects = w.rects.take();
+                rects.clear();
+                collect(node, &mut rects);
+                *w.rects.borrow_mut() = rects;
             }
         });
         s
@@ -258,8 +289,9 @@ impl Win {
 
     /// Runs `f` right after the first surface's next commit, ahead of the flush.
     pub fn on_commit(&self, f: impl FnOnce() + 'static) {
-        if let Some((_, s)) = self.surfaces.borrow().first() {
-            s.on_commit(f);
+        match self.surfaces.borrow().first() {
+            Some((_, s)) => s.on_commit(f),
+            None => super::runtime::idle(f),
         }
     }
 
@@ -268,7 +300,7 @@ impl Win {
         self.surfaces.borrow().iter().for_each(|(_, s)| s.hold());
     }
     pub fn release(&self) {
-        self.surfaces.borrow().iter().for_each(|(_, s)| s.release());
+        self.surfaces().iter().for_each(|s| s.release());
     }
 
     /// Steps `f` on every frame of each surface, re-rendering while it returns true.
@@ -320,7 +352,7 @@ impl Win {
     }
 
     pub fn focusables(&self) -> Vec<(String, Rect)> {
-        self.focusables.borrow().clone()
+        self.rects.borrow().iter().filter(|r| r.2).map(|(id, r, _)| (id.clone(), *r)).collect()
     }
 
     /// GTK child_focus with a direction: nearest focusable that way; returns false at the edge.
@@ -345,12 +377,21 @@ impl Win {
 
     /// Arrow navigation with wrap-around (lib/wrapFocus.ts).
     pub fn wrap_focus(&self, dir: Dir) {
-        if !self.child_focus(dir) {
-            for _ in 0..1000 {
-                if !self.child_focus(dir.opposite()) {
-                    break;
-                }
-            }
+        if self.child_focus(dir) {
+            return;
+        }
+        // at the edge: the farthest focusable the other way
+        let list = self.focusables();
+        let Some(cur) = self.focused() else { return };
+        let Some(mut at) = list.iter().find(|(id, _)| *id == cur).map(|&(_, r)| r) else { return };
+        let mut far = None;
+        for _ in 0..list.len() {
+            let Some(id) = pick(&list, at, dir.opposite()) else { break };
+            at = list.iter().find(|(i, _)| *i == id).map(|&(_, r)| r).unwrap_or(at);
+            far = Some(id);
+        }
+        if let Some(id) = far {
+            self.grab_focus(&id);
         }
     }
 }
@@ -374,18 +415,17 @@ impl Dir {
     }
 }
 
-fn collect_focusables(n: &Node, out: &mut Vec<(String, Rect)>) {
+/// All id'd nodes with their rects and whether they're focusable, in tree order (scrolled-out rows
+/// included, so they stay navigable).
+fn collect(n: &Node, rects: &mut Vec<(String, Rect, bool)>) {
     if !n.visible {
         return;
     }
-    if let (Some(id), true) = (&n.id, n.focusable) {
-        out.push((id.clone(), n.rect));
-    }
-    if let Kind::Scroll { .. } = n.kind {
-        // keep scrolled rows navigable even when clipped
+    if let Some(id) = &n.id {
+        rects.push((id.clone(), n.rect, n.focusable));
     }
     for c in &n.children {
-        collect_focusables(c, out);
+        collect(c, rects);
     }
 }
 
@@ -408,7 +448,7 @@ fn pick(list: &[(String, Rect)], cur: Rect, dir: Dir) -> Option<String> {
             };
             (id, (!overlap, main, cross))
         })
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .min_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)).then(a.1.2.total_cmp(&b.1.2)))
         .map(|(id, _)| id.clone())
 }
 
@@ -417,29 +457,17 @@ impl Win {
     pub fn set_image(&self, img: Option<Rc<wayland::ShmImage>>) {
         *self.image.borrow_mut() = img.clone();
         if let Some(img) = img {
-            for (_, s) in self.surfaces.borrow().iter() {
+            for s in self.surfaces() {
                 s.set_image(img.clone());
             }
         }
     }
 }
 
-fn collect_ids(n: &Node, out: &mut Vec<(String, Rect)>) {
-    if !n.visible {
-        return;
-    }
-    if let Some(id) = &n.id {
-        out.push((id.clone(), n.rect));
-    }
-    for c in &n.children {
-        collect_ids(c, out);
-    }
-}
-
 impl Win {
     /// Layout rect of node `id` from the last render.
     pub fn rect_of(&self, id: &str) -> Option<Rect> {
-        self.rects.borrow().iter().find(|(i, _)| i == id).map(|(_, r)| *r)
+        self.rects.borrow().iter().find(|(i, _, _)| i == id).map(|(_, r, _)| *r)
     }
 }
 

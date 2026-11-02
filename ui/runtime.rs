@@ -13,12 +13,12 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 type Callback = Rc<dyn Fn()>;
-type Task = Pin<Box<dyn Future<Output = ()>>>;
+type Task = (Pin<Box<dyn Future<Output = ()>>>, Waker);
 
 #[derive(Default)]
 struct Runtime {
     fds: RefCell<BTreeMap<RawFd, Callback>>,
-    timers: RefCell<BTreeMap<(Instant, u64), Callback>>,
+    timers: RefCell<BTreeMap<(Instant, u64), Box<dyn FnOnce()>>>,
     timer_seq: Cell<u64>,
     idle: RefCell<VecDeque<Box<dyn FnOnce()>>>,
     tasks: RefCell<BTreeMap<u64, Task>>,
@@ -26,6 +26,12 @@ struct Runtime {
     quit: Cell<bool>,
     before_poll: RefCell<Vec<Callback>>,
     after_flush: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// reused across iterations
+    pollfds: RefCell<Vec<libc::pollfd>>,
+    /// watched fds the next poll also waits to become writable on
+    poll_out: RefCell<Vec<RawFd>>,
+    /// watched for POLLPRI only (sysfs attribute notifications)
+    pri: RefCell<Vec<RawFd>>,
 }
 
 thread_local! {
@@ -52,8 +58,29 @@ pub fn watch(fd: RawFd, f: impl Fn() + 'static) {
     RT.with(|rt| rt.fds.borrow_mut().insert(fd, Rc::new(f)));
 }
 
+/// Calls `f` on POLLPRI only: sysfs attributes are always readable but signal changes this way.
+pub fn watch_pri(fd: RawFd, f: impl Fn() + 'static) {
+    RT.with(|rt| rt.pri.borrow_mut().push(fd));
+    watch(fd, f);
+}
+
 pub fn unwatch(fd: RawFd) {
-    RT.with(|rt| rt.fds.borrow_mut().remove(&fd));
+    RT.with(|rt| {
+        rt.fds.borrow_mut().remove(&fd);
+        rt.pri.borrow_mut().retain(|&p| p != fd);
+        rt.poll_out.borrow_mut().retain(|&p| p != fd);
+    });
+}
+
+/// Polls also call `fd`'s watch once it's writable (a write that hit a full socket); it stays
+/// armed until that happens or `unwatch`.
+pub fn poll_out(fd: RawFd) {
+    RT.with(|rt| {
+        let mut out = rt.poll_out.borrow_mut();
+        if !out.contains(&fd) {
+            out.push(fd);
+        }
+    });
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,12 +93,12 @@ impl Timer {
 }
 
 /// Runs `f` once after `ms` milliseconds.
-pub fn timeout(ms: u64, f: impl Fn() + 'static) -> Timer {
+pub fn timeout(ms: u64, f: impl FnOnce() + 'static) -> Timer {
     RT.with(|rt| {
         let seq = rt.timer_seq.get() + 1;
         rt.timer_seq.set(seq);
         let at = Instant::now() + Duration::from_millis(ms);
-        rt.timers.borrow_mut().insert((at, seq), Rc::new(f));
+        rt.timers.borrow_mut().insert((at, seq), Box::new(f));
         Timer(at, seq)
     })
 }
@@ -85,21 +112,20 @@ pub fn spawn(fut: impl Future<Output = ()> + 'static) {
     RT.with(|rt| {
         let id = rt.task_seq.get() + 1;
         rt.task_seq.set(id);
-        rt.tasks.borrow_mut().insert(id, Box::pin(fut));
+        rt.tasks.borrow_mut().insert(id, (Box::pin(fut), Waker::from(Arc::new(TaskWaker(id)))));
         READY.with(|r| r.borrow_mut().push(id));
     });
 }
 
-/// Runs `f` right before every blocking poll (e.g. flushing the Wayland connection).
 /// Runs `f` once everything queued so far has been flushed (before_poll hooks), ahead of waiting.
 pub fn after_flush(f: impl FnOnce() + 'static) {
     RT.with(|rt| rt.after_flush.borrow_mut().push(Box::new(f)));
 }
 
+/// Runs `f` right before every blocking poll (e.g. flushing the Wayland connection).
 pub fn before_poll(f: impl Fn() + 'static) {
     RT.with(|rt| rt.before_poll.borrow_mut().push(Rc::new(f)));
 }
-
 
 fn poll_tasks() {
     loop {
@@ -109,9 +135,9 @@ fn poll_tasks() {
         }
         for id in ready {
             let Some(mut task) = RT.with(|rt| rt.tasks.borrow_mut().remove(&id)) else { continue };
-            let waker = Waker::from(Arc::new(TaskWaker(id)));
-            let mut pending = true;
-            guard(|| pending = task.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            // a task that panicked stays dropped
+            let mut pending = false;
+            guard(|| pending = task.0.as_mut().poll(&mut Context::from_waker(&task.1)).is_pending());
             if pending {
                 RT.with(|rt| rt.tasks.borrow_mut().insert(id, task));
             }
@@ -135,7 +161,7 @@ fn run_due_timers() {
             timers.remove(&key)
         });
         let Some(f) = due else { return };
-        guard(|| f());
+        guard(f);
         poll_tasks();
     }
 }
@@ -159,14 +185,20 @@ pub fn iterate(block: bool) {
         0
     } else {
         RT.with(|rt| match rt.timers.borrow().keys().next() {
-            Some((at, _)) => at.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32,
+            // rounded up: a truncated wait wakes just before the timer and spins until it's due
+            Some((at, _)) => at.saturating_duration_since(Instant::now()).as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
             None => -1,
         })
     };
-    let hooks: Vec<Callback> = RT.with(|rt| rt.before_poll.borrow().clone());
-    for h in hooks {
+    let hooks = RT.with(|rt| std::mem::take(&mut *rt.before_poll.borrow_mut()));
+    for h in &hooks {
         h();
     }
+    RT.with(|rt| {
+        let mut b = rt.before_poll.borrow_mut();
+        let added = std::mem::replace(&mut *b, hooks);
+        b.extend(added);
+    });
     // work deferred until what's queued (a first frame) has gone out; then straight round again,
     // since it may have queued more
     let deferred = RT.with(|rt| std::mem::take(&mut *rt.after_flush.borrow_mut()));
@@ -176,18 +208,52 @@ pub fn iterate(block: bool) {
         }
         return;
     }
-    let mut fds: Vec<libc::pollfd> = RT.with(|rt| {
-        rt.fds.borrow().keys().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect()
+    let mut fds = RT.with(|rt| {
+        let mut v = std::mem::take(&mut *rt.pollfds.borrow_mut());
+        v.clear();
+        let out = rt.poll_out.borrow();
+        let pri = rt.pri.borrow();
+        let events = |fd| {
+            if pri.contains(&fd) {
+                libc::POLLPRI
+            } else if out.contains(&fd) {
+                libc::POLLIN | libc::POLLOUT
+            } else {
+                libc::POLLIN
+            }
+        };
+        v.extend(rt.fds.borrow().keys().map(|&fd| libc::pollfd { fd, events: events(fd), revents: 0 }));
+        v
     });
     let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
     if n > 0 {
         for p in fds.iter().filter(|p| p.revents != 0) {
+            if p.revents & libc::POLLNVAL != 0 {
+                // closed while still watched: it would report POLLNVAL forever
+                unwatch(p.fd);
+                continue;
+            }
+            // signalled writable (or failed): disarmed; a write that fills it again re-arms
+            if p.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
+                RT.with(|rt| rt.poll_out.borrow_mut().retain(|&o| o != p.fd));
+            }
             if let Some(f) = RT.with(|rt| rt.fds.borrow().get(&p.fd).cloned()) {
                 guard(|| f());
                 poll_tasks();
             }
+            // sysfs reports every change as POLLPRI|POLLERR, and a removed attribute the same way
+            // forever: one that can't be read anymore is gone, stop watching it
+            if p.revents & libc::POLLERR != 0 && RT.with(|rt| rt.pri.borrow().contains(&p.fd)) {
+                let mut b = 0u8;
+                if unsafe { libc::pread(p.fd, (&raw mut b).cast(), 1, 0) } < 0
+                    && !matches!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock)
+                {
+                    unwatch(p.fd);
+                }
+            }
         }
     }
+    RT.with(|rt| *rt.pollfds.borrow_mut() = fds);
     run_due_timers();
     run_idle();
 }
@@ -329,6 +395,34 @@ mod tests {
         drop(tx);
         drive(|| got.get().is_none());
     }
+
+    #[test]
+    fn queue_skips_dropped_waiters() {
+        let q = Queue::default();
+        let first = Box::pin(q.lock());
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut first = first;
+        let Poll::Ready(g) = first.as_mut().poll(&mut cx) else { panic!("free queue") };
+        let mut second = Box::pin(q.lock());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(second);
+        drop(g);
+        assert!(!q.busy.get(), "dropped waiter must not keep the queue busy");
+        // handed the lock, then dropped before taking it
+        let Poll::Ready(g) = Box::pin(q.lock()).as_mut().poll(&mut cx) else { panic!("free queue") };
+        let mut third = Box::pin(q.lock());
+        assert!(third.as_mut().poll(&mut cx).is_pending());
+        drop(g);
+        drop(third);
+        assert!(!q.busy.get());
+    }
+
+    #[test]
+    fn panicked_task_is_dropped() {
+        spawn(async { panic!("boom") });
+        poll_tasks();
+        assert!(RT.with(|rt| rt.tasks.borrow().is_empty()));
+    }
 }
 
 /// FIFO async lock: serializes async jobs (the TS promise queues) without polling.
@@ -340,24 +434,45 @@ pub struct Queue {
 
 pub struct QueueGuard<'a>(&'a Queue);
 
+/// A queued `lock` call; dropped after being handed the lock but before taking it, it passes it on.
+struct Waiting<'a>(&'a Queue, Receiver<()>);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if self.1.0.value.borrow_mut().take().is_some() {
+            self.0.unlock();
+        }
+    }
+}
+
 impl Queue {
     pub async fn lock(&self) -> QueueGuard<'_> {
         if self.busy.replace(true) {
             let (tx, rx) = oneshot();
             self.waiters.borrow_mut().push_back(tx);
-            rx.await;
+            let mut w = Waiting(self, rx);
+            (&mut w.1).await;
         }
         QueueGuard(self)
+    }
+
+    fn unlock(&self) {
+        loop {
+            let next = self.waiters.borrow_mut().pop_front();
+            match next {
+                // a waiter whose future was dropped can't take it
+                Some(tx) if tx.0.as_ref().is_some_and(|s| Rc::strong_count(s) < 2) => continue,
+                // ownership passes straight to the next waiter
+                Some(tx) => return tx.send(()),
+                None => return self.busy.set(false),
+            }
+        }
     }
 }
 
 impl Drop for QueueGuard<'_> {
     fn drop(&mut self) {
-        match self.0.waiters.borrow_mut().pop_front() {
-            // ownership passes straight to the next waiter
-            Some(tx) => tx.send(()),
-            None => self.0.busy.set(false),
-        }
+        self.0.unlock();
     }
 }
 

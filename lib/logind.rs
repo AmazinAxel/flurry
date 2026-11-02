@@ -23,10 +23,17 @@ pub fn sleeping() -> State<bool> {
 pub fn start() {
     let Some(bus) = dbus::system() else { return };
     bus.subscribe(
-        SignalFilter { interface: Some(MANAGER.into()), member: Some("PrepareForSleep".into()), path: Some(PATH.into()), ..Default::default() },
+        SignalFilter {
+            sender: Some(NAME.into()),
+            interface: Some(MANAGER.into()),
+            member: Some("PrepareForSleep".into()),
+            path: Some(PATH.into()),
+            ..Default::default()
+        },
         |m| {
             if let Ok(s) = m.read1::<bool>() {
-                sleeping().set(s);
+                // every PrepareForSleep(true) must reach the lock, even a repeated one
+                if s && sleeping().peek() { sleeping().notify() } else { sleeping().set(s) }
             }
         },
     );
@@ -38,9 +45,8 @@ pub fn inhibit_sleep(why: &str) {
     }
     let Some(bus) = dbus::system() else { return };
     let msg = method(NAME, PATH, MANAGER, "Inhibit").append3("sleep", "flurry", why).append1("delay");
-    bus.call_cb(msg, |r| match r.ok().and_then(|m| m.read1::<::dbus::arg::OwnedFd>().ok()) {
+    bus.call_cb(msg, |r| match r.ok().and_then(|m| m.read1::<OwnedFd>().ok()) {
         Some(fd) => {
-            let fd: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd.into_fd()) };
             if WANTED.with(Cell::get) {
                 INHIBITOR.with(|i| *i.borrow_mut() = Some(fd));
             }
@@ -70,7 +76,12 @@ pub fn poweroff() {
     power("PowerOff");
 }
 pub fn reboot() {
-    power("Reboot");
+    reboot_cb(|_| {});
+}
+/// Reboot; `done` gets whether logind accepted it (false: still running, e.g. refused by polkit).
+pub fn reboot_cb(done: impl FnOnce(bool) + 'static) {
+    let Some(bus) = dbus::system() else { return done(false) };
+    bus.call_cb(method(NAME, PATH, MANAGER, "Reboot").append1(false), move |r| done(r.is_ok()));
 }
 
 pub fn set_brightness(device: &str, value: u32) {

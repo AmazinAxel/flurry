@@ -14,6 +14,7 @@ use crate::ui::wayland::{Anchor, Keymode, PointerEvent};
 use crate::ui::window::{Spec, Win};
 use crate::lib::{audio, mediaPlayer};
 use crate::lib::scrollStep::scroll_step;
+use crate::lib::state::State;
 use crate::widgets::status::quicksettings::quicksettings::{self as qs, set_slider, slider_value};
 use crate::widgets::status::status::quickstatus;
 use crate::widgets::status::{bluetooth, calendar, network};
@@ -22,10 +23,6 @@ use crate::widgets::status::{bluetooth, calendar, network};
 pub const MENU_WIDTH: f32 = 500.0;
 /// Spacing unit inside the cards; also the wallpaper's inner padding.
 pub const GAP: f32 = SPACE_L;
-
-thread_local! {
-    static DRAG: Cell<Option<&'static str>> = const { Cell::new(None) };
-}
 
 /// Wallpaper-backed part, and what goes under it.
 fn content(base: &Style, name: &str, focus: Option<&str>) -> (Node, Option<Node>) {
@@ -42,6 +39,19 @@ fn content(base: &Style, name: &str, focus: Option<&str>) -> (Node, Option<Node>
         _ => calendar::calendar(base),
     };
     (menu, None)
+}
+
+/// Redraws when `state` changes while one of `menus` is open.
+pub fn watch_in<T: Clone + PartialEq + 'static>(w: &Rc<Win>, state: &State<T>, menus: &'static [&'static str]) {
+    let weak = Rc::downgrade(w);
+    state.subscribe(move || {
+        if let Some(w) = weak.upgrade()
+            && w.visible()
+            && current().peek().is_some_and(|m| menus.contains(&m))
+        {
+            w.redraw();
+        }
+    });
 }
 
 pub fn menu_window() -> Rc<Win> {
@@ -80,22 +90,24 @@ pub fn menu_window() -> Rc<Win> {
         w.set_visible(open.is_some());
         w.redraw();
     });
-    w.watch(&crate::lib::audio::speakers());
-    w.watch(&crate::lib::audio::default_name());
-    w.watch(&crate::lib::brightness::brightness());
-    w.watch(&crate::widgets::status::quicksettings::sound::selected());
-    w.watch(&crate::lib::bluetooth::bt());
-    w.watch(&bluetooth::order());
-    w.watch(&bluetooth::sticky());
-    w.watch(&crate::lib::time::now());
-    w.watch(&mediaPlayer::is_playing());
-    w.watch(&mediaPlayer::song());
-    w.watch(&mediaPlayer::playlist_index());
-    w.watch(&crate::lib::battery::battery());
-    w.watch(&crate::lib::streamingMode::streaming_mode());
-    w.watch(&crate::widgets::status::modules::statusIcons::network_icon());
-    w.watch(&crate::widgets::status::modules::mpris::track());
-    w.watch(&crate::widgets::record::service::is_rec());
+    // each state redraws only the menus showing it
+    const STATUS: &[&str] = &["status"];
+    watch_in(&w, &crate::lib::audio::speakers(), STATUS);
+    watch_in(&w, &crate::lib::audio::default_name(), STATUS);
+    watch_in(&w, &crate::lib::brightness::brightness(), STATUS);
+    watch_in(&w, &crate::widgets::status::quicksettings::sound::selected(), STATUS);
+    watch_in(&w, &crate::lib::bluetooth::bt(), &["status", "bluetooth"]);
+    watch_in(&w, &bluetooth::order(), &["bluetooth"]);
+    watch_in(&w, &bluetooth::sticky(), &["bluetooth"]);
+    watch_in(&w, &crate::lib::time::now(), &["status", "calendar"]);
+    watch_in(&w, &mediaPlayer::is_playing(), STATUS);
+    watch_in(&w, &mediaPlayer::song(), STATUS);
+    watch_in(&w, &mediaPlayer::playlist_index(), STATUS);
+    watch_in(&w, &crate::lib::battery::battery(), STATUS);
+    watch_in(&w, &crate::lib::streamingMode::streaming_mode(), &["status", "wifi"]);
+    watch_in(&w, &crate::widgets::status::modules::statusIcons::network_icon(), STATUS);
+    watch_in(&w, &crate::widgets::status::modules::mpris::track(), STATUS);
+    watch_in(&w, &crate::widgets::record::service::is_rec(), STATUS);
     network::watch(&w);
 
     let ww = Rc::downgrade(&w);
@@ -149,24 +161,25 @@ pub fn menu_window() -> Rc<Win> {
     });
 
     let ww = Rc::downgrade(&w);
+    // the slider being dragged
+    let drag: Cell<Option<&'static str>> = Cell::new(None);
     w.on_pointer(move |ev, _| {
         let Some(w) = ww.upgrade() else { return };
-        let inside = |id: &str, x: f64, y: f64| w.rect_of(id).is_some_and(|r| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom());
-        let hit = |x: f64, y: f64| {
-            ["volume", "brightness"].into_iter().find_map(|id| w.rect_of(id).filter(|r| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom()).map(|r| (id, r)))
-        };
+        let contains = |r: &tiny_skia::Rect, x: f64, y: f64| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom();
+        let inside = |id: &str, x: f64, y: f64| w.rect_of(id).is_some_and(|r| contains(&r, x, y));
+        let hit = |x: f64, y: f64| ["volume", "brightness"].into_iter().find_map(|id| w.rect_of(id).filter(|r| contains(r, x, y)).map(|r| (id, r)));
         match ev {
             PointerEvent::Button { x, y, pressed: true } => {
                 if inside("mediaBtn", x, y) {
                     mediaPlayer::play_pause();
                 } else if let Some((id, r)) = hit(x, y) {
-                    DRAG.with(|d| d.set(Some(id)));
+                    drag.set(Some(id));
                     set_slider(id, slider_value(r, x as f32));
                 }
             }
-            PointerEvent::Button { pressed: false, .. } | PointerEvent::Leave => DRAG.with(|d| d.set(None)),
+            PointerEvent::Button { pressed: false, .. } | PointerEvent::Leave => drag.set(None),
             PointerEvent::Motion { x, .. } => {
-                if let Some(id) = DRAG.with(Cell::get)
+                if let Some(id) = drag.get()
                     && let Some(r) = w.rect_of(id)
                 {
                     set_slider(id, slider_value(r, x as f32));

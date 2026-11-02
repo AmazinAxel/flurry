@@ -4,15 +4,6 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
-const NAMES: &[&str] = &[
-    "audio-input-microphone", "microphone-disabled", "bluetooth-active", "dialog-password", "display-brightness",
-    "emblem-default", "media-playback-pause", "media-playback-start", "media-record",
-    "network-wireless-acquiring", "network-wireless-encrypted", "network-wireless-offline", "network-wireless",
-    "notifications-disabled", "view-refresh",
-];
-
-
-
 fn flatten(group: &usvg::Group, opacity: f32, out: &mut String) {
     for node in group.children() {
         match node {
@@ -93,15 +84,16 @@ fn main() {
         .collect();
     // sorted by the full icon name: icons.rs looks them up with a binary search
     found.sort();
-    let missing: Vec<&&str> = NAMES.iter().filter(|n| !found.iter().any(|(f, _)| *f == format!("{n}-symbolic"))).collect();
-    if !missing.is_empty() {
-        println!("cargo:warning=missing icons: {missing:?}");
-    }
 
     let mut out = String::from("pub static ICONS: &[(&str, f32, &[Shape])] = &[\n");
     for (name, file) in &found {
-        let Ok(data) = std::fs::read(file) else { continue };
-        let Ok(tree) = usvg::Tree::from_data(&data, &usvg::Options::default()) else { continue };
+        let tree = match std::fs::read(file).map_err(|e| e.to_string()).and_then(|d| usvg::Tree::from_data(&d, &usvg::Options::default()).map_err(|e| e.to_string())) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("cargo:warning=icon {name} not baked: {e}");
+                continue;
+            }
+        };
         writeln!(out, "    (\"{name}\", {:?}, &[", tree.size().width()).unwrap();
         flatten(tree.root(), 1.0, &mut out);
         out.push_str("    ]),\n");
@@ -109,4 +101,17 @@ fn main() {
     out.push_str("];\n");
     let dest = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("icons.rs");
     std::fs::write(dest, out).unwrap();
+    fonts_check();
+}
+
+/// Text renders nothing without a font table: package.nix writes it into settings.rs, the dev shell
+/// passes it as FLURRY_FONTS. Said here once instead of at runtime.
+fn fonts_check() {
+    println!("cargo:rerun-if-changed=settings.rs");
+    println!("cargo:rerun-if-env-changed=FLURRY_FONTS");
+    let settings = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("settings.rs");
+    let empty_table = std::fs::read_to_string(settings).is_ok_and(|s| s.lines().any(|l| l.starts_with("pub const FONTS:") && l.trim_end().ends_with("= &[];")));
+    if empty_table && std::env::var("FLURRY_FONTS").unwrap_or_default().trim().is_empty() {
+        println!("cargo:warning=no fonts: settings.rs FONTS is empty and FLURRY_FONTS is unset (use nix-shell / nix develop); text will not render");
+    }
 }

@@ -13,6 +13,10 @@
       sideview = servoPkgs.callPackage ./sideview/package.nix { };
       default = pkgs.callPackage ./package.nix { inherit sideview; };
     });
+    # CI: the package without Servo (a stub sideview), so the Nix side is checked cheaply
+    checks = forAll (pkgs: _: {
+      package = pkgs.callPackage ./package.nix { sideview = pkgs.writeShellScriptBin "flurry-sideview" "exit 1"; };
+    });
     devShells = forAll (pkgs: _: { default = import ./shell.nix { inherit pkgs; }; });
     # `nix run .#dev` from the repo: build it, swap it in for the installed service until it exits
     apps = forAll (pkgs: _: {

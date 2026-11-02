@@ -20,6 +20,8 @@ libc = "0.2"
 url = "2"
 euclid = "0.22"
 dpi = "0.1"
+# what Servo's own clipboard uses (no extra build), behind our ClipboardDelegate
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 [profile.dev.package."*"]
 opt-level = 2

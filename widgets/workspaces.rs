@@ -1,14 +1,15 @@
 // Workspace flash on workspace change (widgets/workspaces.tsx).
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::lib::json::Json;
 use crate::lib::outTransition::Flash;
 use crate::lib::state::State;
 use crate::lib::style::*;
 use crate::lib::sway;
 use crate::ui::node::{Align, Background, Node, Sides, Style};
+use crate::ui::runtime;
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{Spec, Win};
 
@@ -16,22 +17,60 @@ thread_local! {
     static FOCUSED: State<i64> = State::new(0);
     static OCCUPIED: State<BTreeSet<i64>> = State::new(BTreeSet::new());
     static SCRATCHPAD: State<usize> = State::new(0);
+    /// window size for a scratchpad count: the largest column (focus on one, all occupied)
+    static SIZE: Cell<Option<(usize, (f32, f32))>> = const { Cell::new(None) };
+    /// queued for the next idle pass: (full GET_WORKSPACES, focus flash with the scratchpad count)
+    static QUEUED: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
 }
 
+/// Occupied/focused from GET_WORKSPACES (sway drops empty unfocused workspaces).
 fn update() {
-    let Some(tree) = sway::tree() else { return };
-    let workspaces: Vec<&Json> = tree.get("nodes").arr().iter().flat_map(|o| o.get("nodes").arr()).collect();
-    OCCUPIED.with(|o| o.set(workspaces.iter().filter_map(|w| w.get("num").int()).filter(|n| (1..=9).contains(n)).collect()));
-    let focus0 = tree.get("focus").arr().first().and_then(Json::int);
-    let output = tree.get("nodes").arr().iter().find(|o| o.get("id").int() == focus0);
-    let f = output
-        .and_then(|o| {
-            let wf = o.get("focus").arr().first().and_then(Json::int);
-            o.get("nodes").arr().iter().find(|w| w.get("id").int() == wf).and_then(|w| w.get("num").int())
-        })
-        .unwrap_or(0);
+    let Some(list) = sway::workspaces() else { return };
+    OCCUPIED.with(|o| o.set(list.arr().iter().filter_map(|w| w.get("num").int()).filter(|n| (1..=9).contains(n)).collect()));
+    let f = list.arr().iter().find(|w| w.get("focused").bool() == Some(true)).and_then(|w| w.get("num").int()).unwrap_or(0);
     FOCUSED.with(|s| s.set(f));
-    let scratch = workspaces.iter().find(|w| w.get("name").str() == Some("__i3_scratch")).map(|w| w.get("floating_nodes").arr().len()).unwrap_or(0);
+}
+
+/// Applies what the event says itself (focus, a workspace created or emptied); anything else
+/// re-reads the list. Returns whether the list must be re-read.
+fn apply_event(ev: &crate::lib::json::Json) -> bool {
+    let num = |k: &str| ev.get(k).get("num").int();
+    let slot = |k: &str| num(k).filter(|n| (1..=9).contains(n));
+    match ev.get("change").str() {
+        Some("focus") => {
+            if let Some(n) = slot("current") {
+                OCCUPIED.with(|o| o.update(|o| { o.insert(n); }));
+            }
+            FOCUSED.with(|s| s.set(num("current").unwrap_or(0)));
+            false
+        }
+        Some("init") => {
+            if let Some(n) = slot("current") {
+                OCCUPIED.with(|o| o.update(|o| { o.insert(n); }));
+            }
+            false
+        }
+        Some("empty") => {
+            if let Some(n) = slot("current") {
+                OCCUPIED.with(|o| o.update(|o| { o.remove(&n); }));
+            }
+            false
+        }
+        _ => true,
+    }
+}
+
+/// The scratchpad count needs the tree; it only shows with the flash on a focus change.
+fn update_scratchpad() {
+    let Some(tree) = sway::tree() else { return };
+    let scratch = tree
+        .get("nodes")
+        .arr()
+        .iter()
+        .flat_map(|o| o.get("nodes").arr())
+        .find(|w| w.get("name").str() == Some("__i3_scratch"))
+        .map(|w| w.get("floating_nodes").arr().len())
+        .unwrap_or(0);
     SCRATCHPAD.with(|s| s.set(scratch));
 }
 
@@ -69,34 +108,43 @@ pub fn workspaces() {
         let n = column(&base, focused, &OCCUPIED.with(|s| s.peek()));
         // the surface keeps its largest size (focus on one, all occupied) and the slide only moves
         // content inside it: resizing the layer per frame or per switch took compositor round trips
-        let full = column(&base, 1, &(1..=9).collect());
-        let (w, h) = (full.measure_w().1 + full.style.margin.h(), full.measure_h(f32::MAX).1 + full.style.margin.v());
+        let count = SCRATCHPAD.with(|s| s.peek());
+        let (w, h) = match SIZE.with(Cell::get) {
+            Some((c, size)) if c == count => size,
+            _ => {
+                let full = column(&base, 1, &(1..=9).collect());
+                let size = (full.measure_w().1 + full.style.margin.h(), full.measure_h(f32::MAX).1 + full.style.margin.v());
+                SIZE.with(|s| s.set(Some((count, size))));
+                size
+            }
+        };
         let mut n = n.align(Align::Start, Align::Start);
         // SLIDE_RIGHT revealer hiding: content slides left out of the window
         n.style.margin.left -= (1.0 - f.progress()) * (w + SPACE_L);
         Node::hbox(base.inherit(), 0.0, vec![n]).size(w, h).align(Align::Start, Align::Start)
     });
     let w2: Rc<Win> = w.clone();
+    // a burst of events (a workspace switch sends several) is one read on the next idle pass
     sway::subscribe(&["workspace"], move |ev| {
-        let current = ev.get("current");
-        if ev.get("change").str() == Some("focus")
-            && let Some(num) = current.get("num").int()
-        {
-            let old = ev.get("old");
-            OCCUPIED.with(|o| {
-                let mut next = o.peek();
-                if let Some(on) = old.get("num").int()
-                    && old.get("nodes").arr().is_empty()
-                    && old.get("floating_nodes").arr().is_empty()
-                {
-                    next.remove(&on);
-                }
-                o.set(next);
-            });
-            FOCUSED.with(|s| s.set(num));
+        let full = apply_event(ev);
+        let focus = ev.get("change").str() == Some("focus");
+        let queued = QUEUED.with(Cell::get);
+        QUEUED.with(|q| q.set(Some(queued.map_or((full, focus), |(a, b)| (a || full, b || focus)))));
+        if queued.is_some() {
+            return;
         }
-        update();
-        flash.show(&w2);
+        let (flash, w2) = (flash.clone(), w2.clone());
+        runtime::idle(move || {
+            let Some((full, focus)) = QUEUED.with(Cell::take) else { return };
+            if full {
+                update();
+            }
+            if focus {
+                update_scratchpad();
+                flash.show(&w2);
+            }
+        });
     });
     update();
+    update_scratchpad();
 }

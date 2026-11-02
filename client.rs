@@ -1,8 +1,11 @@
 // `flurry <cmd> [arg]`: the request client for sway keybinds. Kept apart from the shell so a keybind
-// loads only libc, not the shell's dbus/pipewire/fontconfig/harfbuzz stack. `flurry` alone starts the shell.
+// loads only libc, not the shell's dbus/pipewire/harfbuzz stack. `flurry` alone starts the shell.
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+#[allow(dead_code)]
+#[path = "lib/xdg.rs"]
+mod xdg;
+
+use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 
 fn main() {
@@ -12,12 +15,16 @@ fn main() {
         eprintln!("flurry: {}", std::process::Command::new(shell).exec());
         std::process::exit(1);
     }
-    // same path as the shell's socket_path() (lib/xdg.rs runtime_dir)
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/tmp/flurry-{}", unsafe { libc::getuid() }));
-    let Ok(mut s) = UnixStream::connect(format!("{dir}/flurry.sock")) else {
+    // one datagram, no reply, never blocking: a busy shell (full queue) drops it, never stalls the keybind
+    let sent = xdg::socket_path().zip(UnixDatagram::unbound().ok()).is_some_and(|(p, s)| {
+        let _ = s.set_nonblocking(true);
+        match s.send_to(args.join(" ").as_bytes(), p) {
+            Ok(_) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+        }
+    });
+    if !sent {
         eprintln!("flurry is not running");
         std::process::exit(1);
-    };
-    let _ = s.write_all((args.join(" ") + "\n").as_bytes());
-    let _ = s.read(&mut [0u8; 16]);
+    }
 }

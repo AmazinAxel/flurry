@@ -20,20 +20,28 @@ use Seg::*;
 
 include!(concat!(env!("OUT_DIR"), "/icons.rs"));
 
-#[cfg(test)]
-fn exists(name: &str) -> bool {
-    ICONS.binary_search_by(|(n, _, _)| n.cmp(&name)).is_ok()
-}
-thread_local! {
-    /// Paths are built once per icon on first draw.
-    static PATHS: std::cell::RefCell<std::collections::HashMap<usize, std::rc::Rc<Vec<Option<tiny_skia::Path>>>>> = Default::default();
+fn index(name: &str) -> Option<usize> {
+    ICONS.binary_search_by(|(n, _, _)| n.cmp(&name)).ok()
 }
 
-fn paths(i: usize) -> std::rc::Rc<Vec<Option<tiny_skia::Path>>> {
-    if let Some(p) = PATHS.with(|c| c.borrow().get(&i).cloned()) {
-        return p;
-    }
-    let built: Vec<Option<tiny_skia::Path>> = ICONS[i]
+/// The baked table's own name for `name`, if that icon exists.
+pub fn find(name: &str) -> Option<&'static str> {
+    index(name).map(|i| ICONS[i].0)
+}
+
+type Paths = Vec<Option<tiny_skia::Path>>;
+
+thread_local! {
+    /// Paths are built once per icon on first draw; leaked so draws borrow them for free.
+    static PATHS: Vec<std::cell::OnceCell<&'static Paths>> = (0..ICONS.len()).map(|_| Default::default()).collect();
+}
+
+fn paths(i: usize) -> &'static Paths {
+    PATHS.with(|c| *c[i].get_or_init(|| Box::leak(Box::new(build(i)))))
+}
+
+fn build(i: usize) -> Paths {
+    ICONS[i]
         .2
         .iter()
         .map(|shape| {
@@ -49,16 +57,13 @@ fn paths(i: usize) -> std::rc::Rc<Vec<Option<tiny_skia::Path>>> {
             }
             pb.finish()
         })
-        .collect();
-    let built = std::rc::Rc::new(built);
-    PATHS.with(|c| c.borrow_mut().insert(i, built.clone()));
-    built
+        .collect()
 }
 
 /// Draws icon `name` scaled to `size` px at (x, y). Unknown names draw nothing (GTK's missing icon is
 /// never shown in flurry since every name is baked).
 pub fn draw(pm: &mut PixmapMut, name: &str, size: f32, x: f32, y: f32, color: Color, ts: Transform) {
-    let Ok(i) = ICONS.binary_search_by(|(n, _, _)| n.cmp(&name)) else { return };
+    let Some(i) = index(name) else { return };
     let (_, view, shapes) = &ICONS[i];
     let t = ts.pre_translate(x, y).pre_scale(size / view, size / view);
     for (shape, path) in shapes.iter().zip(paths(i).iter()) {
@@ -79,7 +84,7 @@ mod tests {
     fn table_is_sorted_for_binary_search() {
         assert!(super::ICONS.windows(2).all(|w| w[0].0 < w[1].0));
         for n in ["network-wireless-symbolic", "audio-volume-muted-symbolic", "bluetooth-active-symbolic"] {
-            assert!(super::exists(n), "{n}");
+            assert_eq!(super::find(n), Some(n));
         }
     }
 }

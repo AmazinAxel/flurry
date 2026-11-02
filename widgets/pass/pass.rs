@@ -10,16 +10,23 @@ use crate::ui::{runtime, window};
 
 thread_local! {
     static ENTRIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// bumped per show and hide: a walk finishing after either is dropped
+    static SHOWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// pass's own rule: $PASSWORD_STORE_DIR, else ~/.password-store
 fn store() -> String {
-    format!("{}/.password-store", crate::lib::xdg::home_dir())
+    std::env::var("PASSWORD_STORE_DIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| format!("{}/.password-store", crate::lib::xdg::home_dir()))
 }
 
 fn walk(dir: &str, base: usize, out: &mut Vec<String>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
-        let p = format!("{dir}/{}", e.file_name().to_string_lossy());
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue; // .git, .gpg-id, ...
+        }
+        let p = format!("{dir}/{name}");
         match e.file_type() {
             Ok(t) if t.is_dir() => walk(&p, base, out),
             Ok(t) if t.is_file() && p.ends_with(".gpg") => out.push(p[base + 1..p.len() - 4].to_string()),
@@ -28,13 +35,28 @@ fn walk(dir: &str, base: usize, out: &mut Vec<String>) {
     }
 }
 
-/// `find STORE -type f -name '*.gpg'`, relative and without the extension, sorted
+/// `find STORE -type f -name '*.gpg'`, relative and without the extension, sorted; off the loop
+/// (the dialog's first frame never waits on it, and searching starts at 2 chars)
 fn load_entries() {
-    let s = store();
-    let mut out = vec![];
-    walk(&s, s.len(), &mut out);
-    out.sort();
-    ENTRIES.with(|e| *e.borrow_mut() = out);
+    let show = SHOWS.with(|s| {
+        s.set(s.get() + 1);
+        s.get()
+    });
+    runtime::spawn(async move {
+        let out = runtime::blocking(|| {
+            let s = store();
+            let mut out = vec![];
+            walk(&s, s.len(), &mut out);
+            out.sort();
+            out
+        })
+        .await;
+        if let Some(out) = out
+            && SHOWS.with(|s| s.get()) == show
+        {
+            ENTRIES.with(|e| *e.borrow_mut() = out);
+        }
+    });
 }
 
 pub fn search(q: &str) -> Vec<String> {
@@ -51,16 +73,16 @@ fn copy_pair(name: &str) {
     window::set_visible("pass", false);
     let name = name.to_string();
     runtime::spawn(async move {
-        let out = exec(&["pass", "show", &name]).await.unwrap_or_default();
+        let mut out = exec(&["pass", "show", "--", &name]).await.unwrap_or_default();
         let mut lines = out.split('\n');
-        let password = lines.next().unwrap_or("").to_string();
+        let password = lines.next().unwrap_or("");
         let login = lines.next().unwrap_or("");
-        if password.is_empty() {
-            return;
+        if !password.is_empty() {
+            let stripped = strip_login(login);
+            let user = if stripped.is_empty() { name.rsplit('/').next().unwrap_or("").to_string() } else { stripped };
+            copy_login(&user, password);
         }
-        let stripped = strip_login(login);
-        let user = if stripped.is_empty() { name.rsplit('/').next().unwrap_or("").to_string() } else { stripped };
-        copy_login(&user, &password).await;
+        crate::ui::entry::wipe(&mut out);
     });
 }
 
@@ -79,8 +101,7 @@ pub fn strip_login(line: &str) -> String {
 }
 
 pub fn pass() {
-    load_entries();
-    search_dialog("pass", SearchSpec {
+    let w = search_dialog("pass", SearchSpec {
         search: Box::new(search),
         activate: Rc::new(|n: &String| copy_pair(n)),
         shift_activate: None,
@@ -92,6 +113,14 @@ pub fn pass() {
         }),
         sensitive: None,
         on_show: Some(Rc::new(load_entries)),
+    });
+    // the store's names don't stay in memory while hidden
+    let v = w.visibility.clone();
+    w.visibility.subscribe(move || {
+        if !v.peek() {
+            SHOWS.with(|s| s.set(s.get() + 1));
+            ENTRIES.with(|e| *e.borrow_mut() = Vec::new());
+        }
     });
 }
 

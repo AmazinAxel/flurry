@@ -20,8 +20,13 @@ pub fn cache_dir() -> String {
 pub fn config_dir() -> String {
     base("XDG_CONFIG_HOME", ".config")
 }
-pub fn runtime_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/tmp/flurry-{}", unsafe { libc::getuid() }))
+/// No fallback: a shared /tmp path could be squatted by another user.
+pub fn runtime_dir() -> Option<String> {
+    std::env::var("XDG_RUNTIME_DIR").ok().filter(|v| v.starts_with('/'))
+}
+/// The request socket; also compiled into the client (std only here).
+pub fn socket_path() -> Option<String> {
+    runtime_dir().map(|d| format!("{d}/flurry.sock"))
 }
 
 /// g_get_user_special_dir: XDG_<NAME>_DIR from user-dirs.dirs, else $HOME/<Name>.

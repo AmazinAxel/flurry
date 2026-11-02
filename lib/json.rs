@@ -51,15 +51,19 @@ impl Json {
 }
 
 pub fn parse(s: &str) -> Option<Json> {
-    let mut p = P { s: s.as_bytes(), i: 0 };
+    let mut p = P { s: s.as_bytes(), i: 0, depth: 0 };
     let v = p.value()?;
     p.ws();
     (p.i == p.s.len()).then_some(v)
 }
 
+/// nesting limit, so hostile input can't overflow the stack
+const MAX_DEPTH: u32 = 128;
+
 struct P<'a> {
     s: &'a [u8],
     i: usize,
+    depth: u32,
 }
 
 impl P<'_> {
@@ -78,6 +82,15 @@ impl P<'_> {
         }
     }
     fn value(&mut self) -> Option<Json> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let v = self.value_inner();
+        self.depth -= 1;
+        v
+    }
+    fn value_inner(&mut self) -> Option<Json> {
         self.ws();
         match *self.s.get(self.i)? {
             b'{' => {
@@ -162,8 +175,11 @@ impl P<'_> {
                             self.i += 4;
                             if (0xd800..0xdc00).contains(&cp) && self.s.get(self.i..self.i + 2) == Some(b"\\u") {
                                 let lo = u32::from_str_radix(std::str::from_utf8(self.s.get(self.i + 2..self.i + 6)?).ok()?, 16).ok()?;
-                                self.i += 6;
-                                cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                                // an unpaired high surrogate becomes U+FFFD and the next escape is read on its own
+                                if (0xdc00..=0xdfff).contains(&lo) {
+                                    self.i += 6;
+                                    cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                                }
                             }
                             let mut b = [0; 4];
                             out.extend_from_slice(char::from_u32(cp).unwrap_or('\u{fffd}').encode_utf8(&mut b).as_bytes());
@@ -204,6 +220,19 @@ mod tests {
         assert_eq!(j.get("x").num(), Some(-150.0));
         assert_eq!(j.get("s").str(), Some("a\"é"));
         assert_eq!(j.get("missing"), &Json::Null);
+    }
+
+    #[test]
+    fn deep_nesting_rejected() {
+        assert!(parse(&format!("{}{}", "[".repeat(100), "]".repeat(100))).is_some());
+        assert!(parse(&format!("{}{}", "[".repeat(100_000), "]".repeat(100_000))).is_none());
+    }
+
+    #[test]
+    fn bad_surrogates_replaced() {
+        assert_eq!(parse(r#""\ud800\ud800""#).unwrap().str(), Some("\u{fffd}\u{fffd}"));
+        assert_eq!(parse(r#""\ud83d\ude00""#).unwrap().str(), Some("😀"));
+        assert_eq!(parse(r#""\ud800x""#).unwrap().str(), Some("\u{fffd}x"));
     }
 
     #[test]

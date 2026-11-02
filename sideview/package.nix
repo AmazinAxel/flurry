@@ -11,7 +11,7 @@ let unwrapped = rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ];
   };
   # fetchCargoVendor (not cargoLock) so the mozjs workaround below finds $cargoDepsCopy
-  cargoHash = "sha256-LTwjPZjFCxQHQHVatUHouxkobxnOcVDWkJsi8kc8b40=";
+  cargoHash = "sha256-e8bbAkRPWn1sv6taaHrShdy3GJcU0vJwtK+DfmTTG+c=";
 
   nativeBuildInputs = servo.nativeBuildInputs ++ [ makeWrapper ];
   buildInputs = servo.buildInputs ++ [ libxkbcommon ];
