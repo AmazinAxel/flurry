@@ -167,9 +167,16 @@ impl Win {
                     if !w.visible() {
                         let gone = w.surfaces.take();
                         drop(gone);
-                        // nothing modal (keys, a dim) left up, only the bar: its caches go too
-                        let modal = |w: &Win| w.visible() && (w.spec.borrow().keymode != Keymode::None || w.spec.borrow().dim.is_some());
-                        if !WINDOWS.with(|ws| ws.borrow().values().any(|w| modal(w))) {
+                        // the last hidden window gone and nothing modal (keys, a dim) up, only the bar: the
+                        // caches go too (never while another hidden window could reopen on them)
+                        let busy = |w: &Win| {
+                            if w.visible() {
+                                w.spec.borrow().keymode != Keymode::None || w.spec.borrow().dim.is_some()
+                            } else {
+                                !w.surfaces.borrow().is_empty()
+                            }
+                        };
+                        if !WINDOWS.with(|ws| ws.borrow().values().any(|w| busy(w))) {
                             super::node::trim_caches();
                         }
                     }

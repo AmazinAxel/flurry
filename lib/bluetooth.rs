@@ -265,16 +265,23 @@ pub fn disconnect(path: &str) {
 
 const PAIR_TIMEOUT_MS: u64 = 120_000;
 
+thread_local! {
+    /// devices with a Pair call in flight
+    static PAIRING: std::cell::RefCell<std::collections::HashSet<String>> = Default::default();
+}
+
 /// `done` gets whether pairing succeeded; the code shown for it goes either way. Ignored (no `done`)
 /// while a Pair call for the device is in flight.
 pub fn pair(path: &str, done: impl FnOnce(bool) + 'static) {
-    if bt().with(|b| b.devices.iter().any(|d| d.path == path && d.pairing)) {
+    // keyed by path, not the Device: it survives bluez restarts and the device being re-added
+    if !PAIRING.with(|s| s.borrow_mut().insert(path.to_string())) {
         return;
     }
     set_flag(path, |d| d.pairing = true);
     let p = path.to_string();
     // past the usual reply timeout: bluez answers once the user confirms the code
     call_timeout(path, "org.bluez.Device1", "Pair", PAIR_TIMEOUT_MS, move |ok| {
+        PAIRING.with(|s| s.borrow_mut().remove(&p));
         set_flag(&p, |d| d.pairing = false);
         if bt().with(|b| b.pairing.as_ref().is_some_and(|x| x.device == p)) {
             answer(false);

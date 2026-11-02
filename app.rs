@@ -102,8 +102,8 @@ fn serve(sock: UnixDatagram) {
 }
 
 thread_local! {
-    /// the sync reminder last sent: not sent again while it's still up
-    static SYNC_NOTE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// the sync reminder last sent (id, unix secs): not again while it's up or for a day after
+    static SYNC_NOTE: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Checked at startup, then once a day (a one-shot timer chain, no polling).
@@ -138,7 +138,9 @@ fn sync_reminder() -> bool {
     if settings::SYNC_COMMAND.is_empty() || now.saturating_sub(last) <= 7 * 86_400_000 {
         return false;
     }
-    if SYNC_NOTE.with(|n| n.get()).and_then(lib::notifd::get).is_some_and(|n| n.app_name == "Sync") {
+    if let Some((id, at)) = SYNC_NOTE.with(|n| n.get())
+        && (now / 1000 < at + 86_400 || lib::notifd::get(id).is_some_and(|n| n.app_name == "Sync"))
+    {
         return true;
     }
     let argv: Vec<String> = settings::SYNC_COMMAND.iter().map(|s| s.to_string()).collect();
@@ -151,7 +153,7 @@ fn sync_reminder() -> bool {
             lib::apps::launch(&argv);
         }
     });
-    SYNC_NOTE.with(|n| n.set(Some(id)));
+    SYNC_NOTE.with(|n| n.set(Some((id, now / 1000))));
     true
 }
 
