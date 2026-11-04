@@ -1,13 +1,13 @@
 #![allow(non_snake_case, special_module_name)]
 #![allow(clippy::type_complexity, clippy::module_inception)]
 
-mod config;
 mod lib;
 mod settings;
 mod ui;
 mod widgets;
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixDatagram;
 
 use lib::{menuState, mediaPlayer, streamingMode::streaming_mode, xdg};
@@ -65,22 +65,25 @@ fn request(cmd: &str, arg: Option<&str>) {
 
 /// Binds the request socket; exits if another shell is already serving it.
 fn bind_socket() -> Option<UnixDatagram> {
-    let path = xdg::socket_path()?;
-    if std::path::Path::new(&path).exists() {
-        let probe = UnixDatagram::unbound().ok()?;
-        let _ = probe.set_nonblocking(true);
-        match probe.send_to(b"", &path) {
-            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                let _ = std::fs::remove_file(&path); // stale
-            }
-            _ => std::process::exit(0),
-        }
+    let Some(dir) = xdg::runtime_dir() else {
+        eprintln!("flurry: no XDG_RUNTIME_DIR: no request socket, no single-instance guard");
+        return None;
+    };
+    // the lock, held for life, makes the stale-socket unlink and the bind one step
+    let lock = std::fs::OpenOptions::new().write(true).create(true).mode(0o600).open(format!("{dir}/flurry.lock"));
+    match lock {
+        Ok(f) if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 => std::mem::forget(f),
+        Ok(_) => std::process::exit(0),
+        Err(e) => eprintln!("flurry: lock file: {e}"),
     }
+    let path = xdg::socket_path()?;
+    let _ = std::fs::remove_file(&path);
     let sock = match UnixDatagram::bind(&path) {
         Ok(s) => s,
-        // another shell won the race to bind it
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => std::process::exit(0),
-        Err(_) => return None,
+        Err(e) => {
+            eprintln!("flurry: cannot bind {path}: {e}");
+            return None;
+        }
     };
     let _ = sock.set_nonblocking(true);
     Some(sock)
@@ -92,29 +95,38 @@ fn serve(sock: UnixDatagram) {
         let mut buf = [0u8; 512];
         while let Ok(n) = sock.recv(&mut buf) {
             let line = String::from_utf8_lossy(&buf[..n]);
-            // `sideview plan` style: the first two words
-            let mut words = line.trim().split(' ');
-            if let Some(cmd) = words.next() {
-                request(cmd, words.next());
-            }
+            let (cmd, arg) = parse_request(&line);
+            request(cmd, arg);
         }
     });
 }
 
+/// `sideview plan` style: the command, then everything after it as one argument.
+fn parse_request(line: &str) -> (&str, Option<&str>) {
+    match line.trim().split_once(' ') {
+        Some((cmd, arg)) => (cmd, Some(arg.trim())),
+        None => (line.trim(), None),
+    }
+}
+
 thread_local! {
-    /// the sync reminder last sent (id, unix secs): not again while it's up or for a day after
+    /// each reminder last sent (id, unix secs): not again while it's up or for a day after
     static SYNC_NOTE: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
+    static DOWNLOADS_NOTE: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// True when `note`'s reminder is still up or under a day old.
+fn recent(note: &'static std::thread::LocalKey<std::cell::Cell<Option<(u32, u64)>>>, app: &str) -> bool {
+    note.with(|n| n.get()).is_some_and(|(id, at)| lib::time::now_secs() < at + 86_400 || lib::notifd::get(id).is_some_and(|n| n.app_name == app))
 }
 
 /// Checked at startup, then once a day (a one-shot timer chain, no polling).
 fn reminders() {
     let _ = runtime::timeout(86_400_000, reminders);
-    if sync_reminder() {
-        return;
-    }
+    sync_reminder();
     let downloads = xdg::user_dir("DOWNLOAD");
     // no Downloads dir configured: user-dirs points it at $HOME, whose size means nothing here
-    if downloads.trim_end_matches('/') == xdg::home_dir().trim_end_matches('/') {
+    if downloads.trim_end_matches('/') == xdg::home_dir().trim_end_matches('/') || recent(&DOWNLOADS_NOTE, "Cleanup") {
         return;
     }
     // the walk can take a while on a full folder: off the loop
@@ -123,38 +135,40 @@ fn reminders() {
         // Greater than 100MB
         if ui::runtime::blocking(move || dir_size(std::path::Path::new(&d))).await.unwrap_or(0) > 100_000_000 {
             let argv: Vec<String> = settings::FILE_MANAGER.iter().map(|s| s.to_string()).chain([downloads]).collect();
-            lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), argv)]);
+            let id = lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), argv)]);
+            DOWNLOADS_NOTE.with(|n| n.set(Some((id, lib::time::now_secs()))));
         }
     });
 }
 
-/// Reminds to sync when the last one is over a week old (wall clock, so time asleep counts);
-/// true when due.
-fn sync_reminder() -> bool {
+/// Reminds to sync when the last successful one is over a week old (wall clock, so time asleep
+/// counts).
+fn sync_reminder() {
     // lastSync: unix ms
     let last_sync = format!("{}/flurry/lastSync", xdg::state_dir());
     let last: u64 = std::fs::read_to_string(&last_sync).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let now = lib::time::now_secs() * 1000;
-    if settings::SYNC_COMMAND.is_empty() || now.saturating_sub(last) <= 7 * 86_400_000 {
-        return false;
+    if settings::SYNC_COMMAND.is_empty() || now.saturating_sub(last) <= 7 * 86_400_000 || recent(&SYNC_NOTE, "Sync") {
+        return;
     }
-    if let Some((id, at)) = SYNC_NOTE.with(|n| n.get())
-        && (now / 1000 < at + 86_400 || lib::notifd::get(id).is_some_and(|n| n.app_name == "Sync"))
-    {
-        return true;
-    }
-    let argv: Vec<String> = settings::SYNC_COMMAND.iter().map(|s| s.to_string()).collect();
     let id = lib::notifd::send_local("Sync", "Sync system", "", &[("1".into(), "Update & Sync".into())], move |action| {
-        if action == "1" {
+        if action != "1" {
+            return;
+        }
+        let last_sync = last_sync.clone();
+        runtime::spawn(async move {
+            if lib::process::status(settings::SYNC_COMMAND).await != Some(0) {
+                return;
+            }
             if let Some(dir) = std::path::Path::new(&last_sync).parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(&last_sync, (lib::time::now_secs() * 1000).to_string());
-            lib::apps::launch(&argv);
-        }
+            if let Err(e) = xdg::write_atomic(&last_sync, (lib::time::now_secs() * 1000).to_string().as_bytes(), 0o644) {
+                eprintln!("flurry: {last_sync}: {e}");
+            }
+        });
     });
     SYNC_NOTE.with(|n| n.set(Some((id, now / 1000))));
-    true
 }
 
 /// `du -sb`: apparent size of everything under `p`.
@@ -218,10 +232,10 @@ fn main() {
         lib::battery::start();
         lib::bluetooth::start();
         lib::audio::start();
+        lib::iwd::start();
         status::quicksettings::sound::start();
         status::bluetooth::start();
         status::network::start();
-        status::modules::statusIcons::start();
         status::modules::mpris::start();
         mediaPlayer::watch();
         lib::brightness::monitor();
@@ -242,4 +256,15 @@ fn main() {
         None => runtime::idle(start),
     }
     runtime::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_request;
+
+    #[test]
+    fn request_splits_at_first_space() {
+        assert_eq!(parse_request("launcher\n"), ("launcher", None));
+        assert_eq!(parse_request(" sideview  plan b \n"), ("sideview", Some("plan b")));
+    }
 }

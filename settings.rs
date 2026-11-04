@@ -1,8 +1,11 @@
-// Replaced at build time by package.nix from programs.flurry.settings.
+// Replaced at build time by package.nix from programs.flurry.settings; the values here mirror
+// package.nix's defaults for dev builds.
 /// Sideview pages: name -> url ("assistant" -> "flurry:claude" is built in).
 pub const SIDEVIEW: &[(&str, &str)] = &[];
 /// Bluetooth device display names: advertised name -> shown name.
 pub const BLUETOOTH_NAMES: &[(&str, &str)] = &[];
+/// Sound output display names: advertised name (the sink's description) -> shown name.
+pub const SOUND_NAMES: &[(&str, &str)] = &[];
 /// mpd playlists (folders in the music dir) in cycle order, with a style color name
 /// (red, yellow, purple, blue1..blue4; anything else is blue2).
 pub const PLAYLISTS: &[(&str, &str)] = &[];
@@ -13,6 +16,15 @@ pub const SYNC_COMMAND: &[&str] = &[];
 /// argv prefixes; the path is appended.
 pub const FILE_MANAGER: &[&str] = &["xdg-open"];
 pub const IMAGE_VIEWER: &[&str] = &["xdg-open"];
+/// Launcher app names (case-insensitive substrings) that start only after a focus break and run
+/// for at most 5 minutes.
+pub const FOCUS_BLOCKED: &[&str] = &["discord"];
+/// Wallpaper directory; relative paths are under $HOME.
+pub const WALLPAPER_DIR: &str = "Wallpapers";
+/// argv run after saving a pass entry when argv[0] is on PATH; empty runs nothing.
+pub const PASS_SYNC_COMMAND: &[&str] = &["pass-sync"];
+/// wl-gammarelay temperatures (dark scheme, light scheme) in kelvin; None leaves it alone.
+pub const NIGHT_LIGHT: Option<(u32, u32)> = Some((3500, 6500));
 /// Notifications whose body starts with one of these are dropped.
 pub const NOTIFICATION_FILTERS: &[&str] = &[];
 /// Font fallback chains sorted by fontconfig at build time: (family, fontconfig weight, file, face

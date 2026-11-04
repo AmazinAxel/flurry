@@ -11,6 +11,11 @@ path = "app.rs"
 name = "flurry"
 path = "client.rs"
 
+# the Servo helper's Claude Code protocol (std + libc only), tested here: CI can't build Servo
+[[test]]
+name = "sideview-claude"
+path = "sideview/src/claude.rs"
+
 [dependencies]
 libc = "0.2"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
@@ -29,10 +34,7 @@ usvg = { version = "0.45", default-features = false }
 [profile.release]
 lto = true
 codegen-units = 1
-
 strip = true
-opt-level = 3
-panic = "abort"
 
 [profile.dev.package."*"]
 opt-level = 2

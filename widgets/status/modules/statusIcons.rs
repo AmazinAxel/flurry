@@ -1,31 +1,17 @@
 use crate::lib::battery::battery;
 use crate::lib::bluetooth::bt;
 use crate::lib::iwd;
-use crate::lib::state::State;
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::style::*;
 use crate::ui::node::{Align, Node, Style, alpha};
 
-thread_local! {
-    static NETWORK_ICON: State<&'static str> = State::new("network-wireless-offline-symbolic");
-}
-
-pub fn network_icon() -> State<&'static str> {
-    NETWORK_ICON.with(Clone::clone)
-}
-
+/// Icon for the iwd station state.
 fn icon_for(state: &str) -> &'static str {
     match state {
         "connected" | "roaming" => "network-wireless-symbolic",
         "connecting" | "disconnecting" => "network-wireless-acquiring-symbolic",
         _ => "network-wireless-offline-symbolic",
     }
-}
-
-/// Follows the shared iwd station state.
-pub fn start() {
-    iwd::start();
-    iwd::state().subscribe(|| network_icon().set(iwd::state().with(|s| icon_for(s))));
 }
 
 fn img(base: &Style, name: &'static str) -> Node {
@@ -57,7 +43,7 @@ pub fn status(base: &Style) -> Node {
     Node::vbox(base.inherit(), SPACE_M, vec![
         Node::icon(rec, "media-record-symbolic", 36.0).show(crate::widgets::record::service::is_rec().peek()),
         battery_percent(base),
-        img(base, network_icon().peek()),
+        img(base, iwd::state().with(|s| icon_for(s))),
         img(base, "bluetooth-active-symbolic").show(bt().with(|b| b.powered())),
         img(base, "notifications-disabled-symbolic").show(streaming_mode().peek()),
     ])

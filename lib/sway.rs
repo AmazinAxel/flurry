@@ -1,17 +1,16 @@
-// i3-ipc over $SWAYSOCK: request queue on one socket, subscriptions on their own (lib/sway.ts).
+// i3-ipc over $SWAYSOCK: requests on one kept socket, subscriptions on their own.
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::rc::Rc;
 
 use crate::lib::json::{self, Json};
 use crate::ui::runtime;
 
 const MAGIC: &[u8] = b"i3-ipc";
 
-pub fn encode(kind: u32, payload: &str) -> Vec<u8> {
+fn encode(kind: u32, payload: &str) -> Vec<u8> {
     let mut m = Vec::with_capacity(14 + payload.len());
     m.extend_from_slice(MAGIC);
     m.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -21,7 +20,7 @@ pub fn encode(kind: u32, payload: &str) -> Vec<u8> {
 }
 
 /// Pops one complete message (type, body) off `buf`.
-pub fn decode(buf: &mut Vec<u8>) -> Option<(u32, String)> {
+fn decode(buf: &mut Vec<u8>) -> Option<(u32, String)> {
     if buf.len() < 14 {
         return None;
     }
@@ -43,7 +42,16 @@ thread_local! {
     static SOCK: RefCell<Option<UnixStream>> = const { RefCell::new(None) };
 }
 
-/// Blocking round trip on a short-lived local socket; sway replies within microseconds.
+fn request(sock: &mut UnixStream, kind: u32, payload: &str) -> std::io::Result<String> {
+    sock.write_all(&encode(kind, payload))?;
+    let mut head = [0u8; 14];
+    sock.read_exact(&mut head)?;
+    let mut body = vec![0; u32::from_le_bytes([head[6], head[7], head[8], head[9]]) as usize];
+    sock.read_exact(&mut body)?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Blocking round trip on the kept local socket; sway replies within microseconds.
 /// A stuck sway costs at most the 1s timeout, not the whole loop.
 fn roundtrip(kind: u32, payload: &str) -> Option<Json> {
     SOCK.with(|s| {
@@ -55,34 +63,15 @@ fn roundtrip(kind: u32, payload: &str) -> Option<Json> {
                     c.set_read_timeout(t).is_ok() && c.set_write_timeout(t).is_ok()
                 });
             }
-            let sock = s.as_mut()?;
-            let mut timed_out = false;
-            let ok = sock.write_all(&encode(kind, payload)).is_ok();
-            let mut buf = vec![];
-            let mut chunk = [0u8; 65536];
-            let reply = ok
-                .then(|| loop {
-                    if let Some((_, body)) = decode(&mut buf) {
-                        break Some(body);
+            match request(s.as_mut()?, kind, payload) {
+                Ok(body) => return json::parse(&body),
+                Err(e) => {
+                    // a late reply would answer the next request: start over on a fresh socket
+                    *s = None;
+                    if attempt == 1 || matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+                        return None;
                     }
-                    match sock.read(&mut chunk) {
-                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(e) => {
-                            timed_out = matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut);
-                            break None;
-                        }
-                        _ => break None,
-                    }
-                })
-                .flatten();
-            if let Some(body) = reply {
-                return json::parse(&body);
-            }
-            // a late reply would answer the next request: start over on a fresh socket
-            *s = None;
-            if attempt == 1 || timed_out {
-                return None;
+                }
             }
         }
         None
@@ -114,15 +103,14 @@ pub fn subscribe(events: &[&str], cb: impl Fn(&Json) + 'static) {
     }
     let _ = s.set_nonblocking(true);
     let fd = s.as_raw_fd();
-    let s = Rc::new(RefCell::new(s));
     let buf = RefCell::new(Vec::new());
     runtime::watch(fd, move || {
         let mut chunk = [0u8; 65536];
         loop {
-            match s.borrow_mut().read(&mut chunk) {
+            match (&s).read(&mut chunk) {
                 Ok(n) if n > 0 => buf.borrow_mut().extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 // EOF or a reset socket: poll() would report it forever
                 _ => {
                     runtime::unwatch(fd);

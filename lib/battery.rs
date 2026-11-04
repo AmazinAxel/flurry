@@ -1,7 +1,7 @@
 // UPower DisplayDevice: percentage, state, presence.
 
 use crate::lib::dbus::{self, PropMap, SignalFilter, get_all, prop_bool, prop_f64, prop_i64};
-use crate::lib::state::State;
+use crate::ui::state::global_state;
 
 const DEST: &str = "org.freedesktop.UPower";
 const PATH: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
@@ -19,22 +19,19 @@ impl Battery {
     pub fn charging(&self) -> bool {
         self.state == 1
     }
-    /// record/service.ts onBattery
+    /// running on battery: not charging, full or about to charge
     pub fn on_battery(&self) -> bool {
         self.present && ![1, 4, 5].contains(&self.state)
     }
 }
 
-thread_local! {
-    static BATTERY: State<Battery> = State::new(Battery::default());
-}
-
-pub fn battery() -> State<Battery> {
-    BATTERY.with(Clone::clone)
+global_state! {
+    pub fn battery() -> Battery = Battery::default();
 }
 
 fn apply(p: &PropMap) {
     battery().update(|b| {
+        let old = b.clone();
         if let Some(v) = prop_f64(p, "Percentage") {
             b.percentage = v / 100.0;
         }
@@ -44,19 +41,14 @@ fn apply(p: &PropMap) {
         if let Some(v) = prop_bool(p, "IsPresent") {
             b.present = v;
         }
+        *b != old
     });
 }
 
 pub fn start() {
     let Some(bus) = dbus::system() else { return };
     bus.subscribe(
-        SignalFilter {
-            sender: Some(DEST.into()),
-            path: Some(PATH.into()),
-            interface: Some("org.freedesktop.DBus.Properties".into()),
-            member: Some("PropertiesChanged".into()),
-            ..Default::default()
-        },
+        SignalFilter { path: Some(PATH.into()), ..SignalFilter::properties_changed(Some(DEST)) },
         |m| {
             if let Ok((iface, p)) = m.read2::<&str, PropMap>()
                 && iface == IFACE

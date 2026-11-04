@@ -1,5 +1,7 @@
 // Symbolic icons baked by build.rs, filled with the current color like GTK recolors symbolic SVGs.
 
+use std::sync::OnceLock;
+
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
 
 pub struct Shape {
@@ -31,13 +33,11 @@ pub fn find(name: &str) -> Option<&'static str> {
 
 type Paths = Vec<Option<tiny_skia::Path>>;
 
-thread_local! {
-    /// Paths are built once per icon on first draw; leaked so draws borrow them for free.
-    static PATHS: Vec<std::cell::OnceCell<&'static Paths>> = (0..ICONS.len()).map(|_| Default::default()).collect();
-}
+/// Paths are built once per icon on first draw.
+static PATHS: [OnceLock<Paths>; ICON_COUNT] = [const { OnceLock::new() }; ICON_COUNT];
 
 fn paths(i: usize) -> &'static Paths {
-    PATHS.with(|c| *c[i].get_or_init(|| Box::leak(Box::new(build(i)))))
+    PATHS[i].get_or_init(|| build(i))
 }
 
 fn build(i: usize) -> Paths {

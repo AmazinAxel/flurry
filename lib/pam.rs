@@ -1,12 +1,13 @@
 // PAM on a worker thread: pam_start + pam_authenticate, conversation messages
 // reported back to the poll loop through a pipe.
 
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
-use crate::ui::entry::wipe_bytes;
+use crate::ui::entry::Secret;
 use crate::ui::runtime;
 
 #[repr(C)]
@@ -49,17 +50,23 @@ pub enum Event {
     Done(c_int),
 }
 
+/// Frames on the pipe: a kind byte, then the code (Done) or 0, little-endian.
+const FRAME: usize = 5;
+const DONE: u8 = 0;
+const INFO: u8 = 1;
+const ERROR: u8 = 2;
+
 struct ConvData {
-    password: Option<CString>,
+    /// nul-terminated
+    password: Option<Secret>,
     /// the secret answers one prompt only
     answered: bool,
     out: std::fs::File,
 }
 
-fn report(out: &mut std::fs::File, kind: u8, text: &str) {
-    let mut buf = vec![kind];
-    buf.extend_from_slice(&(text.len() as u32).to_le_bytes());
-    buf.extend_from_slice(text.as_bytes());
+fn report(out: &mut std::fs::File, kind: u8, code: c_int) {
+    let mut buf = [kind, 0, 0, 0, 0];
+    buf[1..].copy_from_slice(&code.to_le_bytes());
     let _ = out.write_all(&buf);
 }
 
@@ -72,13 +79,12 @@ extern "C" fn conv(n: c_int, msgs: *mut *const PamMessage, resp: *mut *mut PamRe
     }
     for i in 0..n {
         let m = unsafe { &**msgs.add(i) };
-        let text = if m.msg.is_null() { String::new() } else { unsafe { CStr::from_ptr(m.msg) }.to_string_lossy().into_owned() };
         let r = unsafe { &mut *out.add(i) };
         match m.style {
             PAM_PROMPT_ECHO_OFF if !d.answered => {
                 // the secret, or an empty answer when there is none (fprint skip)
                 d.answered = true;
-                let s = d.password.as_ref().map(|p| p.as_ptr()).unwrap_or(c"".as_ptr());
+                let s = d.password.as_deref().map(|p| p.as_ptr().cast()).unwrap_or(c"".as_ptr());
                 r.resp = unsafe { libc::strdup(s) };
             }
             PAM_PROMPT_ECHO_OFF | PAM_PROMPT_ECHO_ON => {
@@ -96,8 +102,8 @@ extern "C" fn conv(n: c_int, msgs: *mut *const PamMessage, resp: *mut *mut PamRe
                 unsafe { libc::free(out.cast()) };
                 return PAM_CONV_ERR;
             }
-            PAM_ERROR_MSG => report(&mut d.out, 2, &text),
-            PAM_TEXT_INFO => report(&mut d.out, 1, &text),
+            PAM_ERROR_MSG => report(&mut d.out, ERROR, 0),
+            PAM_TEXT_INFO => report(&mut d.out, INFO, 0),
             _ => {}
         }
     }
@@ -113,24 +119,19 @@ thread_local! {
     };
 }
 
-/// The password as a C string without leaving unwiped copies behind (no realloc for the nul).
-fn c_password(p: String) -> Option<CString> {
-    let mut v = p.into_bytes();
-    if v.contains(&0) {
-        wipe_bytes(&mut v);
+/// The password nul-terminated in a buffer that wipes itself, leaving no unwiped copy behind.
+fn c_password(p: Secret) -> Option<Secret> {
+    if p.contains(&0) {
         return None;
     }
-    if v.capacity() == v.len() {
-        let mut bigger = Vec::with_capacity(v.len() + 1);
-        bigger.extend_from_slice(&v);
-        wipe_bytes(&mut v);
-        v = bigger;
-    }
-    Some(unsafe { CString::from_vec_unchecked(v) })
+    let mut c = Vec::with_capacity(p.len() + 1);
+    c.extend_from_slice(&p);
+    c.push(0);
+    Some(Secret::new(c))
 }
 
 /// Runs PAM `service` for the current user; `on_event` receives conversation messages and the result.
-pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(Event) + 'static) {
+pub fn authenticate(service: &str, password: Option<Secret>, on_event: impl Fn(Event) + 'static) {
     let mut fds = [0; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         on_event(Event::Done(-1));
@@ -140,9 +141,8 @@ pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(E
     let service = CString::new(service).unwrap_or_default();
     let password = password.and_then(c_password);
     let user = USER.with(Clone::clone);
-    std::thread::spawn(move || {
-        let out = std::fs::File::from(wr);
-        let mut data = ConvData { password, answered: false, out };
+    let work = move || {
+        let mut data = ConvData { password, answered: false, out: std::fs::File::from(wr) };
         let c = PamConv { conv, data: (&raw mut data).cast() };
         let mut h = std::ptr::null_mut();
         let mut ret = unsafe { pam_start(service.as_ptr(), user.as_ptr(), &c, &mut h) };
@@ -150,30 +150,30 @@ pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(E
             ret = unsafe { pam_authenticate(h, 0) };
             unsafe { pam_end(h, ret) };
         }
-        if let Some(p) = data.password.take() {
-            wipe_bytes(&mut p.into_bytes_with_nul());
+        report(&mut data.out, DONE, ret);
+        // dropping `data` wipes the password
+    };
+    // shared so a refused spawn (thread limit) hands the job back to run here
+    let job = Arc::new(Mutex::new(Some(work)));
+    let theirs = job.clone();
+    if let Err(e) = std::thread::Builder::new().spawn(move || {
+        if let Some(w) = theirs.lock().ok().and_then(|mut j| j.take()) {
+            w();
         }
-        let mut out = data.out;
-        report(&mut out, 0, &ret.to_string());
-    });
+    }) {
+        eprintln!("flurry: thread spawn failed, running PAM inline: {e}");
+        if let Some(w) = job.lock().ok().and_then(|mut j| j.take()) {
+            w();
+        }
+    }
     let raw = rd.as_raw_fd();
-    let file = std::cell::RefCell::new(std::fs::File::from(rd));
-    let on_event = Rc::new(on_event);
-    let buf = std::cell::RefCell::new(Vec::<u8>::new());
-    let done = std::cell::Cell::new(false);
+    let file = std::fs::File::from(rd);
+    let buf = RefCell::new(Vec::<u8>::new());
+    let done = Cell::new(false);
     runtime::watch(raw, move || {
         let mut chunk = [0u8; 1024];
-        // a signal mid-read: retry a few times, then leave it to the next poll (still readable)
-        let mut read = None;
-        for _ in 0..4 {
-            match file.borrow_mut().read(&mut chunk) {
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-                r => read = Some(r.unwrap_or(0)),
-            }
-            break;
-        }
-        let Some(n) = read else { return };
+        // only called when readable: an error reads as the end, which fails the attempt
+        let n = (&file).read(&mut chunk).unwrap_or(0);
         if n == 0 {
             runtime::unwatch(raw);
             // the worker went away without a result: never leave the caller waiting
@@ -184,22 +184,86 @@ pub fn authenticate(service: &str, password: Option<String>, on_event: impl Fn(E
         }
         let mut b = buf.borrow_mut();
         b.extend_from_slice(&chunk[..n]);
-        while b.len() >= 5 {
-            let len = u32::from_le_bytes(b[1..5].try_into().unwrap()) as usize;
-            if b.len() < 5 + len {
-                break;
-            }
-            let kind = b[0];
-            let text = String::from_utf8_lossy(&b[5..5 + len]).into_owned();
-            b.drain(..5 + len);
-            if kind == 0 {
+        drain_frames(&mut b, |ev| {
+            if matches!(ev, Event::Done(_)) {
                 done.set(true);
             }
-            on_event(match kind {
-                0 => Event::Done(text.parse().unwrap_or(-1)),
-                1 => Event::Info,
-                _ => Event::Error,
-            });
-        }
+            on_event(ev);
+        });
     });
+}
+
+/// Hands every whole frame in `buf` to `f`, keeping a trailing partial one for the next read.
+fn drain_frames(buf: &mut Vec<u8>, mut f: impl FnMut(Event)) {
+    let frames = buf.len() / FRAME * FRAME;
+    for fr in buf[..frames].as_chunks::<FRAME>().0 {
+        let code = c_int::from_le_bytes([fr[1], fr[2], fr[3], fr[4]]);
+        f(match fr[0] {
+            DONE => Event::Done(code),
+            INFO => Event::Info,
+            _ => Event::Error,
+        });
+    }
+    buf.drain(..frames);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret(s: &[u8]) -> Secret {
+        Secret::new(s.to_vec())
+    }
+
+    #[test]
+    fn password_is_nul_terminated() {
+        assert_eq!(&*c_password(secret(b"pw")).unwrap(), b"pw\0");
+        assert!(c_password(secret(b"a\0b")).is_none());
+    }
+
+    fn written(frames: &[(u8, c_int)]) -> Vec<u8> {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let mut out = std::fs::File::from(wr);
+        for &(kind, code) in frames {
+            report(&mut out, kind, code);
+        }
+        drop(out);
+        let mut buf = vec![];
+        std::fs::File::from(rd).read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    fn label(ev: Event) -> (char, c_int) {
+        match ev {
+            Event::Info => ('i', 0),
+            Event::Error => ('e', 0),
+            Event::Done(c) => ('d', c),
+        }
+    }
+
+    #[test]
+    fn frames_round_trip() {
+        let mut buf = written(&[(INFO, 0), (ERROR, 0), (DONE, PAM_AUTH_ERR), (DONE, -1)]);
+        assert_eq!(buf.len(), 4 * FRAME);
+        let mut got = vec![];
+        drain_frames(&mut buf, |ev| got.push(label(ev)));
+        assert_eq!(got, [('i', 0), ('e', 0), ('d', PAM_AUTH_ERR), ('d', -1)]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn partial_frame_waits_for_the_rest() {
+        let all = written(&[(INFO, 0), (DONE, 0)]);
+        let mut buf = all[..FRAME + 2].to_vec();
+        let mut got = vec![];
+        drain_frames(&mut buf, |ev| got.push(label(ev)));
+        assert_eq!(got, [('i', 0)]);
+        assert_eq!(buf, all[FRAME..FRAME + 2]);
+        buf.extend_from_slice(&all[FRAME + 2..]);
+        drain_frames(&mut buf, |ev| got.push(label(ev)));
+        assert_eq!(got, [('i', 0), ('d', 0)]);
+        assert!(buf.is_empty());
+    }
 }

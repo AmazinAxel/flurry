@@ -1,18 +1,24 @@
 // flurry-sideview: Servo web pages in a right-edge layer surface, driven by the flurry process over
 // stdin (widgets/sideview.rs). Commands, one per line:
 //   show <page> <url> | hide | focus <true|false> <ignore|exclusive> | width <px> | dark <true|false>
-// and "mapped" on stdout once a show's first frame is on screen.
+// and on stdout: "mapped" once a show's first frame is on screen, "closed" when the compositor
+// closed the panel (output gone), "open <url>" for a link to open in the default browser (flurry
+// launches it: this process is sandboxed, see package.nix). Its one argument is the panel
+// background before a page paints, as rrggbb (flurry's style).
 
 mod claude;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use dpi::PhysicalSize;
 use euclid::Scale;
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle};
@@ -68,8 +74,58 @@ impl EventLoopWaker for Waker {
     }
 }
 
+/// What the delegates share with the loop.
+#[derive(Default)]
+struct Shared {
+    rendering: RefCell<Option<Rc<dyn RenderingContext>>>,
+    /// popups waiting for their first navigation, dropped after a few seconds without one
+    popups: RefCell<Vec<(WebView, Instant)>>,
+    last_open: Cell<Option<Instant>>,
+    /// the last click or key press given to the page on screen
+    input_at: Cell<Option<(WebViewId, Instant)>>,
+    /// the last Ctrl+V given to a page
+    paste_at: Cell<Option<(WebViewId, Instant)>>,
+    /// the clipboard read in progress (the last paste's)
+    receive: RefCell<Option<Receive>>,
+}
+
+impl Shared {
+    /// A click or key press given to page `id` on screen within the last second.
+    fn recent_input(&self, id: WebViewId, now: Instant) -> bool {
+        self.input_at.get().is_some_and(|(i, at)| i == id && now < at + Duration::from_secs(1))
+    }
+
+    /// Web links only: pages must not be able to hand local files or other schemes to their
+    /// handlers. Only from the page on screen, right after a click or key there (a hidden page
+    /// can't open anything), and at most one a second, so a page can't flood the browser. flurry
+    /// opens it (outside this sandbox and its own service), checking the same again.
+    fn open_external(&self, url: &str, from: WebViewId) {
+        let now = Instant::now();
+        if (url.starts_with("https://") || url.starts_with("http://"))
+            && !url.contains(|c: char| c.is_whitespace() || c.is_control())
+            && self.recent_input(from, now)
+            && self.last_open.get().is_none_or(|at| now >= at + Duration::from_secs(1))
+        {
+            self.last_open.set(Some(now));
+            tell(&format!("open {url}"));
+        }
+    }
+}
+
+/// Drops the shared web views, rendering context and clipboard read while the Wayland connection
+/// (and Servo) are still alive: the delegates holding `Shared` would only let go after both.
+struct ClearShared(Rc<Shared>);
+impl Drop for ClearShared {
+    fn drop(&mut self) {
+        self.0.popups.borrow_mut().clear();
+        self.0.rendering.borrow_mut().take();
+        self.0.receive.borrow_mut().take();
+    }
+}
+
 #[derive(Default)]
 struct Frame {
+    shared: Rc<Shared>,
     dirty: Cell<bool>,
     /// console messages addressed to us (\u{1} prefix), with their page: the claude page's channel out
     messages: RefCell<Vec<(WebView, String)>>,
@@ -79,39 +135,84 @@ struct Frame {
     claude_views: RefCell<Vec<WebViewId>>,
 }
 
-/// Local files are for the claude page's own directory; every other load of one fails.
+/// The page is read from FLURRY_CLAUDE_PAGE (set by the package wrapper; kept out of the binary so
+/// page edits don't rebuild Servo); debug builds fall back to the source tree. A release build's
+/// source path means nothing at runtime (and anyone could create it), so there is no page then.
+fn page_url() -> Option<url::Url> {
+    let page = std::env::var_os("FLURRY_CLAUDE_PAGE").map(PathBuf::from);
+    let page = page.or_else(|| cfg!(debug_assertions).then(|| concat!(env!("CARGO_MANIFEST_DIR"), "/claude").into()))?;
+    url::Url::from_file_path(page.join("index.html")).ok()
+}
+
+/// Local files are for the claude page's own directory; every other load of one fails. Compared as
+/// resolved paths: a URL prefix would let `..%2f` out.
 fn filter_files(load: WebResourceLoad, page: Option<&url::Url>) {
     let url = &load.request().url;
-    let own = page.and_then(|p| p.join(".").ok()).is_some_and(|dir| url.as_str().starts_with(dir.as_str()));
-    if url.scheme() == "file" && !own {
+    if url.scheme() != "file" {
+        return;
+    }
+    let dir = page.and_then(|p| p.to_file_path().ok()).and_then(|p| p.parent()?.canonicalize().ok());
+    let own = dir.is_some_and(|dir| url.to_file_path().ok().and_then(|p| p.canonicalize().ok()).is_some_and(|p| p.starts_with(&dir)));
+    if !own {
         let url = url.clone();
         load.intercept(WebResourceResponse::new(url)).cancel();
     }
 }
 
-/// Pages write the clipboard as they like, but read it only to paste: within a second of a Ctrl+V
-/// given to that page.
-#[derive(Default)]
-struct Clipboard(std::cell::OnceCell<Option<RefCell<arboard::Clipboard>>>);
+/// A line to flurry on stdout.
+fn tell(msg: &str) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(format!("{msg}\n").as_bytes()).and_then(|_| out.flush());
+}
+
+/// The selection as this client sees it (wl_data_device): shared by the input handling and the
+/// clipboard delegate.
+type Selection = Rc<RefCell<Option<(wl_data_offer::WlDataOffer, Vec<String>)>>>;
+
+/// Pages write (or clear) the clipboard only right after input given to them, and read it only to
+/// paste: within a second of a Ctrl+V given to that page.
+struct Clipboard {
+    arboard: std::cell::OnceCell<Option<RefCell<arboard::Clipboard>>>,
+    conn: Connection,
+    selection: Selection,
+    shared: Rc<Shared>,
+}
 impl Clipboard {
     fn with<T>(&self, f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Option<T> {
-        let c = self.0.get_or_init(|| arboard::Clipboard::new().ok().map(RefCell::new)).as_ref()?;
+        let c = self.arboard.get_or_init(|| arboard::Clipboard::new().ok().map(RefCell::new)).as_ref()?;
         f(&mut c.borrow_mut()).ok()
     }
 }
 impl ClipboardDelegate for Clipboard {
-    fn clear(&self, _: WebView) {
-        self.with(|c| c.clear());
+    fn clear(&self, webview: WebView) {
+        if self.shared.recent_input(webview.id(), Instant::now()) {
+            self.with(|c| c.clear());
+        }
     }
     fn get_text(&self, webview: WebView, request: StringRequest) {
-        let pasting = PASTE_AT.with(|p| p.get()).is_some_and(|(id, at)| id == webview.id() && at.elapsed() < Duration::from_secs(1));
-        match pasting.then(|| self.with(|c| c.get_text())).flatten() {
-            Some(text) => request.success(text),
+        let pasting = self.shared.paste_at.get().is_some_and(|(id, at)| id == webview.id() && at.elapsed() < Duration::from_secs(1));
+        // read like a media paste (by the loop, as the source writes), not through arboard (blocks)
+        let sel = self.selection.borrow();
+        let text = sel.as_ref().filter(|_| pasting).and_then(|(offer, mimes)| {
+            let mime = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"].into_iter().find(|t| mimes.iter().any(|m| m == t))?;
+            Some((offer, mime))
+        });
+        match text {
+            Some((offer, mime)) => {
+                let done = move |bytes: Vec<u8>| match String::from_utf8(bytes) {
+                    Ok(text) => request.success(text),
+                    Err(_) => request.failure(String::new()),
+                };
+                // a read still going is dropped (a dropped request fails)
+                *self.shared.receive.borrow_mut() = Receive::start(&self.conn, offer, mime, done);
+            }
             None => request.failure(String::new()),
         }
     }
-    fn set_text(&self, _: WebView, text: String) {
-        self.with(|c| c.set_text(text));
+    fn set_text(&self, webview: WebView, text: String) {
+        if self.shared.recent_input(webview.id(), Instant::now()) {
+            self.with(|c| c.set_text(text));
+        }
     }
 }
 
@@ -144,36 +245,24 @@ impl WebViewDelegate for Frame {
     fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
         // new windows open in the default browser: catch the popup's first navigation; a page
         // already waiting on two gets none (window.open returns null)
-        if POPUPS.with(|p| p.borrow().len()) >= 2 {
+        let shared = &self.shared;
+        if shared.popups.borrow().len() >= 2 {
             return;
         }
-        RENDERING.with(|r| {
-            if let Some(rc) = r.borrow().clone() {
-                let aux = request.builder(rc).delegate(Rc::new(Popup(parent.id()))).build();
-                aux.hide(); // never in the scene
-                POPUPS.with(|p| p.borrow_mut().push((aux, Instant::now())));
-            }
-        });
-    }
-}
-
-/// Web links only: pages must not be able to hand local files or other schemes to their handlers.
-/// Only from the page on screen, right after a click or key there (a hidden page can't open
-/// anything), and at most one a second, so a page can't flood the browser.
-fn open_external(url: &str, from: WebViewId) {
-    let now = Instant::now();
-    if (url.starts_with("https://") || url.starts_with("http://"))
-        && INPUT_AT.with(|i| i.get()).is_some_and(|(id, at)| id == from && now < at + Duration::from_secs(1))
-        && LAST_OPEN.with(|l| l.get().is_none_or(|at| now >= at + Duration::from_secs(1)))
-        && let Ok(mut child) = std::process::Command::new("xdg-open").arg(url).spawn()
-    {
-        LAST_OPEN.with(|l| l.set(Some(now)));
-        std::thread::spawn(move || child.wait()); // reaped
+        let rendering = shared.rendering.borrow().clone();
+        if let Some(rc) = rendering {
+            let aux = request.builder(rc).delegate(Rc::new(Popup { from: parent.id(), shared: shared.clone() })).build();
+            aux.hide(); // never in the scene
+            shared.popups.borrow_mut().push((aux, Instant::now()));
+        }
     }
 }
 
 /// A page's new window, by the page that opened it.
-struct Popup(WebViewId);
+struct Popup {
+    from: WebViewId,
+    shared: Rc<Shared>,
+}
 impl WebViewDelegate for Popup {
     fn load_web_resource(&self, _: WebView, load: WebResourceLoad) {
         filter_files(load, None);
@@ -182,21 +271,56 @@ impl WebViewDelegate for Popup {
         let url = nav.url.to_string();
         nav.deny();
         if url != "about:blank" {
-            open_external(&url, self.0);
-            POPUPS.with(|p| p.borrow_mut().retain(|(wv, _)| *wv != webview));
+            self.shared.open_external(&url, self.from);
+            self.shared.popups.borrow_mut().retain(|(wv, _)| *wv != webview);
         }
     }
 }
 
-thread_local! {
-    static RENDERING: RefCell<Option<Rc<dyn RenderingContext>>> = const { RefCell::new(None) };
-    /// popups waiting for their first navigation, dropped after a few seconds without one
-    static POPUPS: RefCell<Vec<(WebView, Instant)>> = const { RefCell::new(Vec::new()) };
-    static LAST_OPEN: Cell<Option<Instant>> = const { Cell::new(None) };
-    /// the last click or key press given to the page on screen
-    static INPUT_AT: Cell<Option<(WebViewId, Instant)>> = const { Cell::new(None) };
-    /// the last Ctrl+V given to a page
-    static PASTE_AT: Cell<Option<(WebViewId, Instant)>> = const { Cell::new(None) };
+/// A clipboard transfer in progress: the source writes at its own pace and the loop reads
+/// whenever the pipe is readable, so a slow or endless source never holds up the panel; what
+/// goes over the cap is dropped. A newer paste replaces (drops) it.
+struct Receive {
+    file: std::fs::File,
+    data: Vec<u8>,
+    done: Box<dyn FnOnce(Vec<u8>)>,
+}
+
+impl Receive {
+    /// Asks the selection's source for `mime`; `done` gets the data, empty if the transfer failed.
+    fn start(conn: &Connection, offer: &wl_data_offer::WlDataOffer, mime: &str, done: impl FnOnce(Vec<u8>) + 'static) -> Option<Self> {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return None;
+        }
+        let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        offer.receive(mime.into(), wr.as_fd());
+        drop(wr);
+        let _ = conn.flush();
+        unsafe { libc::fcntl(rd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        Some(Self { file: std::fs::File::from(rd), data: vec![], done: Box::new(done) })
+    }
+
+    /// Takes what the source has written so far; None once it is over (the end, an error or the
+    /// cap) and the data handed on.
+    fn pump(mut self) -> Option<Self> {
+        const CAP: usize = 20 << 20;
+        let mut chunk = [0u8; 65536];
+        loop {
+            match self.file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) if self.data.len() + n <= CAP => self.data.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Some(self),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => {
+                    self.data.clear();
+                    break;
+                }
+            }
+        }
+        (self.done)(self.data);
+        None
+    }
 }
 
 struct State {
@@ -205,6 +329,8 @@ struct State {
     scale: i32,
     ctx: xkb::Context,
     xkb: Option<xkb::State>,
+    /// dead keys and Compose sequences (the locale's table)
+    compose: Option<xkb::compose::State>,
     repeat: (i32, i32),
     pointer: (f64, f64),
     has_keyboard: bool,
@@ -216,10 +342,11 @@ struct State {
     repeat_key: Option<(xkb::Keycode, Instant)>,
     /// announced offers not yet claimed by a selection or drag
     offers: Vec<(wl_data_offer::WlDataOffer, Vec<String>)>,
-    selection: Option<(wl_data_offer::WlDataOffer, Vec<String>)>,
+    selection: Selection,
     /// drags are not taken; their offer is only held until they leave
     dnd: Option<wl_data_offer::WlDataOffer>,
-    closed: bool,
+    /// the compositor closed the layer surface (its output went away)
+    layer_closed: bool,
 }
 
 impl State {
@@ -258,9 +385,113 @@ fn named(sym: xkb::Keysym) -> Option<NamedKey> {
         K::Control_L | K::Control_R => NamedKey::Control,
         K::Alt_L | K::Alt_R => NamedKey::Alt,
         K::Super_L | K::Super_R => NamedKey::Meta,
+        K::ISO_Level3_Shift => NamedKey::AltGraph,
+        K::Insert => NamedKey::Insert,
+        K::Caps_Lock => NamedKey::CapsLock,
+        K::Num_Lock => NamedKey::NumLock,
+        K::Scroll_Lock => NamedKey::ScrollLock,
+        K::Print => NamedKey::PrintScreen,
+        K::Pause => NamedKey::Pause,
+        K::Menu => NamedKey::ContextMenu,
+        K::F1 => NamedKey::F1,
+        K::F2 => NamedKey::F2,
+        K::F3 => NamedKey::F3,
+        K::F4 => NamedKey::F4,
         K::F5 => NamedKey::F5,
+        K::F6 => NamedKey::F6,
+        K::F7 => NamedKey::F7,
+        K::F8 => NamedKey::F8,
+        K::F9 => NamedKey::F9,
+        K::F10 => NamedKey::F10,
+        K::F11 => NamedKey::F11,
+        K::F12 => NamedKey::F12,
         _ => return None,
     })
+}
+
+/// The physical key (KeyboardEvent.code) and its location, from the evdev keycode.
+fn code(evdev: u32) -> (Code, Location) {
+    use Code as C;
+    use Location::{Left as L, Numpad as N, Right as R, Standard as S};
+    const ROW_Q: [Code; 10] = [C::KeyQ, C::KeyW, C::KeyE, C::KeyR, C::KeyT, C::KeyY, C::KeyU, C::KeyI, C::KeyO, C::KeyP];
+    const ROW_A: [Code; 9] = [C::KeyA, C::KeyS, C::KeyD, C::KeyF, C::KeyG, C::KeyH, C::KeyJ, C::KeyK, C::KeyL];
+    const ROW_Z: [Code; 7] = [C::KeyZ, C::KeyX, C::KeyC, C::KeyV, C::KeyB, C::KeyN, C::KeyM];
+    const DIGITS: [Code; 10] = [C::Digit1, C::Digit2, C::Digit3, C::Digit4, C::Digit5, C::Digit6, C::Digit7, C::Digit8, C::Digit9, C::Digit0];
+    const FKEYS: [Code; 10] = [C::F1, C::F2, C::F3, C::F4, C::F5, C::F6, C::F7, C::F8, C::F9, C::F10];
+    match evdev {
+        1 => (C::Escape, S),
+        2..=11 => (DIGITS[evdev as usize - 2], S),
+        12 => (C::Minus, S),
+        13 => (C::Equal, S),
+        14 => (C::Backspace, S),
+        15 => (C::Tab, S),
+        16..=25 => (ROW_Q[evdev as usize - 16], S),
+        26 => (C::BracketLeft, S),
+        27 => (C::BracketRight, S),
+        28 => (C::Enter, S),
+        29 => (C::ControlLeft, L),
+        30..=38 => (ROW_A[evdev as usize - 30], S),
+        39 => (C::Semicolon, S),
+        40 => (C::Quote, S),
+        41 => (C::Backquote, S),
+        42 => (C::ShiftLeft, L),
+        43 => (C::Backslash, S),
+        44..=50 => (ROW_Z[evdev as usize - 44], S),
+        51 => (C::Comma, S),
+        52 => (C::Period, S),
+        53 => (C::Slash, S),
+        54 => (C::ShiftRight, R),
+        55 => (C::NumpadMultiply, N),
+        56 => (C::AltLeft, L),
+        57 => (C::Space, S),
+        58 => (C::CapsLock, S),
+        59..=68 => (FKEYS[evdev as usize - 59], S),
+        69 => (C::NumLock, N),
+        70 => (C::ScrollLock, S),
+        71 => (C::Numpad7, N),
+        72 => (C::Numpad8, N),
+        73 => (C::Numpad9, N),
+        74 => (C::NumpadSubtract, N),
+        75 => (C::Numpad4, N),
+        76 => (C::Numpad5, N),
+        77 => (C::Numpad6, N),
+        78 => (C::NumpadAdd, N),
+        79 => (C::Numpad1, N),
+        80 => (C::Numpad2, N),
+        81 => (C::Numpad3, N),
+        82 => (C::Numpad0, N),
+        83 => (C::NumpadDecimal, N),
+        86 => (C::IntlBackslash, S),
+        87 => (C::F11, S),
+        88 => (C::F12, S),
+        96 => (C::NumpadEnter, N),
+        97 => (C::ControlRight, R),
+        98 => (C::NumpadDivide, N),
+        99 => (C::PrintScreen, S),
+        100 => (C::AltRight, R),
+        102 => (C::Home, S),
+        103 => (C::ArrowUp, S),
+        104 => (C::PageUp, S),
+        105 => (C::ArrowLeft, S),
+        106 => (C::ArrowRight, S),
+        107 => (C::End, S),
+        108 => (C::ArrowDown, S),
+        109 => (C::PageDown, S),
+        110 => (C::Insert, S),
+        111 => (C::Delete, S),
+        119 => (C::Pause, S),
+        125 => (C::MetaLeft, L),
+        126 => (C::MetaRight, R),
+        127 => (C::ContextMenu, S),
+        _ => (C::Unidentified, S),
+    }
+}
+
+/// The locale's Compose table (LC_ALL, LC_CTYPE, LANG, as setlocale picks it).
+fn compose_state(ctx: &xkb::Context) -> Option<xkb::compose::State> {
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"].iter().filter_map(std::env::var_os).find(|v| !v.is_empty()).unwrap_or_else(|| "C".into());
+    let table = xkb::compose::Table::new_from_locale(ctx, &locale, xkb::compose::COMPILE_NO_FLAGS).ok()?;
+    Some(xkb::compose::State::new(&table, xkb::compose::STATE_NO_FLAGS))
 }
 
 fn main() {
@@ -291,7 +522,7 @@ fn main() {
     let mut s = Surfaces { border, content, viewport, layer: None };
 
     let mut state = State {
-        size: (400, 1),
+        size: (0, 0),
         configured: false,
         // the outputs' until the surface is told its own
         scale: 1,
@@ -306,9 +537,10 @@ fn main() {
         keys: vec![],
         repeat_key: None,
         offers: vec![],
-        selection: None,
+        selection: Selection::default(),
+        compose: None,
         dnd: None,
-        closed: false,
+        layer_closed: false,
     };
     // the outputs' scale to start with: just their first announcement
     let outputs: Vec<wl_output::WlOutput> = globals.contents().with_list(|list| {
@@ -326,9 +558,15 @@ fn main() {
 
     let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     let data = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .map(|d| d.join("flurry-sideview"));
+    // cookies, auth cache and local storage: Servo creates them 0644, so the directory is private
+    if let Some(d) = &data {
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(d);
+        let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+    }
     let opts = Opts { config_dir: data, ..Default::default() };
     let mut prefs = Preferences::default();
     prefs.dom_intersection_observer_enabled = true;
@@ -337,14 +575,21 @@ fn main() {
     prefs.layout_variable_fonts_enabled = true;
     prefs.user_agent = SAFARI_UA.into();
     prefs.editing_caret_blink_time = 0; // steady caret
-    prefs.shell_background_color_rgba = [0x2e as f64 / 255.0, 0x34 as f64 / 255.0, 0x40 as f64 / 255.0, 1.0];
+    if let Some(bg) = std::env::args().nth(1).and_then(|a| u32::from_str_radix(&a, 16).ok()) {
+        let c = |shift: u32| ((bg >> shift) & 0xff) as f64 / 255.0;
+        prefs.shell_background_color_rgba = [c(16), c(8), c(0), 1.0];
+    }
     let servo = ServoBuilder::default().opts(opts).preferences(prefs).event_loop_waker(Box::new(Waker(wake_fd))).build();
     let scripts = Rc::new(UserContentManager::new(&servo));
     scripts.add_script(Rc::new(UserScript::new(PASTE_SHIM_JS.into(), None)));
+    // dropped before Servo (and the connection, declared before it)
+    let shared = Rc::new(Shared::default());
+    let _clear = ClearShared(shared.clone());
 
-    let mut width: u32 = 400;
+    // flurry sends its width, scheme and focus before the first show
+    let mut width: u32 = 0;
     let mut focused = false;
-    let mut zone = "ignore".to_string();
+    let mut exclusive = false;
     let mut dark = true;
     let mut pages: HashMap<String, WebView> = HashMap::new();
     let mut current: Option<String> = None;
@@ -352,17 +597,18 @@ fn main() {
     // configured since the last map: presenting before that blocks in eglSwapBuffers on a frame
     // callback the unmapped surface never gets (re-shows hung until the helper was killed)
     let mut mapped = false;
-    // deadline for a page just shown to produce its first frame (painting before it renders the
-    // previous scene)
-    let mut awaiting: Option<Instant> = None;
-    let mut skip_blank = false;
+    // a page just shown waits for the first frame its show produces (painting before it renders
+    // the previous scene); one still loading, for its load to complete (its frames until then
+    // are blank, so the old one stays up)
+    let mut awaiting = false;
+    let mut loading = false;
     let mut rendering: Option<Rc<WindowRenderingContext>> = None;
     // one Claude Code process for every page showing flurry:claude: replies go to the page that
     // sent the last message (two such pages share the conversation)
     let mut chat = claude::Chat::default();
     let mut chat_view: Option<WebView> = None;
-    let frame = Rc::new(Frame { claude_url: claude::page_url(), ..Default::default() });
-    let clipboard = Rc::new(Clipboard::default());
+    let frame = Rc::new(Frame { shared: shared.clone(), claude_url: page_url(), ..Default::default() });
+    let clipboard = Rc::new(Clipboard { arboard: Default::default(), conn: conn.clone(), selection: state.selection.clone(), shared: shared.clone() });
     // the panel's border waits for the first frame presented after a map, and flurry for "mapped"
     let mut bordered = false;
     let mut announce = false;
@@ -375,7 +621,7 @@ fn main() {
     let mut input: Vec<u8> = Vec::new();
     let wl_fd = conn.as_fd().as_raw_fd();
 
-    let map = |s: &mut Surfaces, width: u32, focused: bool, zone: &str| {
+    let map = |s: &mut Surfaces, width: u32, focused: bool, exclusive: bool| {
         if s.layer.is_none() {
             let l = shell.get_layer_surface(&s.border, None, zwlr_layer_shell_v1::Layer::Overlay, "sideview".into(), &qh, ());
             use zwlr_layer_surface_v1::Anchor;
@@ -390,25 +636,21 @@ fn main() {
         } else {
             zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand
         });
-        l.set_exclusive_zone(if zone == "exclusive" { width as i32 } else { -1 });
+        l.set_exclusive_zone(if exclusive { width as i32 } else { -1 });
         s.border.commit();
     };
-    let border_buffers: RefCell<Vec<wl_buffer::WlBuffer>> = RefCell::default();
-    let paint_border = |s: &Surfaces, color: u32| {
-        let [r, g, b, a] = rgba(color);
-        let buf = pixels.create_u32_rgba_buffer(r, g, b, a, &qh, ());
-        s.border.attach(Some(&buf), 0, 0);
+    // the border's two colors, without and with the keyboard (#sideview:focus-within)
+    let border_buffers = [DARK4, BLUE3].map(|c| {
+        let [r, g, b, a] = rgba(c);
+        pixels.create_u32_rgba_buffer(r, g, b, a, &qh, ())
+    });
+    let paint_border = |s: &Surfaces, focused: bool| {
+        s.border.attach(Some(&border_buffers[focused as usize]), 0, 0);
         s.border.damage(0, 0, i32::MAX, i32::MAX);
         s.border.commit();
-        // the old one is replaced by this commit; destroying before the commit would unmap
-        let mut bufs = border_buffers.borrow_mut();
-        for old in bufs.drain(..) {
-            old.destroy();
-        }
-        bufs.push(buf);
     };
 
-    while !state.closed {
+    loop {
         // commands from flurry
         let mut buf = [0u8; 4096];
         loop {
@@ -422,27 +664,31 @@ fn main() {
             input.extend_from_slice(&buf[..n as usize]);
         }
         let mut lines: Vec<String> = rendering.as_ref().and_then(|_| pending_show.take()).into_iter().collect();
-        while let Some(i) = input.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = input.drain(..=i).collect();
-            lines.push(String::from_utf8_lossy(&line).trim().to_string());
+        let end = input.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        lines.extend(input[..end].split(|&b| b == b'\n').filter(|l| !l.is_empty()).map(|l| String::from_utf8_lossy(l).trim().to_string()));
+        input.drain(..end);
+        // the output went away: hidden like a hide, and flurry is told (the pages stay)
+        if std::mem::take(&mut state.layer_closed) {
+            lines.push("hide".into());
+            tell("closed");
         }
         for line in lines {
             let mut w = line.splitn(3, ' ');
             match (w.next(), w.next(), w.next()) {
                 (Some("show"), Some(name), Some(url)) => {
                     let is_claude = url == claude::URL;
-                    let target = || if is_claude { claude::page_url() } else { url::Url::parse(url).ok() };
-                    if !pages.contains_key(name) && target().is_none() {
+                    let target = if is_claude { frame.claude_url.clone() } else { url::Url::parse(url).ok() };
+                    if !pages.contains_key(name) && target.is_none() {
                         continue; // nothing to show
                     }
-                    // a visible page swapped for another: its hide builds a frame of neither page
-                    let swap = visible && current.as_deref().is_some_and(|c| c != name && pages.contains_key(c));
+                    // the page on screen shown again: its show changes nothing, so no frame comes
+                    let again = visible && current.as_deref() == Some(name);
                     if !visible {
                         visible = true;
-                        map(&mut s, width, focused, &zone);
+                        map(&mut s, width, focused, exclusive);
                     }
                     announce = true;
-                    INPUT_AT.with(|i| i.set(None)); // input given to the page shown before doesn't count
+                    shared.input_at.set(None); // input given to the page shown before doesn't count
                     let Some(rc) = &rendering else {
                         // web views are created once the first configure gives the surface a size
                         pending_show = Some(line.clone());
@@ -450,7 +696,7 @@ fn main() {
                     };
                     current = Some(name.to_string());
                     if !pages.contains_key(name)
-                        && let Some(u) = target()
+                        && let Some(u) = target
                     {
                         let wv = WebViewBuilder::new(&servo, rc.clone())
                             .url(u)
@@ -467,28 +713,31 @@ fn main() {
                     }
                     // first reply without waiting for Claude Code to start (once the page is up)
                     prewarm |= is_claude;
-                    // hide before show: the shared scene never holds two pages at once
+                    // show before hide: each show or hide builds a frame of its own, and a swap's
+                    // in-between one then still holds the shown page (hiding first made it one of
+                    // neither page, blank)
+                    let shown = pages.get(name);
+                    if let Some(wv) = shown {
+                        wv.show();
+                    }
                     for (n, wv) in &pages {
                         if n != name {
                             wv.hide();
                             wv.set_focused(false);
                         }
                     }
-                    if let Some(wv) = pages.get(name) {
-                        wv.show();
+                    if let Some(wv) = shown {
                         wv.set_focused(true);
                     }
                     // paint on the frame the show produces, not the stale scene still built
-                    frame.dirty.set(false);
-                    skip_blank = swap;
-                    let loading = pages.get(name).is_some_and(|wv| wv.load_status() != LoadStatus::Complete);
-                    awaiting = Some(Instant::now() + Duration::from_millis(if loading { 1000 } else { 150 }));
+                    frame.dirty.set(again);
+                    (awaiting, loading) = (!again, false);
                 }
                 (Some("hide"), _, _) => {
                     // a show still waiting for the first configure is cancelled, not replayed after
                     pending_show = None;
                     state.release_keys();
-                    INPUT_AT.with(|i| i.set(None));
+                    shared.input_at.set(None);
                     (bordered, announce) = (false, false);
                     // hidden web views drop out of the scene and are throttled (no animations or
                     // rAF, timers at most once a second); losing focus fires blur, a cue for pages
@@ -497,7 +746,7 @@ fn main() {
                         wv.hide();
                         wv.set_focused(false);
                     }
-                    awaiting = None;
+                    awaiting = false;
                     visible = false;
                     mapped = false;
                     if let Some(l) = s.layer.take() {
@@ -510,15 +759,17 @@ fn main() {
                 }
                 (Some("focus"), Some(f), Some(z)) => {
                     focused = f == "true";
-                    zone = z.to_string();
+                    exclusive = z == "exclusive";
                     if visible {
-                        map(&mut s, width, focused, &zone);
+                        map(&mut s, width, focused, exclusive);
                     }
                 }
                 (Some("width"), Some(px), _) => {
-                    width = px.parse().unwrap_or(400);
-                    if visible {
-                        map(&mut s, width, focused, &zone);
+                    if let Ok(px) = px.parse() {
+                        width = px;
+                        if visible {
+                            map(&mut s, width, focused, exclusive);
+                        }
                     }
                 }
                 (Some("dark"), Some(d), _) => {
@@ -560,16 +811,16 @@ fn main() {
                     {
                         let rc = Rc::new(rc);
                         let _ = rc.make_current();
-                        RENDERING.with(|r| *r.borrow_mut() = Some(rc.clone()));
+                        *shared.rendering.borrow_mut() = Some(rc.clone());
                         rendering = Some(rc);
                     }
                 }
             }
             mapped = true;
             if bordered {
-                paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 }); // commits the new size
+                paint_border(&s, state.has_keyboard); // commits the new size
             }
-            if awaiting.is_none() {
+            if !awaiting {
                 frame.dirty.set(true);
             }
             continue; // run a pending show now
@@ -597,8 +848,11 @@ fn main() {
             } else if !pressed && state.repeat_key.map(|r| r.0) == Some(code) {
                 state.repeat_key = None;
             }
+            // shortcuts by the first layout's base symbol too: Ctrl+R on a non-Latin layout
+            let base = x.get_keymap().key_get_syms_by_level(code, 0, 0).first().copied();
+            let is = |k: xkb::Keysym| sym == k || base == Some(k);
             let wv = current.as_ref().and_then(|c| pages.get(c));
-            if pressed && ctrl && sym == xkb::Keysym::r {
+            if pressed && ctrl && is(xkb::Keysym::r) {
                 if !repeat && let Some(wv) = wv {
                     wv.reload(); // ctrl+R to reload page
                     if frame.claude_url.is_some() && wv.url() == frame.claude_url {
@@ -612,26 +866,54 @@ fn main() {
             }
             if pressed
                 && ctrl
-                && sym == xkb::Keysym::v
+                && is(xkb::Keysym::v)
                 && let Some(wv) = wv
             {
-                PASTE_AT.with(|p| p.set(Some((wv.id(), now))));
+                shared.paste_at.set(Some((wv.id(), now)));
             }
             if pressed
                 && !repeat
                 && ctrl
-                && sym == xkb::Keysym::v
-                && let Some((offer, mimes)) = &state.selection
-                && let Some(mime) = mimes.iter().find(|m| m.starts_with("image/") || m.starts_with("video/"))
+                && is(xkb::Keysym::v)
                 && let Some(wv) = wv
             {
-                let bytes = receive(&conn, offer, mime);
-                if !bytes.is_empty() {
-                    wv.evaluate_javascript(format!("window.__flurryPaste({:?}, {:?})", base64(&bytes), mime), |_| {});
+                // media only when there's no text to paste: copied rich text also offers an image
+                let sel = state.selection.borrow();
+                let media = sel.as_ref().filter(|(_, mimes)| !mimes.iter().any(|m| m.starts_with("text/plain"))).and_then(|(offer, mimes)| {
+                    let mime = mimes.iter().find(|m| m.starts_with("image/") || m.starts_with("video/"))?;
+                    Some((offer, mime))
+                });
+                if let Some((offer, mime)) = media {
+                    // pasted once it has all come in (to the page it was given to)
+                    let (wv, m) = (wv.clone(), mime.clone());
+                    let paste = move |bytes: Vec<u8>| {
+                        if !bytes.is_empty() {
+                            wv.evaluate_javascript(format!("window.__flurryPaste({:?}, {:?})", BASE64_STANDARD.encode(&bytes), m), |_| {});
+                        }
+                    };
+                    *shared.receive.borrow_mut() = Receive::start(&conn, offer, mime, paste);
                     continue;
                 }
             }
-            let text: String = sym.key_char().filter(|c| !c.is_control()).map(String::from).unwrap_or_default();
+            let mut text: String = sym.key_char().filter(|c| !c.is_control()).map(String::from).unwrap_or_default();
+            if pressed
+                && !repeat
+                && let Some(c) = &mut state.compose
+                && matches!(c.feed(sym), xkb::compose::FeedResult::Accepted)
+            {
+                match c.status() {
+                    xkb::compose::Status::Composing => continue,
+                    xkb::compose::Status::Composed => {
+                        text = c.utf8().unwrap_or_default();
+                        c.reset();
+                    }
+                    xkb::compose::Status::Cancelled => {
+                        c.reset();
+                        continue;
+                    }
+                    xkb::compose::Status::Nothing => {}
+                }
+            }
             let key = match named(sym) {
                 Some(n) => Key::Named(n),
                 None if !text.is_empty() => Key::Character(text),
@@ -649,7 +931,8 @@ fn main() {
                 }
             }
             let ks = if pressed { KeyState::Down } else { KeyState::Up };
-            state.events.push(InputEvent::Keyboard(KeyboardEvent::new_without_event(ks, key, Code::Unidentified, Location::Standard, modifiers, repeat, false)));
+            let (code, location) = self::code(code.raw().saturating_sub(8));
+            state.events.push(InputEvent::Keyboard(KeyboardEvent::new_without_event(ks, key, code, location, modifiers, repeat, false)));
         }
 
         servo.spin_event_loop();
@@ -664,11 +947,11 @@ fn main() {
                 // only a well-formed user message reaches Claude Code
                 let sent = claude::user_message(parts).is_some_and(|line| chat.send(&line));
                 if !sent {
-                    wv.evaluate_javascript(r#"window.__claude(['{"type":"exit"}'])"#, |_| {}); // claude not found: unblock the page
+                    wv.evaluate_javascript(r#"window.__claude(['{"type":"exit","error":"claude not found"}'])"#, |_| {});
                 }
                 chat_view = Some(wv);
             } else if let Some(url) = m.strip_prefix("open:") {
-                open_external(url, wv.id());
+                shared.open_external(url, wv.id());
             } else {
                 eprintln!("flurry-sideview: {m}"); // page errors (window.onerror)
             }
@@ -682,7 +965,7 @@ fn main() {
             let lines: Vec<String> = lines.iter().map(|l| claude::quote(l)).collect();
             wv.evaluate_javascript(format!("window.__claude([{}])", lines.join(",")), |_| {});
         }
-        POPUPS.with(|p| p.borrow_mut().retain(|(_, at)| at.elapsed() < Duration::from_secs(5)));
+        shared.popups.borrow_mut().retain(|(_, at)| at.elapsed() < Duration::from_secs(5));
         if let Some(wv) = current.as_ref().and_then(|c| pages.get(c)) {
             for ev in state.events.drain(..) {
                 let real = match &ev {
@@ -691,24 +974,17 @@ fn main() {
                     _ => false,
                 };
                 if real && visible {
-                    INPUT_AT.with(|i| i.set(Some((wv.id(), Instant::now()))));
+                    shared.input_at.set(Some((wv.id(), Instant::now())));
                 }
                 wv.notify_input_event(ev);
             }
-            if awaiting.is_some() && frame.dirty.get() {
-                if wv.load_status() != LoadStatus::Complete {
-                    frame.dirty.set(false); // still loading: its frames are blank, the old one stays up
-                } else if skip_blank {
-                    // the first frame after a swap is the empty in-between scene; the shown page's
-                    // follows, unless both arrived together (then the renderer already holds it)
-                    frame.dirty.set(false);
-                    skip_blank = false;
-                    awaiting = Some(Instant::now() + Duration::from_millis(16));
+            if awaiting {
+                if wv.load_status() == LoadStatus::Started {
+                    frame.dirty.set(false); // nothing parsed yet: its frames are blank, the old one stays up
+                    loading = true;
+                } else if std::mem::take(&mut loading) {
+                    frame.dirty.set(true); // its head parsed (a Servo event; a stalled subresource can't hold it back)
                 }
-            }
-            if awaiting.is_some_and(|at| Instant::now() >= at) {
-                frame.dirty.set(true); // no frame came (nothing changed): paint what there is
-                skip_blank = false;
             }
             if visible && mapped
                 && frame.dirty.replace(false)
@@ -718,16 +994,14 @@ fn main() {
                     // maps the panel, with this frame: never the stale one before it; sent ahead of
                     // the swap, which may wait on the frame callback of one shown before the hide
                     bordered = true;
-                    paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });
+                    paint_border(&s, state.has_keyboard);
                     let _ = conn.flush();
                 }
                 wv.paint();
                 rc.present();
-                awaiting = None;
+                awaiting = false;
                 if std::mem::take(&mut announce) {
-                    use std::io::Write;
-                    let mut out = std::io::stdout();
-                    let _ = out.write_all(b"mapped\n").and_then(|_| out.flush());
+                    tell("mapped");
                 }
                 if std::mem::take(&mut prewarm) {
                     chat.prewarm();
@@ -750,12 +1024,10 @@ fn main() {
             // -1 (no chat process, or nothing to write) is ignored by poll
             libc::pollfd { fd: chat.fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: chat.write_fd(), events: libc::POLLOUT, revents: 0 },
+            // a paste coming in
+            libc::pollfd { fd: shared.receive.borrow().as_ref().map_or(-1, |r| r.file.as_raw_fd()), events: libc::POLLIN, revents: 0 },
         ];
-        let wake_at = match (state.repeat_key.map(|r| r.1), awaiting.filter(|_| visible && mapped)) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let timeout = wake_at.map(|at| at.saturating_duration_since(Instant::now()).as_millis() as i32).unwrap_or(-1);
+        let timeout = state.repeat_key.map(|r| r.1.saturating_duration_since(Instant::now()).as_millis() as i32).unwrap_or(-1);
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if fds[0].revents & libc::POLLIN != 0 {
             if guard.read().is_err() {
@@ -771,64 +1043,20 @@ fn main() {
         if fds[4].revents != 0 {
             chat.flush(); // a failure shows as the process's end on its stdout
         }
+        if fds[5].revents != 0
+            && let Some(r) = shared.receive.take().and_then(Receive::pump)
+        {
+            *shared.receive.borrow_mut() = Some(r);
+        }
         let had_keyboard = state.has_keyboard;
         if queue.dispatch_pending(&mut state).is_err() {
             return;
         }
         if state.has_keyboard != had_keyboard && visible && bordered {
             // #sideview:focus-within
-            paint_border(&s, if state.has_keyboard { BLUE3 } else { DARK4 });
+            paint_border(&s, state.has_keyboard);
         }
     }
-}
-
-fn receive(conn: &Connection, offer: &wl_data_offer::WlDataOffer, mime: &str) -> Vec<u8> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-        return vec![];
-    }
-    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    offer.receive(mime.into(), wr.as_fd());
-    drop(wr);
-    let _ = conn.flush();
-    // a slow or endless source must not hang the panel: what isn't all there in time is dropped
-    const CAP: usize = 20 << 20;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    unsafe { libc::fcntl(rd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
-    let mut file = std::fs::File::from(rd);
-    let mut out = vec![];
-    let mut chunk = [0u8; 65536];
-    loop {
-        match file.read(&mut chunk) {
-            Ok(0) => return out,
-            Ok(n) if out.len() + n <= CAP => out.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
-                let mut pfd = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-                if left <= 0 || unsafe { libc::poll(&mut pfd, 1, left) } <= 0 {
-                    return vec![];
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            _ => return vec![],
-        }
-    }
-}
-
-fn base64(b: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::with_capacity(b.len().div_ceil(3) * 4);
-    for c in b.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= c.len() {
-                s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                s.push('=');
-            }
-        }
-    }
-    s
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -873,7 +1101,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
                 state.size = (width, height);
                 state.configured = true;
             }
-            zwlr_layer_surface_v1::Event::Closed => state.closed = true,
+            zwlr_layer_surface_v1::Event::Closed => state.layer_closed = true,
             _ => {}
         }
     }
@@ -910,6 +1138,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 if let Ok(Some(km)) = km {
                     state.xkb = Some(xkb::State::new(&km));
                 }
+                state.compose = compose_state(&state.ctx);
             }
             wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
                 if let Some(x) = &mut state.xkb {
@@ -970,7 +1199,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
         match ev {
             wl_data_device::Event::DataOffer { id } => state.offers.push((id, vec![])),
             wl_data_device::Event::Selection { id } => {
-                if let Some((old, _)) = state.selection.take() {
+                if let Some((old, _)) = state.selection.borrow_mut().take() {
                     old.destroy();
                 }
                 let mime = id.as_ref().and_then(|o| state.offers.iter().position(|(p, _)| p == o)).map(|i| state.offers.swap_remove(i).1);
@@ -978,7 +1207,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 for (o, _) in state.offers.drain(..) {
                     o.destroy();
                 }
-                state.selection = id.map(|o| (o, mime.unwrap_or_default()));
+                *state.selection.borrow_mut() = id.map(|o| (o, mime.unwrap_or_default()));
             }
             wl_data_device::Event::Enter { id, .. } => {
                 if let Some(o) = &id {
@@ -1007,7 +1236,7 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
         if let wl_data_offer::Event::Offer { mime_type } = ev {
             if let Some((_, m)) = state.offers.iter_mut().find(|(p, _)| p == o) {
                 m.push(mime_type);
-            } else if let Some((sel, m)) = &mut state.selection
+            } else if let Some((sel, m)) = &mut *state.selection.borrow_mut()
                 && sel == o
             {
                 m.push(mime_type);

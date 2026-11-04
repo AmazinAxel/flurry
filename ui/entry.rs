@@ -45,24 +45,10 @@ fn next_char(s: &str, i: usize) -> usize {
     s[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(i)
 }
 fn prev_word(s: &str, i: usize) -> usize {
-    let mut j = i;
-    while j > 0 && s[..j].ends_with(|c: char| !c.is_alphanumeric()) {
-        j = prev_char(s, j);
-    }
-    while j > 0 && s[..j].ends_with(char::is_alphanumeric) {
-        j = prev_char(s, j);
-    }
-    j
+    s[..i].trim_end_matches(|c: char| !c.is_alphanumeric()).trim_end_matches(char::is_alphanumeric).len()
 }
 fn next_word(s: &str, i: usize) -> usize {
-    let mut j = i;
-    while j < s.len() && !s[j..].starts_with(char::is_alphanumeric) {
-        j = next_char(s, j);
-    }
-    while j < s.len() && s[j..].starts_with(char::is_alphanumeric) {
-        j = next_char(s, j);
-    }
-    j
+    s.len() - s[i..].trim_start_matches(|c: char| !c.is_alphanumeric()).trim_start_matches(char::is_alphanumeric).len()
 }
 
 /// Zeroes a secret's whole buffer (spare capacity holds deleted bytes too); empties the string.
@@ -77,6 +63,41 @@ pub fn wipe_bytes(v: &mut Vec<u8>) {
         unsafe { std::ptr::write_volatile(p.add(i), 0) };
     }
     v.clear();
+}
+
+/// Secret bytes, zeroed on drop.
+pub struct Secret(Box<[u8]>);
+
+impl Secret {
+    /// Takes `v` without leaving a copy: a shrinking `into_boxed_slice` would free the tail unwiped.
+    pub fn new(mut v: Vec<u8>) -> Secret {
+        if v.len() == v.capacity() {
+            return Secret(v.into_boxed_slice());
+        }
+        let s = Secret(v.as_slice().into());
+        wipe_bytes(&mut v);
+        s
+    }
+
+    /// The bytes as text ("" if they aren't UTF-8; an entry's text always is).
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("")
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        for b in self.0.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+    }
 }
 
 impl Drop for Entry {
@@ -114,6 +135,16 @@ impl Entry {
         self.changed();
     }
 
+    /// Takes the text out as a `Secret`: the entry is left empty with its buffer wiped (and its
+    /// capacity kept, so typing the next one doesn't reallocate).
+    pub fn take_secret(&mut self) -> Secret {
+        let s = Secret(self.text.as_bytes().into());
+        wipe(&mut self.text);
+        (self.cursor, self.anchor) = (0, 0);
+        self.changed();
+        s
+    }
+
     fn changed(&self) {
         if let Some(f) = &self.on_change {
             f(&self.text);
@@ -137,7 +168,10 @@ impl Entry {
 
     pub fn insert(&mut self, s: &str) {
         self.delete_selection();
-        let mut s: String = s.chars().filter(|c| !c.is_control()).collect();
+        // sized up front: a growing collect would free secret-holding buffers unwiped
+        let mut clean = String::with_capacity(s.len());
+        clean.extend(s.chars().filter(|c| !c.is_control()));
+        let mut s = clean;
         if let Some(max) = self.max_len {
             let room = max.saturating_sub(self.text.chars().count());
             // in place: a copy would leave the cut part of a secret unwiped
@@ -205,19 +239,34 @@ impl Entry {
             }
         }
         match sym {
-            Keysym::BackSpace => {
+            Keysym::BackSpace | Keysym::Delete | Keysym::KP_Delete => {
                 let mut removed = e.delete_selection();
-                if !removed && e.cursor > 0 {
-                    let to = if ev.ctrl { prev_word(&e.text, e.cursor) } else { prev_char(&e.text, e.cursor) };
-                    let c = e.cursor;
-                    e.text.replace_range(to..c, "");
-                    e.cursor = to;
-                    e.anchor = to;
+                let c = e.cursor;
+                let back = sym == Keysym::BackSpace;
+                let to = match (back, ev.ctrl) {
+                    (true, true) => prev_word(&e.text, c),
+                    (true, false) => prev_char(&e.text, c),
+                    (false, true) => next_word(&e.text, c),
+                    (false, false) => next_char(&e.text, c),
+                };
+                if !removed && to != c {
+                    e.text.replace_range(to.min(c)..to.max(c), "");
+                    e.cursor = to.min(c);
+                    e.anchor = e.cursor;
                     removed = true;
                 }
                 if removed {
                     e.changed();
                 }
+                true
+            }
+            Keysym::Home | Keysym::KP_Home => {
+                moving(&mut e, 0, ev.shift);
+                true
+            }
+            Keysym::End | Keysym::KP_End => {
+                let end = e.text.len();
+                moving(&mut e, end, ev.shift);
                 true
             }
             Keysym::Left => {
@@ -242,11 +291,14 @@ impl Entry {
                 moving(&mut e, to, ev.shift);
                 true
             }
-            _ if !ev.ctrl && !ev.alt && !ev.text.is_empty() => {
-                e.insert(&ev.text);
-                true
-            }
-            _ => false,
+            _ => match ev.ch {
+                Some(c) if !ev.ctrl && !ev.alt => {
+                    let mut b = [0; 4];
+                    e.insert(c.encode_utf8(&mut b));
+                    true
+                }
+                _ => false,
+            },
         }
     }
 
@@ -266,15 +318,17 @@ impl Entry {
         chars * self.invisible_char.map(char::len_utf8).unwrap_or(0)
     }
 
-    /// Scroll that keeps the caret (at `caret_x`) inside a `width` wide area, from the current one.
-    fn scroll_for(&self, caret_x: f32, width: f32) -> f32 {
-        if caret_x - self.scroll > width - 1.0 {
+    /// Scroll that keeps the caret (at `caret_x`) inside a `width` wide area, from the current one,
+    /// and no further than shows the end of `text_w` (shrinking text scrolls back).
+    fn scroll_for(&self, caret_x: f32, text_w: f32, width: f32) -> f32 {
+        let s = if caret_x - self.scroll > width - 1.0 {
             caret_x - width + 1.0
         } else if caret_x < self.scroll {
             caret_x
         } else {
             self.scroll
-        }
+        };
+        s.min((text_w - width + 1.0).max(0.0))
     }
 }
 
@@ -289,12 +343,21 @@ pub struct Look {
 /// The text area as a node (GTK's `text` node inside `entry`), filling its allocation.
 pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
     let font = style.font.clone();
+    let mut e = this.borrow_mut();
+    // measured once per build, for the scroll and the paint below (the key covers what they use)
+    let shown = e.display();
+    let empty = e.text.is_empty();
+    let full = text::layout(&shown, &font, None, Wrap::None, false);
+    // prefixes are throwaway, so uncached; the caret mostly sits at the end
+    let x_at = |byte: usize| if byte >= shown.len() { full.width() } else { text::width_uncached(&shown[..byte], &font) };
+    let (a, b) = e.selection();
+    let caret_x = x_at(e.display_index(e.cursor));
+    let sel = (a != b && !shown.is_empty()).then(|| if e.cursor == b { (x_at(e.display_index(a)), caret_x) } else { (caret_x, x_at(e.display_index(b))) });
+    let text_w = full.width();
     let key = {
-        let mut e = this.borrow_mut();
         // settled here, not while painting: the key below has to cover it
         if e.view_w > 0.0 {
-            let caret_x = text::width_uncached(&e.display()[..e.display_index(e.cursor)], &font);
-            e.scroll = e.scroll_for(caret_x, e.view_w);
+            e.scroll = e.scroll_for(caret_x, text_w, e.view_w);
         }
         let colors = [look.color, look.placeholder, look.selection_bg, look.selection_fg].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits));
         // what's displayed, never a secret: a password is keyed by its length only
@@ -302,28 +365,24 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         let len = if e.password { e.text.chars().count() } else { 0 };
         Some(super::node::hash(&(text, len, e.cursor, e.anchor, e.password, e.invisible_char, &e.placeholder, e.scroll.to_bits(), look.caret, colors)))
     };
+    let blank = if empty { e.placeholder.is_empty() } else { shown.is_empty() };
+    let (layout, color) = if empty { (text::layout(&e.placeholder, &font, None, Wrap::None, false), look.placeholder) } else { (full, look.color) };
+    drop(e);
     let this = this.clone();
-    let shadows = style.text_shadow.clone();
+    let shadows = style.text_shadow;
     let height = text::layout("Ag", &font, None, Wrap::None, false).height();
     let paint = Rc::new(move |pm: &mut PixmapMut, r: Rect, ts: Transform| {
         let mut e = this.borrow_mut();
         // the build settles the scroll for this width; a new width keeps the caret visible below
         e.view_w = r.width();
-        let shown = e.display();
-        let (text_s, color) = if e.text.is_empty() { (e.placeholder.as_str(), look.placeholder) } else { (shown.as_str(), look.color) };
-        let layout = text::layout(text_s, &font, None, Wrap::None, false);
-        // prefixes measured once each, uncached (they are throwaway)
-        let x_at = |byte: usize| text::width_uncached(&shown[..byte.min(shown.len())], &font);
-        let (a, b) = e.selection();
-        let caret_x = x_at(e.display_index(e.cursor));
-        let sel = (a != b && !shown.is_empty()).then(|| if e.cursor == b { (x_at(e.display_index(a)), caret_x) } else { (caret_x, x_at(e.display_index(b))) });
-        let x = r.x() - e.scroll_for(caret_x, r.width());
+        let x = r.x() - e.scroll_for(caret_x, text_w, r.width());
+        drop(e);
         let y = r.y() + ((r.height() - layout.height()) / 2.0).floor();
         let clip = r;
         // paint into a layer bounded horizontally to the text area (vertical slack for descenders)
         let bound = Rect::from_ltrb(r.left(), r.top() - r.height(), r.right(), r.bottom() + r.height()).unwrap_or(r);
         // shadows blur only the glyphs that are shown, so they fade out past the text area's edges
-        for sh in shadows.iter().filter(|_| !text_s.is_empty()) {
+        for sh in shadows.iter().filter(|_| !blank) {
             let content = super::node::hash(&(layout.content_hash(), (x - r.x()).to_bits(), (y - r.y()).to_bits(), r.width().to_bits(), r.height().to_bits()));
             let area = bound.transform(Transform::from_translate(sh.x, sh.y)).unwrap_or(bound);
             let tint = sh.over(color).color;
@@ -391,6 +450,20 @@ mod tests {
         e.insert("X");
         assert_eq!(e.text, "aXde");
         assert_eq!(e.cursor, 2);
+    }
+
+    #[test]
+    fn take_secret_wipes_buffer() {
+        let mut e = Entry::default();
+        e.password = true;
+        e.insert("hunter2");
+        let cap = e.text.capacity();
+        let s = e.take_secret();
+        assert_eq!(s.as_str(), "hunter2");
+        assert!(e.text.is_empty() && e.cursor == 0 && e.anchor == 0);
+        assert_eq!(e.text.capacity(), cap);
+        let v = unsafe { e.text.as_mut_vec() };
+        assert!(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.capacity()) }.iter().all(|&b| b == 0));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::cell::Cell;
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::style::*;
-use crate::ui::node::{Align, Background, Node, Sides, Style, rgba};
+use crate::ui::node::{Align, Node, Sides, Style, rgba};
 use crate::ui::wayland::KeyEvent;
 
 thread_local! {
@@ -32,7 +32,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
 }
 
 /// 0 = Sunday
@@ -67,13 +67,7 @@ pub fn key(ev: &KeyEvent) -> bool {
 
 /// strftime on a day number, in UTC so no offset shifts the date.
 fn day_format(day: i64, fmt: &str) -> String {
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t = (day * 86400) as libc::time_t;
-    unsafe { libc::gmtime_r(&t, &mut tm) };
-    let cfmt = std::ffi::CString::new(fmt).unwrap_or_default();
-    let mut buf = [0u8; 64];
-    let n = unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), cfmt.as_ptr(), &tm) };
-    String::from_utf8_lossy(&buf[..n]).into_owned()
+    crate::lib::time::strftime(day * 86400, fmt, true)
 }
 
 /// Seven equal-width cells.
@@ -91,7 +85,7 @@ pub fn calendar(base: &Style) -> Node {
     let today = today();
     let mut cal = frosted(base.inherit());
     cal.min_width = 0.0;
-    cal.background = Background::None;
+    cal.background = None;
     let cell = Style { padding: Sides::all(SPACE_M - BORDER), ..cal.inherit() }.border(Sides::all(BORDER), tiny_skia::Color::TRANSPARENT);
 
     // "October 2026", left-aligned
@@ -118,7 +112,7 @@ pub fn calendar(base: &Style) -> Node {
                     s.color = rgba(255, 255, 255, 0.5); // adjacent months greyed
                 }
                 if day == today {
-                    s.background = Background::Color(blue3());
+                    s.background = Some(blue3());
                     s.border_color = [blue2(); 4];
                     s.color = light1();
                 }

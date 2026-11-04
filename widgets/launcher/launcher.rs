@@ -1,22 +1,19 @@
 use std::rc::Rc;
 
-use crate::lib::apps::{App, exec_argv, fuzzy_query, launch, reload_if_changed, shell_line};
+use crate::lib::apps::{App, exec_argv, fuzzy_query, launch, reload_if_changed};
 use crate::lib::searchDialog::{SearchSpec, search_dialog};
 use crate::lib::style::*;
+use crate::settings::FOCUS_BLOCKED;
 use crate::ui::node::{Align, Node};
 use crate::ui::window;
 use crate::widgets::focus::{focus, start_break};
 
-const FOCUS_BLOCKED: [&str; 1] = ["discord"];
-
 fn blockable(a: &App) -> bool {
-    FOCUS_BLOCKED.iter().any(|b| a.name.to_lowercase().contains(b))
+    let name = a.name.to_lowercase();
+    FOCUS_BLOCKED.iter().any(|b| name.contains(&b.to_lowercase()))
 }
 
 fn launch_app(a: &App) {
-    if focus() && blockable(a) {
-        return;
-    }
     window::toggle("launcher");
     launch(&exec_argv(&a.executable));
 }
@@ -26,7 +23,7 @@ fn break_launch(a: &App) {
         return launch_app(a);
     }
     window::toggle("launcher");
-    start_break(&shell_line(&exec_argv(&a.executable)));
+    start_break(exec_argv(&a.executable));
 }
 
 pub fn launcher() {

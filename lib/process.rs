@@ -3,77 +3,97 @@
 // except with pre_exec (spawn_lines), which forces fork+exec.
 
 use std::cell::{Cell, RefCell};
-use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 
+use crate::ui::entry::{Secret, wipe_bytes};
 use crate::ui::runtime;
 
-fn nonblock(fd: i32) {
-    unsafe {
-        let fl = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+/// Reads per wakeup: a chatty child can't hog the loop.
+const READS_PER_WAKE: usize = 16;
+/// A longer line is passed on in pieces.
+const MAX_LINE: usize = 64 << 10;
+
+fn zero(b: &mut [u8]) {
+    for x in b {
+        unsafe { std::ptr::write_volatile(x, 0) };
     }
 }
 
-fn pidfd(pid: u32) -> Option<OwnedFd> {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
-    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+/// Spawns with a pidfd (Linux 5.3+) to wait on; without one the child is killed and reaped.
+fn spawn(c: &mut Command) -> Option<(Child, OwnedFd)> {
+    let mut child = c.spawn().ok()?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) } as i32;
+    if fd < 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    Some((child, unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
-/// Reads `fd` until EOF, calling `chunk` with each piece and `done` at EOF.
-fn read_stream(fd: OwnedFd, chunk: impl Fn(&[u8]) + 'static, done: impl FnOnce() + 'static) {
+/// A child's output pipe; the sink gets each chunk, then one empty chunk at the end.
+struct Pipe {
+    fd: OwnedFd,
+    sink: Box<dyn FnMut(&[u8])>,
+}
+
+type PipeRef = Rc<RefCell<Option<Pipe>>>;
+
+fn pipe(fd: OwnedFd, sink: impl FnMut(&[u8]) + 'static) -> PipeRef {
     let raw = fd.as_raw_fd();
-    nonblock(raw);
-    let done = RefCell::new(Some(done));
-    runtime::watch(raw, move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
+    runtime::set_nonblocking(raw, true);
+    let p: PipeRef = Rc::new(RefCell::new(Some(Pipe { fd, sink: Box::new(sink) })));
+    let w = p.clone();
+    runtime::watch(raw, move || drain(&w, READS_PER_WAKE));
+    p
+}
+
+/// Reads up to `max` chunks; closes the pipe at EOF, or when `max` is unbounded (the child is gone:
+/// output a grandchild writes later is dropped).
+fn drain(p: &PipeRef, max: usize) {
+    let mut buf = [0u8; 8192];
+    let mut eof = max == usize::MAX;
+    if let Some(pipe) = &mut *p.borrow_mut() {
+        for _ in 0..max {
+            let n = unsafe { libc::read(pipe.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
-                chunk(&buf[..n as usize]);
+                (pipe.sink)(&buf[..n as usize]);
+                zero(&mut buf[..n as usize]);
                 continue;
             }
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                return;
+            let err = std::io::Error::last_os_error().kind();
+            if n < 0 && err == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            runtime::unwatch(raw);
-            let _keep = &fd;
-            if let Some(d) = done.borrow_mut().take() {
-                d();
+            if n == 0 || err != std::io::ErrorKind::WouldBlock {
+                eof = true;
             }
-            return;
+            break;
         }
-    });
+    }
+    if eof && let Some(mut pipe) = p.borrow_mut().take() {
+        runtime::unwatch(pipe.fd.as_raw_fd());
+        (pipe.sink)(&[]);
+    }
 }
 
-/// Resolves to the exit code once `child` exits (-1 if killed by a signal).
-fn wait(child: Child) -> runtime::Receiver<i32> {
-    let fd = pidfd(child.id()).map(Rc::new);
-    wait_fd(child, fd)
-}
-
-fn wait_fd(mut child: Child, fd: Option<Rc<OwnedFd>>) -> runtime::Receiver<i32> {
-    let (tx, rx) = runtime::oneshot();
-    let Some(fd) = fd else {
-        // no pidfd (old kernel): wait on a thread so the loop never blocks
-        runtime::spawn(async move {
-            let code = runtime::blocking(move || child.wait().ok().and_then(|s| s.code()).unwrap_or(-1)).await;
-            tx.send(code.unwrap_or(-1));
-        });
-        return rx;
-    };
-    let raw = fd.as_raw_fd();
-    let child = RefCell::new(Some(child));
+/// Once `child` exits: drains its pipes to the end, then calls `exit` with the code (-1 if killed
+/// by a signal).
+fn supervise(child: Child, pidfd: Rc<OwnedFd>, pipes: Vec<PipeRef>, exit: impl FnOnce(i32) + 'static) {
+    let raw = pidfd.as_raw_fd();
+    let state = RefCell::new(Some((child, pipes, exit)));
     runtime::watch(raw, move || {
         runtime::unwatch(raw);
-        let _keep = &fd;
-        if let Some(mut c) = child.borrow_mut().take() {
-            tx.send(c.wait().ok().and_then(|s| s.code()).unwrap_or(-1));
+        let _keep = &pidfd;
+        if let Some((mut c, pipes, exit)) = state.borrow_mut().take() {
+            for p in &pipes {
+                drain(p, usize::MAX);
+            }
+            exit(c.wait().ok().and_then(|s| s.code()).unwrap_or(-1));
         }
     });
-    rx
 }
 
 fn command(argv: &[&str]) -> Option<Command> {
@@ -83,60 +103,52 @@ fn command(argv: &[&str]) -> Option<Command> {
     Some(c)
 }
 
+/// Appends without leaving a copy behind: a growing Vec would free its old buffer unwiped.
+fn append(v: &mut Vec<u8>, b: &[u8]) {
+    if v.capacity() - v.len() < b.len() {
+        let mut n = Vec::with_capacity((v.len() + b.len()).next_power_of_two().max(8192));
+        n.extend_from_slice(v);
+        wipe_bytes(v);
+        *v = n;
+    }
+    v.extend_from_slice(b);
+}
+
+/// No copy for valid UTF-8; a lossy one wipes the original.
+fn into_string(v: Vec<u8>) -> String {
+    String::from_utf8(v).unwrap_or_else(|e| {
+        let mut v = e.into_bytes();
+        let s = String::from_utf8_lossy(&v).into_owned();
+        wipe_bytes(&mut v);
+        s
+    })
+}
+
 pub struct Output {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
 }
 
-/// Runs to completion, collecting output.
+/// Runs to completion, collecting output. Nothing is left unwiped behind the returned strings.
 pub async fn output(argv: &[&str], stdin: Option<&[u8]>) -> Option<Output> {
     let mut c = command(argv)?;
     c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = c.spawn().ok()?;
+    let (mut child, pidfd) = spawn(&mut c)?;
     if let (Some(data), Some(si)) = (stdin, child.stdin.take()) {
-        write_stdin(si, data);
+        write_stdin(si.into(), data);
     }
     let out = Rc::new(RefCell::new((Vec::new(), Vec::new())));
-    let (tx, rx) = runtime::oneshot::<()>();
-    let tx = Rc::new(tx);
-    // (stdout, stderr) still open; tx fires once both hit EOF
-    let open = Rc::new(Cell::new((true, true)));
-    let eof = |stdout: bool| {
-        let (open, tx) = (open.clone(), tx.clone());
-        move || {
-            let (o, e) = open.get();
-            let now = if stdout { (false, e) } else { (o, false) };
-            open.set(now);
-            if now == (false, false) {
-                tx.send(());
-            }
-        }
-    };
-    let (so, se): (OwnedFd, OwnedFd) = (child.stdout.take()?.into(), child.stderr.take()?.into());
-    let (so_raw, se_raw) = (so.as_raw_fd(), se.as_raw_fd());
-    let o = out.clone();
-    read_stream(so, move |b| o.borrow_mut().0.extend_from_slice(b), eof(true));
-    let o = out.clone();
-    read_stream(se, move |b| o.borrow_mut().1.extend_from_slice(b), eof(false));
-    let code = wait(child).await.unwrap_or(-1);
-    // a grandchild can hold the pipes open long after: stop reading shortly after the child exits
-    let t = {
-        let tx = tx.clone();
-        runtime::timeout(200, move || tx.send(()))
-    };
-    rx.await;
-    t.cancel();
-    // unwatching closes a still-open pipe (an EOF'd one is closed already, its number maybe reused)
-    let (o, e) = open.get();
-    if o {
-        runtime::unwatch(so_raw);
-    }
-    if e {
-        runtime::unwatch(se_raw);
-    }
+    let (o, e) = (out.clone(), out.clone());
+    let pipes = vec![
+        pipe(child.stdout.take()?.into(), move |b| append(&mut o.borrow_mut().0, b)),
+        pipe(child.stderr.take()?.into(), move |b| append(&mut e.borrow_mut().1, b)),
+    ];
+    let (tx, rx) = runtime::oneshot();
+    supervise(child, Rc::new(pidfd), pipes, move |code| tx.send(code));
+    let code = rx.await.unwrap_or(-1);
     let (so, se) = std::mem::take(&mut *out.borrow_mut());
-    Some(Output { code, stdout: String::from_utf8_lossy(&so).into_owned(), stderr: String::from_utf8_lossy(&se).into_owned() })
+    Some(Output { code, stdout: into_string(so), stderr: into_string(se) })
 }
 
 /// execAsync: stdout (trailing newline trimmed) on success, stderr on failure.
@@ -154,75 +166,94 @@ pub async fn exec(argv: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Writes `data` without blocking the loop: what fits in the pipe now, the rest from a thread.
-fn write_stdin(mut si: std::process::ChildStdin, data: &[u8]) {
-    let raw = si.as_raw_fd();
-    nonblock(raw);
-    let mut n = 0;
-    while n < data.len() {
-        match si.write(&data[n..]) {
-            Ok(0) => return,
-            Ok(k) => n += k,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => return,
+/// Writes `data` without blocking the loop: what fits in the pipe now, the rest as it drains.
+fn write_stdin(fd: OwnedFd, data: &[u8]) {
+    let raw = fd.as_raw_fd();
+    runtime::set_nonblocking(raw, true);
+    // Some(n): n bytes written; None: done or failed
+    let write = move |data: &[u8], mut n: usize| -> Option<usize> {
+        while n < data.len() {
+            let k = unsafe { libc::write(raw, data[n..].as_ptr().cast(), data.len() - n) };
+            if k > 0 {
+                n += k as usize;
+                continue;
+            }
+            match std::io::Error::last_os_error().kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => return Some(n),
+                _ => return None,
+            }
         }
-    }
-    if n < data.len() {
-        unsafe { libc::fcntl(raw, libc::F_SETFL, libc::fcntl(raw, libc::F_GETFL) & !libc::O_NONBLOCK) };
-        let rest = data[n..].to_vec();
-        std::thread::spawn(move || {
-            let _ = si.write_all(&rest);
-        });
-    }
+        None
+    };
+    let Some(n) = write(data, 0) else { return };
+    let rest = Secret::new(data[n..].to_vec());
+    let off = Cell::new(0);
+    runtime::watch(raw, move || {
+        let _keep = &fd;
+        match write(&rest, off.get()) {
+            Some(n) => {
+                off.set(n);
+                runtime::poll_out(raw);
+            }
+            None => runtime::unwatch(raw),
+        }
+    });
+    runtime::poll_out(raw);
 }
 
 /// Exit code (-1 if killed by a signal); None if it couldn't start. No stdio.
 pub async fn status(argv: &[&str]) -> Option<i32> {
     let mut c = command(argv)?;
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    let child = c.spawn().ok()?;
-    Some(wait(child).await.unwrap_or(-1))
+    let (child, pidfd) = spawn(&mut c)?;
+    let (tx, rx) = runtime::oneshot();
+    supervise(child, Rc::new(pidfd), vec![], move |code| tx.send(code));
+    Some(rx.await.unwrap_or(-1))
 }
-
-/// Pipes `input` to stdin; true on exit status 0.
-pub async fn run_input(argv: &[&str], input: &[u8]) -> bool {
-    matches!(output(argv, Some(input)).await, Some(o) if o.code == 0)
-}
-
 
 /// A running process with line-streamed output.
 pub struct Proc {
-    pub pid: u32,
-    pidfd: Option<Rc<OwnedFd>>,
+    pidfd: Rc<OwnedFd>,
     exited: Rc<Cell<bool>>,
 }
 
 impl Proc {
     /// No-op once the child exited (the pidfd can't hit a reused pid).
     pub fn signal(&self, sig: i32) {
-        if self.exited.get() {
-            return;
+        if !self.exited.get() {
+            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.pidfd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0) };
         }
-        match &self.pidfd {
-            Some(fd) => unsafe {
-                libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0);
-            },
-            None => unsafe {
-                libc::kill(self.pid as libc::pid_t, sig);
-            },
-        }
+    }
+
+    /// True from just before its exit callback runs.
+    pub fn exited(&self) -> bool {
+        self.exited.get()
     }
 }
 
-fn lines(cb: impl Fn(&str) + 'static) -> impl Fn(&[u8]) + 'static {
-    let pending = RefCell::new(Vec::<u8>::new());
+fn lines(cb: impl Fn(&str) + 'static) -> impl FnMut(&[u8]) + 'static {
+    let mut pending = Vec::<u8>::new();
     move |b: &[u8]| {
-        let mut p = pending.borrow_mut();
-        p.extend_from_slice(b);
-        while let Some(i) = p.iter().position(|&c| c == b'\n') {
-            let line: Vec<u8> = p.drain(..=i).collect();
-            cb(String::from_utf8_lossy(&line[..line.len() - 1]).as_ref());
+        if b.is_empty() {
+            if !pending.is_empty() {
+                cb(&String::from_utf8_lossy(&pending));
+                pending.clear();
+            }
+            return;
+        }
+        let mut from = pending.len();
+        pending.extend_from_slice(b);
+        let mut start = 0;
+        while let Some(i) = pending[from..].iter().position(|&c| c == b'\n') {
+            cb(&String::from_utf8_lossy(&pending[start..from + i]));
+            start = from + i + 1;
+            from = start;
+        }
+        pending.drain(..start);
+        if pending.len() > MAX_LINE {
+            cb(&String::from_utf8_lossy(&pending));
+            pending.clear();
         }
     }
 }
@@ -244,25 +275,31 @@ pub fn spawn_lines(
             Ok(())
         });
     }
-    let mut child = c.spawn().ok()?;
-    let pid = child.id();
-    let pidfd = pidfd(pid).map(Rc::new);
+    let (mut child, pidfd) = spawn(&mut c)?;
+    let pidfd = Rc::new(pidfd);
+    let pipes = vec![pipe(child.stdout.take()?.into(), lines(stdout)), pipe(child.stderr.take()?.into(), lines(stderr))];
     let exited = Rc::new(Cell::new(false));
-    read_stream(child.stdout.take()?.into(), lines(stdout), || {});
-    read_stream(child.stderr.take()?.into(), lines(stderr), || {});
-    let rx = wait_fd(child, pidfd.clone());
     let e = exited.clone();
-    runtime::spawn(async move {
-        let code = rx.await.unwrap_or(-1);
+    supervise(child, pidfd.clone(), pipes, move |code| {
         e.set(true);
         exit(code)
     });
-    Some(Proc { pid, pidfd, exited })
+    Some(Proc { pidfd, exited })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn drive(done: impl Fn() -> bool) {
+        for _ in 0..200 {
+            runtime::iterate(false);
+            if done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn exec_collects_stdout_and_status() {
@@ -271,15 +308,39 @@ mod tests {
         runtime::spawn(async move {
             *g.borrow_mut() = Some((exec(&["sh", "-c", "echo hi"]).await, exec(&["sh", "-c", "echo bad >&2; exit 3"]).await));
         });
-        for _ in 0..200 {
-            runtime::iterate(false);
-            if got.borrow().is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        drive(|| got.borrow().is_some());
         let (a, b) = got.borrow_mut().take().expect("finished");
         assert_eq!(a, Ok("hi".into()));
         assert_eq!(b, Err("bad".into()));
+    }
+
+    #[test]
+    fn lines_flush_before_exit() {
+        let got = Rc::new(RefCell::new(Vec::<String>::new()));
+        let (g, g2, g3) = (got.clone(), got.clone(), got.clone());
+        let _p = spawn_lines(
+            &["sh", "-c", "printf 'a\\nb'; printf 'err' >&2; exit 2"],
+            move |l| g.borrow_mut().push(l.into()),
+            move |l| g2.borrow_mut().push(format!("!{l}")),
+            move |code| g3.borrow_mut().push(code.to_string()),
+        );
+        drive(|| got.borrow().last().is_some_and(|l| l == "2"));
+        // the pipes may hit EOF before or after the exit wakeup, in either order
+        let mut out = got.borrow().clone();
+        assert_eq!(out.pop().as_deref(), Some("2"));
+        out.sort();
+        assert_eq!(out, ["!err", "a", "b"]);
+    }
+
+    #[test]
+    fn stdin_larger_than_the_pipe() {
+        let data = vec![b'x'; 300_000];
+        let got = Rc::new(RefCell::new(None));
+        let g = got.clone();
+        runtime::spawn(async move {
+            *g.borrow_mut() = Some(output(&["wc", "-c"], Some(&data)).await.map(|o| o.stdout));
+        });
+        drive(|| got.borrow().is_some());
+        assert_eq!(got.borrow_mut().take().flatten().map(|s| s.trim().to_string()), Some("300000".into()));
     }
 }

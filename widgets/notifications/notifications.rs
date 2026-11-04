@@ -1,13 +1,13 @@
-// Notification popups (widgets/notifications/*.tsx).
+// Notification popups.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 use crate::lib::notifd::{self, Notification};
-use crate::lib::state::State;
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::style::*;
 use crate::lib::sway;
 use crate::ui::node::{Align, Node, Sides, Style};
+use crate::ui::state::global_state;
 use crate::ui::wayland::{Anchor, Layer};
 use crate::ui::window::{Spec, Win};
 use crate::widgets::focus::{focus, focus_text};
@@ -18,12 +18,15 @@ const MAX_SHOWN: usize = 10;
 const SUMMARY_LINES: usize = 2;
 const BODY_LINES: usize = 6;
 
+global_state! {
+    fn shown() -> Vec<Notification> = vec![];
+}
+
 thread_local! {
-    /// shown notifications, oldest first (Map insertion order)
-    static SHOWN: RefCell<Vec<Notification>> = const { RefCell::new(Vec::new()) };
-    static LIST: State<Vec<Notification>> = State::new(vec![]);
     /// the shortest usable output height: the cards scroll past it instead of outgrowing the output
     static MAX_HEIGHT: Cell<f32> = const { Cell::new(f32::MAX) };
+    /// workspaces or outputs changed since MAX_HEIGHT was read
+    static HEIGHT_STALE: Cell<bool> = const { Cell::new(true) };
     /// a foot notification was activated; foot marks its window urgent in response
     static AWAIT_URGENT: Cell<bool> = const { Cell::new(false) };
 }
@@ -38,16 +41,17 @@ fn hidden(n: &Notification) -> bool {
     !n.local && (streaming_mode().peek() || focus())
 }
 
+/// One arriving while hidden (streaming, focusing) is kept by notifd and shows once that ends.
 fn refresh() {
-    let list: Vec<Notification> = SHOWN.with(|s| s.borrow().iter().rev().filter(|n| !hidden(n)).take(MAX_SHOWN).cloned().collect());
-    if !list.is_empty() {
+    let list = notifd::newest(|n| !hidden(n), MAX_SHOWN);
+    if !list.is_empty() && HEIGHT_STALE.with(|s| s.replace(false)) {
         // usable area (bars excluded) of the visible workspaces
         let h = sway::workspaces().and_then(|ws| {
             ws.arr().iter().filter(|w| w.get("visible").bool() == Some(true)).filter_map(|w| w.get("rect").get("height").int()).min()
         });
         MAX_HEIGHT.with(|m| m.set(h.map_or(f32::MAX, |h| (h as f32 - SPACE_L).max(0.0))));
     }
-    LIST.with(|l| l.set(list));
+    shown().set(list);
 }
 
 /// `text` with runs of line breaks (and blank lines) collapsed into one.
@@ -92,18 +96,15 @@ fn item(base: &Style, n: &Notification) -> Node {
 pub fn notifications() {
     let w = Win::new(Spec { name: "notifications", anchor: Anchor::Top | Anchor::Right, layer: Layer::Top, per_monitor: true, ..Default::default() }, |_| {
         let base = window();
-        let list = LIST.with(|l| l.peek());
+        let list = shown().peek();
         let cards = Node::vbox(base.inherit(), 0.0, list.iter().map(|n| item(&base, n)).collect());
         let max = MAX_HEIGHT.with(Cell::get);
         Node::vbox(Style { padding: Sides::trbl(0.0, 0.0, SPACE_L, 0.0), ..base.inherit() }, 0.0, vec![Node::scroll(base.inherit(), max, None, cards)]).size(200.0, 0.0)
     });
-    let ww = w.clone();
-    LIST.with(|l| {
-        let l2 = l.clone();
-        l.subscribe(move || {
-            ww.set_visible(!l2.with(Vec::is_empty));
-            ww.redraw();
-        })
+    let ww = w;
+    shown().subscribe(move || {
+        ww.set_visible(!shown().with(Vec::is_empty));
+        ww.redraw();
     });
     sway::subscribe(&["window"], |ev| match ev.get("change").str() {
         Some("urgent") if ev.get("container").get("urgent").bool() == Some(true) && AWAIT_URGENT.with(|a| a.take()) => {
@@ -115,30 +116,17 @@ pub fn notifications() {
         Some("focus") => AWAIT_URGENT.with(|a| a.set(false)),
         _ => {}
     });
-    notifd::on_notified(|id, _| {
+    sway::subscribe(&["workspace", "output"], |_| HEIGHT_STALE.with(|s| s.set(true)));
+    notifd::on_notified(|id| {
         let Some(n) = notifd::get(id) else { return };
         // dropped unseen: expired, not dismissed by the user
         if filtered(&n) {
             return notifd::resolve(id, notifd::Reason::Expired);
         }
-        // one arriving while hidden (streaming, focusing) is kept and shows once that ends
-        SHOWN.with(|s| {
-            let mut s = s.borrow_mut();
-            match s.iter_mut().find(|x| x.id == id) {
-                Some(slot) => *slot = n,
-                None => s.push(n),
-            }
-        });
         refresh();
     });
     notifd::on_resolved(|id, _| {
-        let removed = SHOWN.with(|s| {
-            let mut s = s.borrow_mut();
-            let before = s.len();
-            s.retain(|x| x.id != id);
-            before != s.len()
-        });
-        if removed {
+        if shown().with(|l| l.iter().any(|n| n.id == id)) {
             refresh();
         }
     });
@@ -148,18 +136,13 @@ pub fn notifications() {
 
 /// The oldest card on screen (the list is newest first).
 fn oldest() -> Option<Notification> {
-    LIST.with(|l| l.with(|l| l.last().cloned()))
+    shown().with(|l| l.last().cloned())
 }
 
 pub fn clear_oldest_notification() {
     if let Some(n) = oldest() {
         notifd::dismiss(n.id);
     }
-}
-
-/// Window app ids are plain names; anything else could inject sway criteria.
-fn safe_app_id(app: &str) -> bool {
-    !app.is_empty() && app.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 pub fn invoke_oldest_notification(i: usize) {
@@ -169,7 +152,8 @@ pub fn invoke_oldest_notification(i: usize) {
     let foot = action == "default" && app.starts_with("foot");
     AWAIT_URGENT.with(|a| a.set(foot));
     notifd::invoke(n.id, &action);
-    if action == "default" && !foot && safe_app_id(app) {
+    // window app ids are plain names; anything else could inject sway criteria
+    if action == "default" && !foot && notifd::safe_app_id(app) {
         sway::command(&format!("[app_id=\"{app}\"] focus"));
     }
 }
@@ -179,14 +163,5 @@ mod tests {
     #[test]
     fn line_collapse() {
         assert_eq!(super::collapse_lines("a\n\n\r\n  \nb\r\nc"), "a\nb\nc");
-    }
-
-    #[test]
-    fn app_id_charset() {
-        assert!(super::safe_app_id("org.mozilla.firefox"));
-        assert!(super::safe_app_id("foot_2-x"));
-        assert!(!super::safe_app_id(""));
-        assert!(!super::safe_app_id("x\"] exec rm"));
-        assert!(!super::safe_app_id("a b"));
     }
 }

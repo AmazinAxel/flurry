@@ -1,15 +1,16 @@
-// Fullscreen dimmed dialog windows with key actions (lib/inputControl.tsx).
+// Fullscreen dimmed dialog windows with key actions.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
 
+use crate::lib::wrapFocus::wrap_focus;
 use crate::ui::entry::{Entry, EntryRef};
 use crate::ui::node::{Node, Style};
 use crate::ui::wayland::{Anchor, KeyEvent, Keymode, Layer};
 use crate::ui::runtime;
-use crate::ui::window::{self, Dir, Spec, View, Win};
+use crate::ui::window::{self, Spec, Win};
 
 pub type Action = Rc<dyn Fn()>;
 pub type Actions = Vec<(Keysym, Action)>;
@@ -28,11 +29,14 @@ pub struct Opts {
     pub actions: Actions,
     pub ctrl_actions: Actions,
     pub on_key: Option<Rc<dyn Fn(&KeyEvent) -> bool>>,
-    pub keymode: Option<Keymode>,
-    pub layer: Option<Layer>,
-    /// entry focused (and cleared) on show
+    /// entry focused on show
     pub focus: Option<&'static str>,
+    /// all cleared on show and hide
     pub entries: Vec<EntryBinding>,
+}
+
+fn find(list: &Actions, k: Keysym) -> Option<&Action> {
+    list.iter().find(|(s, _)| *s == k).map(|(_, a)| a)
 }
 
 pub const DIM: [f32; 4] = [0.0, 0.0, 0.0, 0.3];
@@ -90,50 +94,26 @@ pub fn modal(win: &Rc<Win>) {
     });
 }
 
-/// lib/wrapFocus.ts: arrows move focus (with wrap) unless a modifier is held or the focused widget
-/// consumes them (entries own Left/Right and typed letters). hjkl work like arrows outside entries.
-pub fn wrap_focus(win: &Win, ev: &KeyEvent, entry_focused: bool) -> bool {
-    let vim = matches!(ev.sym, Keysym::h | Keysym::j | Keysym::k | Keysym::l);
-    let dir = match ev.sym {
-        Keysym::Up | Keysym::k => Dir::Up,
-        Keysym::Down | Keysym::j => Dir::Down,
-        Keysym::Left | Keysym::h => Dir::Left,
-        Keysym::Right | Keysym::l => Dir::Right,
-        _ => return false,
-    };
-    if win.focused().is_none() || ev.ctrl || ev.alt || ev.shift || (entry_focused && (vim || matches!(dir, Dir::Left | Dir::Right))) {
-        return false;
-    }
-    win.wrap_focus(dir);
-    true
-}
-
-pub fn input_control(name: &'static str, build: impl Fn(&View) -> Node + 'static, opts: Opts) -> Rc<Win> {
-    let spec = Spec {
-        name,
-        layer: opts.layer.unwrap_or(Layer::Overlay),
-        anchor: Anchor::all(),
-        keymode: opts.keymode.unwrap_or(Keymode::Exclusive),
-        ..Default::default()
-    };
+pub fn input_control(name: &'static str, build: impl Fn(Option<&str>) -> Node + 'static, opts: Opts) -> Rc<Win> {
+    let spec = Spec { name, layer: Layer::Overlay, anchor: Anchor::all(), keymode: Keymode::Exclusive, ..Default::default() };
     let win = Win::new(spec, build);
     modal(&win);
     let opts = Rc::new(opts);
+    let clear = |o: &Opts| {
+        for b in &o.entries {
+            b.entry.borrow_mut().set_text("");
+        }
+    };
 
     let o = opts.clone();
     let weak = Rc::downgrade(&win);
     win.on_show(move || {
+        clear(&o);
         if let Some(f) = &o.on_show {
             f();
         }
         let Some(w) = weak.upgrade() else { return };
-        *w.focus.borrow_mut() = None;
-        if let Some(id) = o.focus
-            && let Some(b) = o.entries.iter().find(|b| b.id == id)
-        {
-            b.entry.borrow_mut().set_text("");
-            *w.focus.borrow_mut() = Some(id.to_string());
-        }
+        *w.focus.borrow_mut() = o.focus.filter(|id| o.entries.iter().any(|b| b.id == *id)).map(String::from);
     });
 
     // typed text (a password, say) doesn't outlive the dialog
@@ -141,69 +121,58 @@ pub fn input_control(name: &'static str, build: impl Fn(&View) -> Node + 'static
     let weak = Rc::downgrade(&win);
     win.visibility.subscribe(move || {
         if weak.upgrade().is_some_and(|w| !w.visible()) {
-            for b in o.entries.iter().filter(|b| Some(b.id) == o.focus) {
-                b.entry.borrow_mut().set_text("");
-            }
+            clear(&o);
         }
     });
 
-    let o = opts.clone();
+    let o = opts;
     let weak = Rc::downgrade(&win);
     win.on_key(move |ev| {
-        let Some(w) = weak.upgrade() else { return false };
+        let Some(w) = weak.upgrade() else { return };
         if ev.sym == Keysym::Escape {
-            window::toggle(name);
-            return true;
+            return window::toggle(name);
         }
-        let lower = ev.lower();
-        let find = |list: &Actions| list.iter().find(|(k, _)| *k == lower).map(|(_, a)| a.clone());
         let action = if ev.alt {
             None
         } else if ev.ctrl {
-            find(&o.ctrl_actions)
+            find(&o.ctrl_actions, ev.lower())
         } else {
-            find(&o.actions)
+            find(&o.actions, ev.lower())
         };
         if let Some(a) = action {
             a();
-            w.redraw();
-            return true;
+            return w.redraw();
         }
         if let Some(f) = &o.on_key
             && f(ev)
         {
-            w.redraw();
-            return true;
+            return w.redraw();
         }
         let focused = w.focused();
         let entry = o.entries.iter().find(|b| Some(b.id) == focused.as_deref());
         if wrap_focus(&w, ev, entry.is_some()) {
-            return true;
+            return;
         }
         if let Some(b) = entry {
             if let Some(f) = &b.on_key
                 && f(ev)
             {
-                w.redraw();
-                return true;
+                return w.redraw();
             }
             if matches!(ev.sym, Keysym::Return | Keysym::KP_Enter) {
                 if let Some(a) = &b.on_activate {
                     a();
                 }
-                w.redraw();
-                return true;
+                return w.redraw();
             }
             if Entry::key(&b.entry, ev) {
-                w.redraw();
-                return true;
+                return w.redraw();
             }
         }
         // GTK default focus chain: Tab / Shift+Tab
         if matches!(ev.sym, Keysym::Tab | Keysym::ISO_Left_Tab) && !ev.ctrl && !ev.alt {
-            return w.focus_step(!ev.shift && ev.sym == Keysym::Tab);
+            w.focus_step(!ev.shift && ev.sym == Keysym::Tab);
         }
-        false
     });
     win
 }

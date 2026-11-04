@@ -1,10 +1,11 @@
 // PipeWire sinks (the subset flurry uses): sink list, default sink, cubic volume + mute
 // with WirePlumber mixer semantics (device Route when the node has one, else node Props), links.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io::Cursor;
-use std::os::fd::AsRawFd;
+use std::fs::File;
+use std::io::{Cursor, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
 use pipewire as pw;
@@ -12,8 +13,8 @@ use pw::spa;
 use spa::pod::serialize::PodSerializer;
 use spa::pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray, deserialize::PodDeserializer};
 
-use crate::lib::state::State;
 use crate::ui::runtime;
+use crate::ui::state::global_state;
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Sink {
@@ -63,9 +64,7 @@ impl Sink {
             self.mute = m;
         }
     }
-}
 
-impl Sink {
     pub fn volume_icon(&self) -> &'static str {
         if self.mute || self.volume == 0.0 {
             "audio-volume-muted-symbolic"
@@ -81,7 +80,7 @@ impl Sink {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Route {
     index: i32,
     device: i32,
@@ -90,7 +89,6 @@ struct Route {
 struct PortInfo {
     node: u32,
     output: bool,
-    monitor: bool,
     channel: String,
 }
 
@@ -110,32 +108,28 @@ struct Pw {
     core: pw::core::Core,
     _context: pw::context::Context,
     _main: pw::main_loop::MainLoop,
+    /// sink ports and sink-to-sink links only: all `link` needs
     ports: HashMap<u32, PortInfo>,
     links: HashMap<u32, (u32, u32)>, // id -> (output node, input node)
 }
 
 thread_local! {
     static PW: RefCell<Option<Pw>> = const { RefCell::new(None) };
-    static SINKS: State<Vec<Sink>> = State::new(vec![]);
-    static DEFAULT: State<Option<String>> = State::new(None);
-    static READY: State<bool> = State::new(false);
     /// Route reads in flight: (core sync sequence, sink), answered after the device's params
     static ROUTE_READS: RefCell<Vec<(spa::utils::result::AsyncSeq, u32)>> = const { RefCell::new(Vec::new()) };
+    /// a reconnect is queued: one per lost connection, however many errors it reports
+    static RECONNECT: Cell<bool> = const { Cell::new(false) };
 }
 
-pub fn speakers() -> State<Vec<Sink>> {
-    SINKS.with(Clone::clone)
-}
-pub fn default_name() -> State<Option<String>> {
-    DEFAULT.with(Clone::clone)
-}
-pub fn ready() -> State<bool> {
-    READY.with(Clone::clone)
+global_state! {
+    pub fn speakers() -> Vec<Sink> = vec![];
+    pub fn default_name() -> Option<String> = None;
+    pub fn ready() -> bool = false;
 }
 
 pub fn default_speaker() -> Option<Sink> {
     let name = default_name().peek()?;
-    speakers().peek().into_iter().find(|s| s.name == name)
+    speakers().with(|l| l.iter().find(|s| s.name == name).cloned())
 }
 
 fn with<R>(f: impl FnOnce(&mut Pw) -> R) -> Option<R> {
@@ -145,18 +139,69 @@ fn with<R>(f: impl FnOnce(&mut Pw) -> R) -> Option<R> {
 
 fn update_sink(id: u32, f: impl FnOnce(&mut Sink)) {
     speakers().update(|list| {
-        if let Some(s) = list.iter_mut().find(|s| s.id == id) {
+        list.iter_mut().find(|s| s.id == id).is_some_and(|s| {
+            let old = s.clone();
             f(s);
+            *s != old
+        })
+    });
+}
+
+/// Connects to PipeWire, or waits for its socket to appear and connects then.
+pub fn start() {
+    pw::init();
+    if !connect() {
+        eprintln!("flurry: pipewire: can't connect, waiting for its socket");
+        wait_for_socket();
+    }
+}
+
+/// inotify on the runtime dir until the socket is (re)created: a restarted PipeWire that isn't
+/// socket-activated binds a fresh one.
+fn wait_for_socket() {
+    let Some(dir) = crate::lib::xdg::runtime_dir() else { return };
+    let name = std::env::var("PIPEWIRE_REMOTE").ok().filter(|r| !r.is_empty() && !r.contains('/')).unwrap_or_else(|| "pipewire-0".into());
+    let Ok(cdir) = std::ffi::CString::new(dir) else { return };
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if fd < 0 {
+        return;
+    }
+    let ino = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if unsafe { libc::inotify_add_watch(fd, cdir.as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO) } < 0 {
+        return;
+    }
+    // created between the failed connect and the watch
+    if connect() {
+        return;
+    }
+    runtime::watch(fd, move || {
+        let mut buf = [0u8; 4096];
+        let mut hit = false;
+        while let Ok(n @ 1..) = (&ino).read(&mut buf) {
+            hit |= inotify_names(&buf[..n]).any(|n| n == name.as_bytes());
+        }
+        if hit && connect() {
+            runtime::unwatch(fd);
         }
     });
 }
 
-pub fn start() {
-    pw::init();
-    let Ok(main) = pw::main_loop::MainLoop::new(None) else { return };
-    let Ok(context) = pw::context::Context::new(&main) else { return };
-    let Ok(core) = context.connect(None) else { return };
-    let Ok(registry) = core.get_registry() else { return };
+/// The names in a buffer of inotify events.
+fn inotify_names(mut buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+    const HEAD: usize = size_of::<libc::inotify_event>();
+    std::iter::from_fn(move || {
+        let len = u32::from_ne_bytes(buf.get(HEAD - 4..HEAD)?.try_into().ok()?) as usize;
+        let name = buf.get(HEAD..HEAD + len)?;
+        buf = &buf[HEAD + len..];
+        Some(name.split(|&b| b == 0).next().unwrap_or_default())
+    })
+}
+
+fn connect() -> bool {
+    let Ok(main) = pw::main_loop::MainLoop::new(None) else { return false };
+    let Ok(context) = pw::context::Context::new(&main) else { return false };
+    let Ok(core) = context.connect(None) else { return false };
+    let Ok(registry) = core.get_registry() else { return false };
     let registry = Rc::new(registry);
     let fd = main.loop_().fd().as_raw_fd();
 
@@ -173,23 +218,18 @@ pub fn start() {
                 }
                 pw::types::ObjectType::Device if get("media.class").as_deref() == Some("Audio/Device") => bind_device(&reg, g),
                 pw::types::ObjectType::Metadata if get("metadata.name").as_deref() == Some("default") => bind_metadata(&reg, g),
+                // a node is announced before its ports and links
                 pw::types::ObjectType::Port => {
-                    let node = get("node.id").and_then(|v| v.parse().ok());
-                    if let Some(node) = node {
-                        let info = PortInfo {
-                            node,
-                            output: get("port.direction").as_deref() == Some("out"),
-                            monitor: get("port.monitor").as_deref() == Some("true"),
-                            channel: get("audio.channel").unwrap_or_default(),
-                        };
-                        with(|p| p.ports.insert(g.id, info));
+                    if let Some(node) = get("node.id").and_then(|v| v.parse().ok()) {
+                        let info = PortInfo { node, output: get("port.direction").as_deref() == Some("out"), channel: get("audio.channel").unwrap_or_default() };
+                        with(|p| p.nodes.contains_key(&node).then(|| p.ports.insert(g.id, info)));
                     }
                 }
                 pw::types::ObjectType::Link => {
                     let out = get("link.output.node").and_then(|v| v.parse().ok());
                     let inp = get("link.input.node").and_then(|v| v.parse().ok());
                     if let (Some(o), Some(i)) = (out, inp) {
-                        with(|p| p.links.insert(g.id, (o, i)));
+                        with(|p| (p.nodes.contains_key(&o) && p.nodes.contains_key(&i)).then(|| p.links.insert(g.id, (o, i))));
                     }
                 }
                 _ => {}
@@ -202,14 +242,17 @@ pub fn start() {
                 p.ports.remove(&id);
                 p.links.remove(&id);
             });
-            speakers().update(|l| l.retain(|s| s.id != id));
+            speakers().update(|l| {
+                let n = l.len();
+                l.retain(|s| s.id != id);
+                l.len() != n
+            });
         })
         .register();
 
     // initial sync done: everything known so far has been announced
-    let done_core = core.clone();
     let pending = core.sync(0).ok();
-    let core_listener = done_core
+    let core_listener = core
         .add_listener_local()
         .done(move |_, seq| {
             if Some(seq) == pending {
@@ -226,8 +269,9 @@ pub fn start() {
         })
         .error(move |id, _, res, _| {
             // core connection lost (pipewire restarted): drop everything and reconnect
-            if id == 0 && res == -libc::EPIPE {
+            if id == 0 && res == -libc::EPIPE && !RECONNECT.replace(true) {
                 runtime::idle(|| {
+                    RECONNECT.set(false);
                     let fd = PW.with(|p| p.borrow_mut().take().map(|p| p._main.loop_().fd().as_raw_fd()));
                     if let Some(fd) = fd {
                         runtime::unwatch(fd);
@@ -236,12 +280,13 @@ pub fn start() {
                     speakers().set(vec![]);
                     default_name().set(None);
                     ready().set(false);
-                    runtime::timeout(1000, start);
+                    start();
                 });
             }
         })
         .register();
 
+    let main_loop = main.clone();
     PW.with(|p| {
         *p.borrow_mut() = Some(Pw {
             _core_listener: core_listener,
@@ -259,12 +304,10 @@ pub fn start() {
         })
     });
     // the loop is dispatched without holding PW: its callbacks (registry, params) borrow PW themselves
-    let main_loop = PW.with(|p| p.borrow().as_ref().map(|p| p._main.clone()));
-    if let Some(main_loop) = main_loop {
-        runtime::watch(fd, move || {
-            main_loop.loop_().iterate(std::time::Duration::ZERO);
-        });
-    }
+    runtime::watch(fd, move || {
+        main_loop.loop_().iterate(std::time::Duration::ZERO);
+    });
+    true
 }
 
 fn bind_node(reg: &pw::registry::Registry, g: &Global, get: &dyn Fn(&str) -> Option<String>) {
@@ -295,11 +338,10 @@ fn bind_node(reg: &pw::registry::Registry, g: &Global, get: &dyn Fn(&str) -> Opt
             let unread = speakers().with(|l| l.iter().any(|s| s.id == id && !s.known));
             if let (Some(dev), Some(_), true) = (device, pd, unread) {
                 with(|p| {
-                    if let Some((_, d, _)) = p.devices.get(&dev) {
-                        d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
-                        if let Ok(seq) = p.core.sync(0) {
-                            ROUTE_READS.with(|r| r.borrow_mut().push((seq, id)));
-                        }
+                    if read_routes(p, dev)
+                        && let Ok(seq) = p.core.sync(0)
+                    {
+                        ROUTE_READS.with(|r| r.borrow_mut().push((seq, id)));
                     }
                 });
             }
@@ -313,21 +355,28 @@ fn bind_node(reg: &pw::registry::Registry, g: &Global, get: &dyn Fn(&str) -> Opt
                 // it changes (only at subscribe): the node's Props change is the cue to re-read it
                 let device = speakers().with(|l| l.iter().find(|s| s.id == id && s.profile_device.is_some()).and_then(|s| s.device));
                 if let Some(dev) = device {
-                    with(|p| {
-                        if let Some((_, d, _)) = p.devices.get(&dev) {
-                            d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
-                        }
-                    });
+                    with(|p| read_routes(p, dev));
                 }
             }
         })
         .register();
     node.subscribe_params(&[spa::param::ParamType::Props]);
     speakers().update(|l| {
+        if l.last() == Some(&sink) {
+            return false;
+        }
         l.retain(|s| s.id != id);
         l.push(sink);
+        true
     });
     with(|p| p.nodes.insert(id, (listener, node)));
+}
+
+/// Asks device `dev` for its Routes (answered through its param listener); false if it isn't bound.
+fn read_routes(p: &Pw, dev: u32) -> bool {
+    let Some((_, d, _)) = p.devices.get(&dev) else { return false };
+    d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
+    true
 }
 
 fn bind_device(reg: &pw::registry::Registry, g: &Global) {
@@ -362,9 +411,13 @@ fn bind_device(reg: &pw::registry::Registry, g: &Global) {
                 }
             });
             speakers().update(|list| {
+                let mut changed = false;
                 for s in list.iter_mut().filter(|s| s.device == Some(id) && s.profile_device == Some(device)) {
+                    let old = s.clone();
                     s.set_route_props(channels.clone(), mute);
+                    changed |= *s != old;
                 }
+                changed
             });
         })
         .register();
@@ -424,7 +477,7 @@ fn apply(sink: &Sink, channels: Option<Vec<f32>>, mute: Option<bool>) {
     let props = props_object(channels, mute);
     with(|p| {
         let route = sink.device.zip(sink.profile_device).and_then(|(dev, pd)| {
-            p.devices.get(&dev).and_then(|(_, d, routes)| routes.iter().find(|r| r.device == pd).map(|r| (d, r.clone())))
+            p.devices.get(&dev).and_then(|(_, d, routes)| routes.iter().find(|r| r.device == pd).map(|r| (d, *r)))
         });
         if let Some((dev, r)) = route {
             let obj = Object {
@@ -454,7 +507,7 @@ fn apply(sink: &Sink, channels: Option<Vec<f32>>, mute: Option<bool>) {
 pub fn set_volume(sink: &Sink, volume: f64) {
     let v = volume.clamp(0.0, 1.5);
     let channels: Vec<f32> = if sink.channels.is_empty() {
-        vec![(v.powi(3)) as f32; 2]
+        vec![v.powi(3) as f32; 2]
     } else {
         sink.channels
             .iter()
@@ -467,10 +520,9 @@ pub fn set_volume(sink: &Sink, volume: f64) {
     };
     // channels too: a drag sends many steps before PipeWire echoes back, and scaling stale channels
     // by a fresh volume shrank every step (dragging to max landed at a fraction)
-    let c = channels.clone();
     update_sink(sink.id, |s| {
         s.volume = v;
-        s.channels = c;
+        s.channels = channels.clone();
     });
     apply(sink, Some(channels), None);
 }
@@ -504,7 +556,7 @@ pub fn link(output: &str, input: &str, connect: bool) {
             return;
         }
         let outs: Vec<(u32, String)> = p.ports.iter().filter(|(_, x)| x.node == o && x.output).map(|(id, x)| (*id, x.channel.clone())).collect();
-        let ins: Vec<(u32, String)> = p.ports.iter().filter(|(_, x)| x.node == i && !x.output && !x.monitor).map(|(id, x)| (*id, x.channel.clone())).collect();
+        let ins: Vec<(u32, String)> = p.ports.iter().filter(|(_, x)| x.node == i && !x.output).map(|(id, x)| (*id, x.channel.clone())).collect();
         for (op, ch) in &outs {
             let Some((ip, _)) = ins.iter().find(|(_, c)| c == ch) else { continue };
             let props = pw::properties::properties! {

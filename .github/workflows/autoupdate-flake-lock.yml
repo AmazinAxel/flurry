@@ -37,34 +37,11 @@ jobs:
   test:
     needs: update-flake-lock
     if: ${{ needs.update-flake-lock.outputs.pr != '' }}
-    runs-on: ubuntu-latest
     permissions:
       contents: read
-    outputs:
-      sha: ${{ steps.head.outputs.sha }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: refs/pull/${{ needs.update-flake-lock.outputs.pr }}/head
-          persist-credentials: false
-
-      - name: Head
-        id: head
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Install Nix
-        uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
-
-      - name: Lint
-        run: nix develop -c cargo clippy --all-targets -- -D warnings
-
-      - name: Test
-        run: nix develop -c cargo test
-
-      - name: Package
-        run: nix build .#checks.x86_64-linux.package
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: refs/pull/${{ needs.update-flake-lock.outputs.pr }}/head
 
   # only a lock that still builds gets merged, and only the commit that was tested
   merge:

@@ -23,9 +23,9 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   // stretchy arrows: turn each into an <img> of the same box, filled with the text color
   function svgToImg(html) {
     return html.replace(/<svg([^>]*)>([\s\S]*?)<\/svg>/g, function (_, attrs, body) {
-      // a standalone SVG document needs its namespace
+      // KaTeX's attrs carry the namespace a standalone SVG document needs
       // its size is set once laid out (sharpen): a standalone SVG of em units rasterizes at 16px/em, 1x
-      var svg = '<svg xmlns="http://www.w3.org/2000/svg"' + attrs.replace(/style="[^"]*"/, '').replace(/ (width|height)="[^"]*"/g, '') + ' fill="#eceff4">' + body + '</svg>';
+      var svg = '<svg' + attrs.replace(/style="[^"]*"/, '').replace(/ (width|height)="[^"]*"/g, '') + ' fill="#eceff4">' + body + '</svg>';
       // the box is katex.css's `.katex svg`; the SVG gets exactly that size in device pixels once
       // laid out, so its own preserveAspectRatio applies and it rasterizes sharp
       var h = /height="([^"]*)"/.exec(attrs);
@@ -45,8 +45,6 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   }
   function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   marked.use({
-    gfm: true,
-    breaks: false,
     renderer: { html: function (t) { return esc(typeof t === 'string' ? t : t.text); } },
     extensions: [
       { name: 'mathBlock', level: 'block',
@@ -87,6 +85,14 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
         li.insertBefore(m, li.firstChild);
       });
     });
+    // a link's text can't pass for another site: the host it opens follows it
+    root.querySelectorAll('a[href]').forEach(function (a) {
+      var u;
+      try { u = new URL(a.getAttribute('href')); } catch (e) { return; }
+      if (!/^https?:$/.test(u.protocol) || a.textContent.trim() === a.getAttribute('href')) return;
+      var h = document.createElement('span'); h.className = 'host'; h.textContent = ' (' + u.host + ')';
+      a.parentNode.insertBefore(h, a.nextSibling);
+    });
   }
 
   // the reply's markdown, rendered again only from the first block that changed (while streaming,
@@ -97,8 +103,7 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
     blocks.splice(k).forEach(function (b) { b.nodes.forEach(function (n) { reply.removeChild(n); }); });
     var tmp = document.createElement('div'), added = [];
     for (var i = k; i < tokens.length; i++) {
-      var one = [tokens[i]]; one.links = tokens.links;
-      tmp.innerHTML = marked.parser(one); markers(tmp);
+      tmp.innerHTML = marked.parser([tokens[i]]); markers(tmp);
       var nodes = Array.prototype.slice.call(tmp.childNodes);
       nodes.forEach(function (n) { reply.appendChild(n); if (n.querySelectorAll) added.push(n); });
       blocks.push({ raw: tokens[i].raw, nodes: nodes });
@@ -189,7 +194,7 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
     } else if (ev.type === 'result') {
       finish(ev.is_error ? String(ev.result || (ev.errors || []).join('; ') || ev.subtype || 'error') : '');
     } else if (ev.type === 'exit') {
-      finish('');
+      finish(String(ev.error || 'Claude Code exited without a reply'));
     }
   }
 

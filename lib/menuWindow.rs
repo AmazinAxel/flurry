@@ -1,12 +1,12 @@
-// Centered modal hosting the open status menu: quickstatus, bluetooth, wifi or calendar (lib/asideStatusWindow.tsx).
+// Centered modal hosting the open status menu: quickstatus, bluetooth, wifi or calendar.
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::menuState::{close_menu, current};
-use crate::lib::inputControl::{modal, wrap_focus};
+use crate::lib::inputControl::modal;
+use crate::lib::wrapFocus::wrap_focus;
 use crate::lib::backgroundSection::background_section;
 use crate::lib::style::*;
 use crate::ui::node::{Node, Sides, Style};
@@ -14,13 +14,11 @@ use crate::ui::wayland::{Anchor, Keymode, PointerEvent};
 use crate::ui::window::{Spec, Win};
 use crate::lib::{audio, mediaPlayer};
 use crate::lib::scrollStep::scroll_step;
-use crate::lib::state::State;
-use crate::widgets::status::quicksettings::quicksettings::{self as qs, set_slider, slider_value};
+use crate::ui::state::State;
+use crate::widgets::status::quicksettings::quicksettings as qs;
 use crate::widgets::status::status::quickstatus;
 use crate::widgets::status::{bluetooth, calendar, network};
 
-/// Card width, the same as the launcher/clipboard cards.
-pub const MENU_WIDTH: f32 = 500.0;
 /// Spacing unit inside the cards; also the wallpaper's inner padding.
 pub const GAP: f32 = SPACE_L;
 
@@ -56,13 +54,13 @@ pub fn watch_in<T: Clone + PartialEq + 'static>(w: &Rc<Win>, state: &State<T>, m
 
 pub fn menu_window() -> Rc<Win> {
     let spec = Spec { name: "menu", anchor: Anchor::all(), keymode: Keymode::Exclusive, ..Default::default() };
-    let w = Win::new(spec, |v| {
+    let w = Win::new(spec, |focus| {
         let base = window();
         let Some(name) = current().peek() else { return Node::hbox(base, 0.0, vec![]) };
-        let (top, rest) = content(&base, name, v.focus.as_deref());
+        let (top, rest) = content(&base, name, focus);
         let top = Node::hbox(Style { padding: Sides::all(GAP), ..base.inherit() }, 0.0, vec![top]).expand(true, false).id("card");
         // same box as the launcher/clipboard/pass cards, so the same top edge
-        background_section(&base, top, rest.map(|r| r.id("cardRest")), 700.0, MENU_WIDTH)
+        background_section(&base, top, rest.map(|r| r.id("cardRest")), CARD_HEIGHT, CARD_WIDTH)
     });
 
     modal(&w);
@@ -105,32 +103,31 @@ pub fn menu_window() -> Rc<Win> {
     watch_in(&w, &mediaPlayer::playlist_index(), STATUS);
     watch_in(&w, &crate::lib::battery::battery(), STATUS);
     watch_in(&w, &crate::lib::streamingMode::streaming_mode(), &["status", "wifi"]);
-    watch_in(&w, &crate::widgets::status::modules::statusIcons::network_icon(), STATUS);
+    watch_in(&w, &crate::lib::iwd::state(), STATUS);
     watch_in(&w, &crate::widgets::status::modules::mpris::track(), STATUS);
     watch_in(&w, &crate::widgets::record::service::is_rec(), STATUS);
     network::watch(&w);
 
     let ww = Rc::downgrade(&w);
     w.on_key(move |ev| {
-        let Some(w) = ww.upgrade() else { return false };
+        let Some(w) = ww.upgrade() else { return };
         let focus = w.focused().unwrap_or_default();
-        let done = |w: &Win| {
-            w.redraw();
-            true
-        };
         if network::key(&focus, ev) {
-            return done(&w);
+            return w.redraw();
         }
+        // hiding forgets the open menu, and also closes one opened with no menu (`flurry toggle menu`)
         if ev.sym == Keysym::Escape {
-            close_menu();
-            return true;
+            return w.set_visible(false);
         }
         let name = current().peek().unwrap_or("");
         if name == "calendar" && calendar::key(ev) {
-            return done(&w);
+            return w.redraw();
         }
         if name == "bluetooth" && bluetooth::key(&focus, ev) {
-            return done(&w);
+            return w.redraw();
+        }
+        if name == "status" && !ev.shift && !ev.ctrl && !ev.alt && qs::key(&focus, ev) {
+            return w.redraw();
         }
         if matches!(ev.sym, Keysym::Return | Keysym::KP_Enter | Keysym::space) {
             match name {
@@ -147,7 +144,7 @@ pub fn menu_window() -> Rc<Win> {
                 }
                 _ => {}
             }
-            return done(&w);
+            return w.redraw();
         }
         let tab = matches!(ev.sym, Keysym::Tab | Keysym::ISO_Left_Tab) && !ev.ctrl && !ev.alt;
         if wrap_focus(&w, ev, false) || (tab && w.focus_step(!ev.shift && ev.sym == Keysym::Tab)) {
@@ -155,47 +152,26 @@ pub fn menu_window() -> Rc<Win> {
                 bluetooth::on_focus(&f);
                 network::on_focus(&f);
             }
-            return done(&w);
+            w.redraw();
         }
-        false
     });
 
     let ww = Rc::downgrade(&w);
-    // the slider being dragged
-    let drag: Cell<Option<&'static str>> = Cell::new(None);
-    w.on_pointer(move |ev, _| {
+    // quickstatus: the media block scrolls mpd's volume, the rest of the card the speaker's
+    w.on_pointer(move |ev| {
         let Some(w) = ww.upgrade() else { return };
-        let contains = |r: &tiny_skia::Rect, x: f64, y: f64| (x as f32) >= r.left() && (x as f32) < r.right() && (y as f32) >= r.top() && (y as f32) < r.bottom();
-        let inside = |id: &str, x: f64, y: f64| w.rect_of(id).is_some_and(|r| contains(&r, x, y));
-        let hit = |x: f64, y: f64| ["volume", "brightness"].into_iter().find_map(|id| w.rect_of(id).filter(|r| contains(r, x, y)).map(|r| (id, r)));
-        match ev {
-            PointerEvent::Button { x, y, pressed: true } => {
-                if inside("mediaBtn", x, y) {
-                    mediaPlayer::play_pause();
-                } else if let Some((id, r)) = hit(x, y) {
-                    drag.set(Some(id));
-                    set_slider(id, slider_value(r, x as f32));
-                }
-            }
-            PointerEvent::Button { pressed: false, .. } | PointerEvent::Leave => drag.set(None),
-            PointerEvent::Motion { x, .. } => {
-                if let Some(id) = drag.get()
-                    && let Some(r) = w.rect_of(id)
-                {
-                    set_slider(id, slider_value(r, x as f32));
-                }
-            }
-            // quickstatus: the media block scrolls mpd's volume, the rest of the card the speaker's
-            PointerEvent::Scroll { x, y, dy, wheel } if current().peek() == Some("status") => {
-                if inside("media", x, y) {
-                    mediaPlayer::media_scroll(dy, wheel);
-                } else if (inside("card", x, y) || inside("cardRest", x, y))
-                    && let Some(s) = audio::default_speaker()
-                {
-                    audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.006));
-                }
-            }
-            _ => {}
+        let PointerEvent::Scroll { x, y, dy, wheel } = ev;
+        if current().peek() != Some("status") {
+            return;
+        }
+        let (x, y) = (x as f32, y as f32);
+        let inside = |id: &str| w.rect_of(id).is_some_and(|r| x >= r.left() && x < r.right() && y >= r.top() && y < r.bottom());
+        if inside("media") {
+            mediaPlayer::media_scroll(dy, wheel);
+        } else if (inside("card") || inside("cardRest"))
+            && let Some(s) = audio::default_speaker()
+        {
+            audio::set_volume(&s, s.volume - scroll_step(dy, wheel, 0.05, 0.006));
         }
     });
     w

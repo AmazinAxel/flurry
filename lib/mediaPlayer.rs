@@ -1,49 +1,45 @@
-// MPD client and playlist control (lib/mediaPlayer.tsx).
+// MPD client and playlist control.
 
-use std::cell::{Cell, RefCell};
-use std::fs::File;
-use std::io::{Read, Write};
+use std::cell::Cell;
+use std::future::Future;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::lib::state::State;
 use crate::settings::{MPD_CROSSFADE, PLAYLISTS};
 use crate::ui::runtime;
+use crate::ui::state::global_state;
 
 thread_local! {
-    static PLAYING: State<bool> = State::new(false);
-    static INDEX: State<usize> = State::new(0);
-    static SOCK: RefCell<Option<Conn>> = const { RefCell::new(None) };
+    static SOCK: Cell<Option<Conn>> = const { Cell::new(None) };
     static QUEUE_LOCK: Rc<runtime::Queue> = Rc::default();
     static STARTED: Cell<bool> = const { Cell::new(false) };
     static SCROLL: Cell<f64> = const { Cell::new(0.0) };
-    static SONG: State<(String, String)> = State::new(Default::default());
     static WATCHING: Cell<bool> = const { Cell::new(false) };
 }
 
-pub fn is_playing() -> State<bool> {
-    PLAYING.with(Clone::clone)
-}
-pub fn playlist_index() -> State<usize> {
-    INDEX.with(Clone::clone)
+global_state! {
+    pub fn is_playing() -> bool = false;
+    pub fn playlist_index() -> usize = 0;
+    /// Current mpd song as (title, artist).
+    pub fn song() -> (String, String) = Default::default();
 }
 /// Current playlist as (name, style color name); None when no playlists are configured.
 pub fn playlist() -> Option<(&'static str, &'static str)> {
     PLAYLISTS.get(playlist_index().peek()).copied()
 }
-/// Current mpd song as (title, artist).
-pub fn song() -> State<(String, String)> {
-    SONG.with(Clone::clone)
-}
 
 struct Conn {
-    /// the TCP or unix socket; File only for its Read/Write on the fd
-    s: File,
+    /// the TCP or unix socket; UnixStream only for its Read/Write on the fd
+    s: UnixStream,
     buf: Vec<u8>,
 }
+
+/// None: the connection broke; Err: mpd answered ACK.
+type Reply = Option<Result<Vec<String>, String>>;
 
 /// MPD_HOST: `[password@]host`, host being a name, an IPv6 address (bracketed or not), a socket path
 /// or `@name` (abstract socket).
@@ -59,8 +55,30 @@ fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+fn field<'a>(lines: &'a [String], k: &str) -> &'a str {
+    lines.iter().find_map(|l| l.strip_prefix(k)).unwrap_or_default()
+}
+
+fn list(cmds: &[String]) -> String {
+    format!("command_list_begin\n{}\ncommand_list_end", cmds.join("\n"))
+}
+
+/// A remote host that vanishes never closes the socket: keepalive and a user timeout turn that into
+/// a read error after ~25s instead of a reply awaited forever.
+fn keepalive(s: &TcpStream) {
+    let fd = s.as_raw_fd();
+    let set = |level, opt, v: libc::c_int| unsafe {
+        libc::setsockopt(fd, level, opt, (&raw const v).cast(), size_of::<libc::c_int>() as libc::socklen_t);
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 10);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+    set(libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 25_000);
+}
+
 /// Connects on a thread (DNS and connect may block); returns the socket and the password if any.
-async fn open() -> Option<(File, Option<String>)> {
+async fn open() -> Option<(OwnedFd, Option<String>)> {
     let env = std::env::var("MPD_HOST").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "127.0.0.1".into());
     let port = std::env::var("MPD_PORT").ok().and_then(|p| p.parse::<u16>().ok()).filter(|p| *p != 0).unwrap_or(6600);
     runtime::blocking(move || {
@@ -73,160 +91,161 @@ async fn open() -> Option<(File, Option<String>)> {
         } else {
             let addr = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
             let s = addr.to_socket_addrs().ok()?.find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())?;
+            keepalive(&s);
             s.into()
         };
-        Some((File::from(fd), pw.map(String::from)))
+        Some((fd, pw.map(String::from)))
     })
     .await
     .flatten()
 }
 
-async fn read_line(c: &Rc<RefCell<Option<Conn>>>) -> Option<String> {
+async fn read_line(c: &mut Conn) -> Option<String> {
     loop {
-        {
-            let mut g = c.borrow_mut();
-            let conn = g.as_mut()?;
-            if let Some(i) = conn.buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = conn.buf.drain(..=i).collect();
-                return Some(String::from_utf8_lossy(&line[..i]).into_owned());
-            }
-            let mut chunk = [0u8; 4096];
-            match conn.s.read(&mut chunk) {
-                Ok(0) => return None,
-                Ok(n) => {
-                    conn.buf.extend_from_slice(&chunk[..n]);
-                    continue;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return None,
-            }
+        if let Some(i) = c.buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&c.buf[..i]).into_owned();
+            c.buf.drain(..=i);
+            return Some(line);
         }
-        let fd = c.borrow().as_ref()?.s.as_raw_fd();
-        runtime::readable(fd).await;
+        let mut chunk = [0u8; 4096];
+        match c.s.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(n) => c.buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => runtime::readable(c.s.as_raw_fd()).await,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
     }
 }
 
-async fn connect(c: &Rc<RefCell<Option<Conn>>>) -> Option<()> {
-    let (s, pw) = open().await?;
-    let fd = s.as_raw_fd();
-    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) };
-    *c.borrow_mut() = Some(Conn { s, buf: vec![] });
-    read_line(c).await?; // greeting
+async fn connect() -> Option<Conn> {
+    let (fd, pw) = open().await?;
+    let s = UnixStream::from(fd);
+    s.set_nonblocking(true).ok()?;
+    let mut c = Conn { s, buf: vec![] };
+    read_line(&mut c).await?; // greeting
     if let Some(pw) = pw {
-        exchange(c, &format!("password {}", quote(&pw))).await?;
+        exchange(&mut c, &format!("password {}", quote(&pw))).await?.ok()?;
     }
-    Some(())
+    Some(c)
 }
 
-async fn exchange(c: &Rc<RefCell<Option<Conn>>>, cmd: &str) -> Option<Vec<String>> {
-    c.borrow_mut().as_mut()?.s.write_all(format!("{cmd}\n").as_bytes()).ok()?;
+async fn exchange(c: &mut Conn, cmd: &str) -> Reply {
+    c.s.write_all(format!("{cmd}\n").as_bytes()).ok()?;
     let mut lines = vec![];
     loop {
         let line = read_line(c).await?;
-        if line == "OK" || line.starts_with("ACK") {
-            break;
+        if line == "OK" {
+            return Some(Ok(lines));
+        }
+        if line.starts_with("ACK") {
+            return Some(Err(line));
         }
         lines.push(line);
     }
-    Some(lines)
 }
 
-async fn send(cmd: &str) -> Option<Vec<String>> {
-    let c = Rc::new(RefCell::new(SOCK.with(|s| s.borrow_mut().take())));
-    if c.borrow().is_none() {
-        connect(&c).await?;
-    }
-    let lines = exchange(&c, cmd).await?;
-    SOCK.with(|s| *s.borrow_mut() = c.borrow_mut().take());
-    Some(lines)
+/// On the shared command connection, (re)connecting if there is none.
+async fn send(cmd: &str) -> Reply {
+    let mut c = match SOCK.take() {
+        Some(c) => c,
+        None => connect().await?,
+    };
+    let r = exchange(&mut c, cmd).await?;
+    SOCK.set(Some(c));
+    Some(r)
+}
+
+/// Reconnects once if the connection broke. None when mpd is unreachable or refused (logged).
+async fn cmd(cmd: &str) -> Option<Vec<String>> {
+    let r = match send(cmd).await {
+        Some(r) => r,
+        None => send(cmd).await?,
+    };
+    r.map_err(|ack| eprintln!("flurry: mpd: {ack}")).ok()
 }
 
 /// Keeps `is_playing` and `song` in sync on a second connection parked in `idle player`.
 /// Started at launch and again by any command, so a restarted mpd is picked back up.
 pub fn watch() {
-    if WATCHING.with(|w| w.replace(true)) {
+    if WATCHING.replace(true) {
         return;
     }
     runtime::spawn(async {
-        let c = Rc::new(RefCell::new(None));
-        if connect(&c).await.is_some() {
-            while let Some(lines) = exchange(&c, "command_list_begin\nstatus\ncurrentsong\ncommand_list_end").await {
-                let field = |k: &str| lines.iter().find_map(|l| l.strip_prefix(k)).unwrap_or_default().to_string();
-                let file = field("file: ");
-                let title = Some(field("Title: ")).filter(|t| !t.is_empty()).unwrap_or_else(|| file.rsplit('/').next().unwrap_or_default().to_string());
-                is_playing().set(field("state: ") == "play");
-                song().set((title, field("Artist: ")));
-                if exchange(&c, "idle player").await.is_none() {
+        if let Some(mut c) = connect().await {
+            while let Some(Ok(lines)) = exchange(&mut c, "command_list_begin\nstatus\ncurrentsong\ncommand_list_end").await {
+                let file = field(&lines, "file: ");
+                let title = Some(field(&lines, "Title: ")).filter(|t| !t.is_empty()).unwrap_or_else(|| file.rsplit('/').next().unwrap_or_default());
+                is_playing().set(field(&lines, "state: ") == "play");
+                song().set((title.to_string(), field(&lines, "Artist: ").to_string()));
+                if !matches!(exchange(&mut c, "idle player").await, Some(Ok(_))) {
                     break;
                 }
             }
         }
-        WATCHING.with(|w| w.set(false));
+        is_playing().set(false);
+        song().set(Default::default());
+        WATCHING.set(false);
     });
 }
 
-/// Queues commands; runs batches one at a time, reconnecting once on failure.
-fn mpd(cmds: &[&str]) -> runtime::Receiver<Vec<String>> {
+/// Runs `job` once every earlier job has finished.
+fn queued(job: impl Future<Output = ()> + 'static) {
     watch();
-    let (tx, rx) = runtime::oneshot();
-    let cmds: Vec<String> = cmds.iter().map(|s| s.to_string()).collect();
     runtime::spawn(async move {
         let queue = QUEUE_LOCK.with(Clone::clone);
         let _turn = queue.lock().await;
-        let mut lines = vec![];
-        for cmd in &cmds {
-            lines = match send(cmd).await {
-                Some(l) => l,
-                None => {
-                    SOCK.with(|s| s.borrow_mut().take());
-                    send(cmd).await.unwrap_or_default()
-                }
-            };
-        }
-        tx.send(lines);
+        job.await;
     });
-    rx
 }
 
-/// One command list, so `watch` wakes only after all of it and never sees the emptied queue.
-fn load_playlist(play: bool) {
-    let mut cmds = vec![];
-    if !STARTED.with(|s| s.replace(true)) && MPD_CROSSFADE != 0 {
-        cmds.push(format!("crossfade {MPD_CROSSFADE}"));
+/// Appends the current playlist shuffled, then drops the old queue (`len` songs): mpd stops a
+/// command list at the first ACK, so a failed add leaves the queue as it was.
+async fn load_playlist(len: usize, play: bool) -> Option<()> {
+    let (name, _) = playlist()?;
+    let mut cmds = vec![format!("add {}", quote(name))];
+    if len > 0 {
+        cmds.push(format!("delete 0:{len}"));
     }
-    if let Some((name, _)) = playlist() {
-        cmds.extend(["clear".to_string(), format!("add {}", quote(name)), "shuffle".into()]);
-        if play {
-            cmds.push("play".into());
-        }
+    cmds.push("shuffle".into());
+    if play {
+        cmds.push("play".into());
     }
-    if !cmds.is_empty() {
-        mpd(&[&format!("command_list_begin\n{}\ncommand_list_end", cmds.join("\n"))]);
-    }
+    cmd(&list(&cmds)).await.map(drop)
 }
 
-fn start() {
-    if !STARTED.with(Cell::get) {
-        load_playlist(false);
+/// The first command after launch sets crossfade, and loads the playlist only into an empty
+/// queue (a shell restart must not replace what's playing) unless the caller loads its own.
+/// Returns mpd's status.
+async fn start(load: bool) -> Option<Vec<String>> {
+    let status = cmd("status").await?;
+    if STARTED.get() {
+        return Some(status);
     }
+    if MPD_CROSSFADE != 0 {
+        cmd(&format!("crossfade {MPD_CROSSFADE}")).await?;
+    }
+    if load && field(&status, "playlistlength: ") == "0" && playlist().is_some() {
+        load_playlist(0, false).await?;
+    }
+    STARTED.set(true);
+    Some(status)
 }
 
 pub fn upd_track(next: bool) {
-    start();
-    mpd(&[if next { "next" } else { "previous" }, "play"]);
-    is_playing().set(true);
+    queued(async move {
+        if start(true).await.is_some() {
+            cmd(&list(&[if next { "next" } else { "previous" }.into(), "play".into()])).await;
+        }
+    });
 }
 
 pub fn play_pause() {
-    start();
-    let rx = mpd(&["status"]);
-    runtime::spawn(async move {
-        let status = rx.await.unwrap_or_default();
-        let playing = status.iter().any(|l| l == "state: play");
-        mpd(&[if playing { "pause 1" } else { "play" }]);
+    queued(async {
+        if let Some(status) = start(true).await {
+            cmd(if field(&status, "state: ") == "play" { "pause 1" } else { "play" }).await;
+        }
     });
-    let p = is_playing();
-    p.set(!p.peek());
 }
 
 pub fn chng_playlist(next: bool) {
@@ -236,7 +255,11 @@ pub fn chng_playlist(next: bool) {
     }
     let i = playlist_index();
     i.set((i.peek() + if next { 1 } else { n - 1 }) % n);
-    load_playlist(true);
+    queued(async {
+        if let Some(status) = start(false).await {
+            load_playlist(field(&status, "playlistlength: ").parse().unwrap_or(0), true).await;
+        }
+    });
 }
 
 /// Quickstatus media block scroll: accumulate and send whole volume steps.
@@ -249,7 +272,9 @@ pub fn media_scroll(dy: f64, wheel: bool) {
         n as i64
     });
     if n != 0 {
-        mpd(&[&format!("volume {n}")]);
+        queued(async move {
+            cmd(&format!("volume {n}")).await;
+        });
     }
 }
 

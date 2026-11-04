@@ -3,22 +3,29 @@
 use std::rc::Rc;
 
 use tiny_skia::{PathBuilder, Rect, Transform};
+use xkbcommon::xkb::Keysym;
 
 use crate::lib::audio;
 use crate::lib::brightness::{self, brightness, set_brightness};
 use crate::lib::deviceMenu::{aside_row, separator};
 use crate::lib::style::*;
-use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash, rgba};
-use crate::widgets::status::quicksettings::sound::{self, apply_selection, name_substitute, node_name, selected};
-use crate::widgets::status::status::volume_icon;
+use crate::ui::node::{Align, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash, rgba};
+use crate::ui::wayland::KeyEvent;
+use crate::widgets::status::quicksettings::sound::{self, apply_selection, name_substitute, selected};
 
-/// Slider horizontal padding and the trough's end caps, shared by drawing and hit testing.
+/// Slider horizontal padding and the trough's end caps.
 const PAD_X: f32 = SPACE_M;
 const CAP: f32 = 10.0;
+/// Left/Right on a focused slider.
+const STEP: f64 = 0.05;
+
+fn volume_icon() -> &'static str {
+    audio::default_speaker().map(|s| s.volume_icon()).unwrap_or("audio-volume-muted-symbolic")
+}
 
 /// `window scale` look: trough @light1 5px with the 10px end caps as shadows, @blue2 highlight,
 /// a 19px diamond knob (9px + 5px @blue2 border, rotated 45deg).
-pub fn slider(base: &Style, id: &str, value: f64) -> Node {
+pub fn slider(base: &Style, id: &str, value: f64, focused: bool) -> Node {
     let paint = Rc::new(move |pm: &mut tiny_skia::PixmapMut, r: Rect, ts: Transform| {
         // r is the content box (padding already removed); trough margin 0 CAP
         let Some(trough) = Rect::from_xywh(r.x() + CAP, r.y() + (r.height() - 5.0) / 2.0, (r.width() - 2.0 * CAP).max(1.0), 5.0) else { return };
@@ -49,36 +56,34 @@ pub fn slider(base: &Style, id: &str, value: f64) -> Node {
             }
         }
     });
-    let s = Style { padding: Sides::vh(SPACE_L, PAD_X), min_height: 5.0, ..base.inherit() };
-    Node::new(Kind::Custom { width: 0.0, height: 5.0, key: None, paint }, s).expand(true, false).id(id)
-}
-
-/// Value for a pointer x inside the slider's border box.
-pub fn slider_value(r: Rect, x: f32) -> f64 {
-    let left = r.x() + PAD_X + CAP;
-    let width = (r.width() - 2.0 * (PAD_X + CAP)).max(1.0);
-    ((x - left) / width).clamp(0.0, 1.0) as f64
+    let mut s = Style { padding: Sides::vh(SPACE_L, PAD_X), min_height: 5.0, ..base.inherit() };
+    if focused {
+        s = focus_outline(s);
+    }
+    Node::new(Kind::Custom { width: 0.0, height: 5.0, key: None, paint }, s).expand(true, false).focusable(id)
 }
 
 pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
     let vol = audio::default_speaker().map(|s| s.volume).unwrap_or(0.0);
-    let mut rows = vec![Node::hbox(base.inherit(), 0.0, vec![Node::icon(base.inherit(), volume_icon(), 22.0).align(Align::Fill, Align::Center), slider(base, "volume", vol)])];
+    let mut rows = vec![Node::hbox(base.inherit(), 0.0, vec![
+        Node::icon(base.inherit(), volume_icon(), 22.0).align(Align::Fill, Align::Center),
+        slider(base, "volume", vol, focus == Some("volume")),
+    ])];
     if brightness::available() {
         rows.push(Node::hbox(base.inherit(), 0.0, vec![
             Node::icon(base.inherit(), "display-brightness-symbolic", 22.0).align(Align::Fill, Align::Center),
-            slider(base, "brightness", brightness().peek()),
+            slider(base, "brightness", brightness().peek(), focus == Some("brightness")),
         ]));
     }
     let sel = selected().peek();
     let sinks: Vec<Node> = sound::listed()
         .iter()
         .map(|sp| {
-            let name = node_name(sp);
-            let is_sel = sel.contains(&name);
-            let id = format!("sink:{name}");
+            let is_sel = sel.contains(&sp.name);
+            let id = format!("sink:{}", sp.name);
             let mut s = aside_row(base, is_sel, false, focus == Some(id.as_str()));
             if !is_sel {
-                s.background = Background::Color(rgba(255, 255, 255, 0.08));
+                s.background = Some(rgba(255, 255, 255, 0.08));
             }
             let mut check = s.inherit();
             check.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
@@ -98,54 +103,37 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
 
 /// Enter selects only this sink, Shift+Enter toggles it into a combined output.
 pub fn activate(id: &str, shift: bool) -> bool {
+    if id == "mediaBtn" {
+        crate::lib::mediaPlayer::play_pause();
+        return true;
+    }
     let Some(name) = id.strip_prefix("sink:") else { return false };
-    let Some(sp) = sound::listed().into_iter().find(|s| node_name(s) == name) else { return false };
+    let Some(sp) = sound::listed().into_iter().find(|s| s.name == name) else { return false };
     if shift { sound::toggle_sink(&sp) } else { apply_selection(&[name.to_string()]) }
     true
 }
 
-pub fn first_sink() -> Option<String> {
-    sound::listed().first().map(|s| format!("sink:{}", node_name(s)))
-}
-
-thread_local! {
-    /// a drag's latest value waiting for the throttle; Some(None) while throttled with none waiting
-    static SLIDER: std::cell::Cell<Option<Option<(&'static str, f64)>>> = const { std::cell::Cell::new(None) };
-}
-
-/// Pointer drags move a slider faster than frames: applied at most once a frame (~16ms), the
-/// latest value winning.
-pub fn set_slider(id: &'static str, value: f64) {
-    if SLIDER.with(|s| s.get()).is_some() {
-        return SLIDER.with(|s| s.set(Some(Some((id, value)))));
-    }
-    apply_slider(id, value);
-    SLIDER.with(|s| s.set(Some(None)));
-    crate::ui::runtime::timeout(16, flush_slider);
-}
-
-fn flush_slider() {
-    match SLIDER.with(|s| s.get()).flatten() {
-        Some((id, value)) => {
-            SLIDER.with(|s| s.set(Some(None)));
-            apply_slider(id, value);
-            crate::ui::runtime::timeout(16, flush_slider);
-        }
-        None => SLIDER.with(|s| s.set(None)),
-    }
-}
-
-fn apply_slider(id: &str, value: f64) {
+/// Left/Right (h/l) on a focused slider step its value.
+pub fn key(id: &str, ev: &KeyEvent) -> bool {
+    let delta = match ev.sym {
+        Keysym::Left | Keysym::h => -STEP,
+        Keysym::Right | Keysym::l => STEP,
+        _ => return false,
+    };
     match id {
         "volume" => {
-            if let Some(s) = audio::default_speaker() {
-                audio::set_volume(&s, value);
-                if s.mute {
-                    audio::set_mute(&s, false);
-                }
+            let Some(s) = audio::default_speaker() else { return true };
+            audio::set_volume(&s, (s.volume + delta).clamp(0.0, 1.0));
+            if s.mute {
+                audio::set_mute(&s, false);
             }
         }
-        "brightness" => set_brightness(value),
-        _ => {}
+        "brightness" => set_brightness((brightness().peek() + delta).clamp(0.0, 1.0)),
+        _ => return false,
     }
+    true
+}
+
+pub fn first_sink() -> Option<String> {
+    sound::listed().first().map(|s| format!("sink:{}", s.name))
 }

@@ -1,8 +1,8 @@
-// Wallpaper-backed header card (lib/backgroundSection.tsx).
+// Wallpaper-backed header card.
 
 use crate::lib::style::*;
 use crate::lib::wallpaper;
-use crate::ui::node::{Align, Background, Node, Sides, Style, alpha, rgba};
+use crate::ui::node::{Align, Node, Sides, Style, alpha, rgba};
 
 /// `.backgroundSection .header:first-child` text/icon look
 pub fn header_style(base: &Style) -> Style {
@@ -25,7 +25,7 @@ pub fn background_section(base: &Style, header: Node, content: Option<Node>, hei
     let filler = Node::hbox(Style { padding: Sides::trbl(48.0, 48.0, 48.0, 0.0), min_height: 32.0, ..hs.inherit() }, 0.0, vec![]);
     // the lockscreen's dark tint keeps light text readable on any wallpaper
     // out to the card's padding, over the blur's bleed: stopping at the box leaves a dark line there
-    let tint = Node::hbox(Style { background: Background::Color(alpha(dark1(), 0.45)), margin: Sides::all(-SPACE_L), ..hs.inherit() }, 0.0, vec![]);
+    let tint = Node::hbox(Style { background: Some(alpha(dark1(), 0.45)), margin: Sides::all(-SPACE_L), ..hs.inherit() }, 0.0, vec![]);
     // a wide, soft halo past the box under a sharper copy that keeps the detail
     let header = Node::overlay(overlay_style, vec![filler, wallpaper::picture(hs.inherit(), 16.0), wallpaper::picture(hs.inherit(), 4.0), tint, header]);
     let mut kids = vec![header];

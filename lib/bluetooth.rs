@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::lib::dbus::{self, ManagedObjects, Message, PropMap, SignalFilter, method, prop_bool, prop_i64, prop_str, set_prop};
-use crate::lib::state::State;
+use crate::ui::state::global_state;
 
 const BLUEZ: &str = "org.bluez";
 
@@ -64,16 +64,13 @@ impl Bt {
 }
 
 thread_local! {
-    static BT: State<Bt> = State::new(Bt::default());
     /// (accept, reject) replies to the agent call awaiting the user's answer
     static PENDING: RefCell<Option<(Message, Message)>> = const { RefCell::new(None) };
 }
 
-pub fn bt() -> State<Bt> {
-    BT.with(Clone::clone)
+global_state! {
+    pub fn bt() -> Bt = Bt::default();
 }
-
-const DEVICE_KEYS: [&str; 8] = ["Address", "Alias", "Icon", "Adapter", "Paired", "Trusted", "Connected", "Percentage"];
 
 fn set_device(d: &mut Device, p: &PropMap) {
     if let Some(v) = prop_str(p, "Address") {
@@ -107,25 +104,19 @@ fn set_device(d: &mut Device, p: &PropMap) {
 fn apply(path: &str, iface: &str, p: &PropMap) {
     match iface {
         "org.bluez.Adapter1" => {
-            let (powered, discovering) = (prop_bool(p, "Powered"), prop_bool(p, "Discovering"));
             let cur = bt().with(|b| b.adapters.get(path).cloned());
-            if cur.is_some() && powered.is_none() && discovering.is_none() {
-                return;
-            }
             let mut a = cur.clone().unwrap_or_else(|| Adapter { path: path.into(), ..Default::default() });
-            a.powered = powered.unwrap_or(a.powered);
-            a.discovering = discovering.unwrap_or(a.discovering);
+            a.powered = prop_bool(p, "Powered").unwrap_or(a.powered);
+            a.discovering = prop_bool(p, "Discovering").unwrap_or(a.discovering);
             if cur.as_ref() != Some(&a) {
                 bt().update(|b| {
                     b.adapters.insert(path.into(), a);
+                    true
                 });
             }
         }
         "org.bluez.Device1" | "org.bluez.Battery1" => {
             let cur = bt().with(|b| b.devices.iter().find(|d| d.path == path).cloned());
-            if cur.is_some() && !p.keys().any(|k| DEVICE_KEYS.contains(&k.as_str())) {
-                return;
-            }
             let mut d = match &cur {
                 Some(d) => d.clone(),
                 None if iface == "org.bluez.Device1" => Device { path: path.into(), battery: -1.0, ..Default::default() },
@@ -149,6 +140,7 @@ fn apply(path: &str, iface: &str, p: &PropMap) {
                 if clear {
                     b.pairing = None;
                 }
+                true
             });
         }
         _ => {}
@@ -166,22 +158,25 @@ fn apply_all(path: &str, ifaces: &HashMap<String, PropMap>) {
 
 fn removed(path: &str, ifaces: &[String]) {
     bt().update(|b| {
+        let mut changed = false;
         if ifaces.iter().any(|i| i == "org.bluez.Adapter1") {
-            b.adapters.remove(path);
+            changed |= b.adapters.remove(path).is_some();
         }
         if ifaces.iter().any(|i| i == "org.bluez.Device1") {
+            let n = b.devices.len();
             b.devices.retain(|d| d.path != path);
+            changed |= b.devices.len() != n;
         }
         if ifaces.iter().any(|i| i == "org.bluez.Battery1")
             && let Some(d) = b.devices.iter_mut().find(|d| d.path == path)
         {
-            d.battery = -1.0;
+            changed |= std::mem::replace(&mut d.battery, -1.0) != -1.0;
         }
+        changed
     });
 }
 
-
-/// Watches org.bluez; the menu only exists once bluez appears (lib/bluetooth.tsx).
+/// Watches org.bluez; the menu only exists once bluez appears.
 pub fn start() {
     let Some(bus) = dbus::system() else { return };
     bus.subscribe(
@@ -201,7 +196,7 @@ pub fn start() {
         },
     );
     bus.subscribe(
-        SignalFilter { sender: Some(BLUEZ.into()), interface: Some("org.freedesktop.DBus.Properties".into()), member: Some("PropertiesChanged".into()), ..Default::default() },
+        SignalFilter::properties_changed(Some(BLUEZ)),
         |m| {
             if let (Some(path), Ok((iface, props))) = (m.path(), m.read2::<&str, PropMap>()) {
                 apply(&path, iface, &props);
@@ -222,7 +217,7 @@ pub fn start() {
                 for (path, ifaces) in paths {
                     apply_all(&path, &ifaces);
                 }
-                bt().update(|b| b.available = true);
+                bt().update(|b| !std::mem::replace(&mut b.available, true));
             });
         },
         || {
@@ -242,11 +237,12 @@ fn call_timeout(path: &str, iface: &str, member: &str, ms: u64, done: impl FnOnc
 }
 
 fn set_flag(path: &str, f: impl FnOnce(&mut Device)) {
-    let path = path.to_string();
     bt().update(|b| {
-        if let Some(d) = b.devices.iter_mut().find(|d| d.path == path) {
+        b.devices.iter_mut().find(|d| d.path == path).is_some_and(|d| {
+            let old = d.clone();
             f(d);
-        }
+            *d != old
+        })
     });
 }
 
@@ -265,43 +261,37 @@ pub fn disconnect(path: &str) {
 
 const PAIR_TIMEOUT_MS: u64 = 120_000;
 
-thread_local! {
-    /// devices with a Pair call in flight
-    static PAIRING: std::cell::RefCell<std::collections::HashSet<String>> = Default::default();
-}
-
 /// `done` gets whether pairing succeeded; the code shown for it goes either way. Ignored (no `done`)
-/// while a Pair call for the device is in flight.
+/// while a Pair call for the device is in flight (bluez refuses a second one anyway).
 pub fn pair(path: &str, done: impl FnOnce(bool) + 'static) {
-    // keyed by path, not the Device: it survives bluez restarts and the device being re-added
-    if !PAIRING.with(|s| s.borrow_mut().insert(path.to_string())) {
+    if bt().with(|b| b.devices.iter().any(|d| d.path == path && d.pairing)) {
         return;
     }
     set_flag(path, |d| d.pairing = true);
     let p = path.to_string();
     // past the usual reply timeout: bluez answers once the user confirms the code
     call_timeout(path, "org.bluez.Device1", "Pair", PAIR_TIMEOUT_MS, move |ok| {
-        PAIRING.with(|s| s.borrow_mut().remove(&p));
         set_flag(&p, |d| d.pairing = false);
         if bt().with(|b| b.pairing.as_ref().is_some_and(|x| x.device == p)) {
-            answer(false);
-            bt().update(|b| b.pairing = None);
+            cancel_pairing();
         }
         done(ok);
     });
 }
 
-pub fn trust(path: &str) {
+/// A call whose reply doesn't matter.
+fn call_msg(msg: Message) {
     if let Some(bus) = dbus::system() {
-        bus.call_cb(set_prop(BLUEZ, path, "org.bluez.Device1", "Trusted", true), |_| {});
+        bus.call_cb(msg, |_| {});
     }
 }
 
+pub fn trust(path: &str) {
+    call_msg(set_prop(BLUEZ, path, "org.bluez.Device1", "Trusted", true));
+}
+
 pub fn remove(adapter: &str, device: &str) {
-    if let Some(bus) = dbus::system() {
-        let msg = method(BLUEZ, adapter, "org.bluez.Adapter1", "RemoveDevice").append1(dbus::Path::from(device.to_string()));
-        bus.call_cb(msg, |_| {});
-    }
+    call_msg(method(BLUEZ, adapter, "org.bluez.Adapter1", "RemoveDevice").append1(dbus::Path::from(device.to_string())));
 }
 
 pub fn set_discovery(on: bool) {
@@ -311,9 +301,7 @@ pub fn set_discovery(on: bool) {
 
 pub fn toggle_power() {
     let Some((path, on)) = bt().with(|b| b.adapter().map(|a| (a.path.clone(), a.powered))) else { return };
-    if let Some(bus) = dbus::system() {
-        bus.call_cb(set_prop(BLUEZ, &path, "org.bluez.Adapter1", "Powered", !on), |_| {});
-    }
+    call_msg(set_prop(BLUEZ, &path, "org.bluez.Adapter1", "Powered", !on));
 }
 
 // Pairing agent (KeyboardDisplay): codes show in the device's row, so both sides can be compared
@@ -324,7 +312,7 @@ const AGENT_PATH: &str = "/org/flurry/BluezAgent";
 
 fn show(device: &str, code: String, confirm: bool) {
     let p = Pairing { device: device.into(), code, confirm };
-    bt().update(|b| b.pairing = Some(p));
+    bt().update(|b| b.pairing.replace(p) != b.pairing);
 }
 
 fn rejected(m: &Message) -> Message {
@@ -337,17 +325,13 @@ pub fn answer(accept: bool) {
     if let Some(bus) = dbus::system() {
         bus.send(if accept { yes } else { no });
     }
-    bt().update(|b| {
-        if let Some(p) = &mut b.pairing {
-            p.confirm = false;
-        }
-    });
+    bt().update(|b| b.pairing.as_mut().is_some_and(|p| std::mem::replace(&mut p.confirm, false)));
 }
 
 /// Rejects a waiting confirmation and hides the code.
 pub fn cancel_pairing() {
     answer(false);
-    bt().update(|b| b.pairing = None);
+    bt().update(|b| b.pairing.take().is_some());
 }
 
 fn defer(m: &Message, device: &str, code: String) -> Option<Message> {
@@ -363,15 +347,13 @@ fn export_agent(bus: &Rc<dbus::Bus>) {
     let guard = |bus: &std::rc::Weak<dbus::Bus>, m: &Message| -> bool {
         bus.upgrade().and_then(|b| b.owner_of(BLUEZ)).is_some_and(|o| m.sender().as_deref() == Some(o.as_str())) && m.path().as_deref() == Some(AGENT_PATH)
     };
+    let cancel: fn(&Message) -> Option<Message> = |m| {
+        cancel_pairing();
+        Some(m.method_return())
+    };
     let handlers: [(&str, fn(&Message) -> Option<Message>); 9] = [
-        ("Release", |m| {
-            cancel_pairing();
-            Some(m.method_return())
-        }),
-        ("Cancel", |m| {
-            cancel_pairing();
-            Some(m.method_return())
-        }),
+        ("Release", cancel),
+        ("Cancel", cancel),
         ("RequestPinCode", |m| {
             let dev: dbus::Path = m.read1().ok()?;
             let Some(code) = crate::lib::random::below(1_000_000) else { return Some(rejected(m)) };

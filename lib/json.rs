@@ -101,7 +101,7 @@ impl P<'_> {
                 }
                 loop {
                     self.ws();
-                    let Json::Str(k) = self.string()? else { return None };
+                    let k = self.string()?;
                     if !self.eat(b':') {
                         return None;
                     }
@@ -130,7 +130,7 @@ impl P<'_> {
                     }
                 }
             }
-            b'"' => self.string(),
+            b'"' => self.string().map(Json::Str),
             b't' => self.lit("true", Json::Bool(true)),
             b'f' => self.lit("false", Json::Bool(false)),
             b'n' => self.lit("null", Json::Null),
@@ -151,7 +151,7 @@ impl P<'_> {
             None
         }
     }
-    fn string(&mut self) -> Option<Json> {
+    fn string(&mut self) -> Option<String> {
         if self.s.get(self.i) != Some(&b'"') {
             return None;
         }
@@ -160,7 +160,7 @@ impl P<'_> {
         while let Some(&c) = self.s.get(self.i) {
             self.i += 1;
             match c {
-                b'"' => return String::from_utf8(out).ok().map(Json::Str),
+                b'"' => return String::from_utf8(out).ok(),
                 b'\\' => {
                     let e = *self.s.get(self.i)?;
                     self.i += 1;

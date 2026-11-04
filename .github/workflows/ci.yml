@@ -3,6 +3,16 @@ name: CI
 on:
   push:
   pull_request:
+  # the flake.lock update tests its PR with these same steps
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+    outputs:
+      sha:
+        description: The commit that was tested.
+        value: ${{ jobs.build.outputs.sha }}
 
 permissions:
   contents: read
@@ -10,11 +20,18 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
+
+      - name: Head
+        id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3 # v3
@@ -23,9 +40,14 @@ jobs:
       - name: Lint
         run: nix develop -c cargo clippy --all-targets -- -D warnings
 
+      # includes the sideview's Claude Code protocol (sideview/src/claude.rs, a test target here)
       - name: Test
         run: nix develop -c cargo test
 
       # package.nix (settings, fonts, wrapper) with a stub sideview instead of Servo
       - name: Package
         run: nix build .#checks.x86_64-linux.package
+
+      # the sideview's Nix side (sandbox launcher, Servo inputs) evaluates; building it is Servo
+      - name: Sideview
+        run: nix eval .#packages.x86_64-linux.sideview.drvPath

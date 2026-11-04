@@ -1,22 +1,21 @@
-// Power/scan header + scrolling device list shared by bluetooth and wifi (lib/deviceMenu.tsx).
+// Power/scan header + scrolling device list shared by bluetooth and wifi.
 
 use std::cell::RefCell;
 
 use crate::lib::style::*;
-use crate::ui::node::{Align, Background, Node, Sides, Style};
+use crate::ui::node::{Align, Node, Sides, Style};
 
 pub struct DeviceMenu<'a> {
     pub base: &'a Style,
     pub powered: bool,
     pub power_icon: &'static str,
     pub scanning: bool,
-    pub empty: bool,
     pub focus: Option<&'a str>,
     pub rows: Vec<Node>,
 }
 
 /// `#asideStatus button` with active / focus states; dimmed only while a connection is in progress.
-pub fn aside_button(base: &Style, active: bool, connecting: bool, focused: bool) -> Style {
+fn aside_button(base: &Style, active: bool, connecting: bool, focused: bool) -> Style {
     let mut s = frosted(button(base));
     s.margin = Sides::all(SPACE_S);
     if active || connecting {
@@ -84,13 +83,13 @@ impl FocusMemory {
 
 pub fn separator(base: &Style) -> Node {
     // as wide as a focused button's outline; the buttons above end SPACE_S + BORDER short of this margin too
-    let s = Style { margin: Sides::trbl(SPACE_M + BORDER, SPACE_S - BORDER, SPACE_M, SPACE_S - BORDER), min_height: BORDER, background: Background::Color(light3()), ..base.inherit() };
+    let s = Style { margin: Sides::trbl(SPACE_M + BORDER, SPACE_S - BORDER, SPACE_M, SPACE_S - BORDER), min_height: BORDER, background: Some(light3()), ..base.inherit() };
     Node::hbox(s, 0.0, vec![])
 }
 
 pub fn device_menu(m: DeviceMenu) -> Node {
     let base = m.base;
-    let show_list = m.powered && !m.empty;
+    let show_list = m.powered && !m.rows.is_empty();
     let mut power = aside_button(base, m.powered, false, m.focus == Some("power"));
     if !m.powered {
         power.padding = Sides::all(SPACE_L);

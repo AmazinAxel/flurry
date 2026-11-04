@@ -5,7 +5,7 @@ use crate::lib::audio;
 use crate::lib::brightness::brightness;
 use crate::lib::outTransition::Flash;
 use crate::lib::style::*;
-use crate::ui::node::{Kind, Node, Sides, Style, fill_rect};
+use crate::ui::node::{Node, Sides, Style, levelbar};
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{Spec, Win};
 
@@ -13,17 +13,12 @@ thread_local! {
     static OSD: RefCell<(&'static str, f64)> = const { RefCell::new(("", 0.0)) };
 }
 
-/// `.osd levelbar`: trough @blue2 with glow, filled block @blue2 inset 3px, empty @light3.
+/// `.osd levelbar`: trough @blue2, filled block @blue2 inset 3px, empty @light3.
 fn osd_bar(value: f64) -> Node {
-    let paint = Rc::new(move |pm: &mut tiny_skia::PixmapMut, r: tiny_skia::Rect, ts: tiny_skia::Transform| {
-        fill_rect(pm, r, blue2(), ts);
-        let Some(inner) = tiny_skia::Rect::from_ltrb(r.left() + 3.0, r.top() + 3.0, r.right() - 3.0, r.bottom() - 3.0) else { return };
-        fill_rect(pm, inner, light3(), ts);
-        if let Some(f) = tiny_skia::Rect::from_xywh(inner.x(), inner.y(), inner.width() * value.clamp(0.0, 1.0) as f32, inner.height()) {
-            fill_rect(pm, f, blue2(), ts);
-        }
-    });
-    Node::new(Kind::Custom { width: 400.0, height: 12.0, key: Some(value.to_bits()), paint }, Style::default()).size(400.0, 0.0)
+    let mut n = levelbar(&Style::default(), value, blue2(), light3(), 6.0);
+    n.style.padding = Sides::all(3.0);
+    n.style.background = Some(blue2());
+    n.size(400.0, 0.0)
 }
 
 pub fn osd() {
@@ -44,7 +39,7 @@ pub fn osd() {
         n
     });
     let show = {
-        let (flash, w) = (flash.clone(), w.clone());
+        let (flash, w) = (flash, w);
         Rc::new(move |icon: &'static str, value: f64| {
             OSD.with(|o| *o.borrow_mut() = (icon, value));
             flash.show(&w);
@@ -57,17 +52,17 @@ pub fn osd() {
 
     // volume/mute changes and default speaker switches, after the first sync; a default that is
     // briefly unknown (new sink not bound yet) keeps the last one so the switch still shows
-    let last: Rc<RefCell<Option<(u32, String)>>> = Rc::default();
+    let last: Rc<RefCell<Option<(u32, u64, bool)>>> = Rc::default();
     let s2 = show.clone();
-    let l = last.clone();
+    let l = last;
     let check = move || {
         if !audio::ready().peek() {
             return;
         }
         // not before its volume arrived: 0 -> actual would flash the OSD at startup
         let Some(s) = audio::default_speaker().filter(audio::Sink::known) else { return };
-        let cur = (s.id, format!("{}{}", s.volume, s.mute));
-        if l.replace(Some(cur.clone())).is_some_and(|prev| prev != cur) {
+        let cur = (s.id, s.volume.to_bits(), s.mute);
+        if l.replace(Some(cur)).is_some_and(|prev| prev != cur) {
             s2(s.volume_icon(), s.volume);
         }
     };

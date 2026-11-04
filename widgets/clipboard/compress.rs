@@ -1,4 +1,4 @@
-// Video compression to a size target (widgets/clipboard/compress.tsx).
+// Video compression to a size target.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -9,27 +9,27 @@ use crate::lib::backgroundSection::{background_section, header_style};
 use crate::lib::clipboard::copy_uri;
 use crate::lib::inputControl::{Opts, input_control};
 use crate::lib::process::{exec, spawn_lines};
-use crate::lib::state::State;
 use crate::lib::style::*;
-use crate::ui::node::{Align, Node, Style, TRANSPARENT};
+use crate::ui::node::{Align, Node, Style, TRANSPARENT, levelbar};
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{self, Spec, Win};
 use crate::ui::runtime;
-use crate::widgets::focus::levelbar;
+use crate::ui::state::global_state;
 
 const TARGETS: [u32; 5] = [10, 20, 50, 100, 500]; // MB
 
 thread_local! {
-    static TARGET: State<usize> = State::new(0);
-    static PROGRESS: State<f64> = State::new(-1.0);
     static SOURCE: RefCell<(String, u64)> = const { RefCell::new((String::new(), 0)) };
+    /// the last output: replaced by the next one, so they don't pile up in the cache
+    static LAST_OUT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-fn target() -> State<usize> {
-    TARGET.with(Clone::clone)
-}
-fn progress() -> State<f64> {
-    PROGRESS.with(Clone::clone)
+/// ffmpeg's stderr kept for the failure notification: only its end.
+const MAX_ERR: usize = 4096;
+
+global_state! {
+    fn target() -> usize = 0;
+    fn progress() -> f64 = -1.0;
 }
 
 async fn ffmpeg(args: Vec<String>, duration_us: f64) -> Result<(), String> {
@@ -48,8 +48,16 @@ async fn ffmpeg(args: Vec<String>, duration_us: f64) -> Result<(), String> {
             }
         },
         move |line| {
-            e.borrow_mut().push_str(line);
-            e.borrow_mut().push('\n');
+            let mut e = e.borrow_mut();
+            e.push_str(line);
+            e.push('\n');
+            if e.len() > MAX_ERR {
+                let mut cut = e.len() - MAX_ERR;
+                while !e.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                e.drain(..cut);
+            }
         },
         move |code| tx.send(code),
     );
@@ -78,29 +86,48 @@ fn compress() {
     // videos are big: on disk, not in the RAM-backed runtime dir
     let dir = format!("{}/flurry", crate::lib::xdg::cache_dir());
     let _ = std::fs::create_dir_all(&dir);
-    let out = format!("{dir}/{}.mp4", if base == id.to_string() { base } else { format!("{base}_{id}") });
+    let out = format!("{dir}/{base}_{id}.mp4");
+    if let Some(old) = LAST_OUT.with(|l| l.borrow_mut().replace(out.clone()))
+        && old != source
+    {
+        let _ = std::fs::remove_file(old);
+    }
     runtime::spawn(async move {
         let result: Result<(), String> = async {
-            let d = exec(&["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", &source]).await?;
+            let d = exec(&["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration", "-of", "csv=p=0", &source]).await?;
             let duration: f64 = d.trim().parse().ok().filter(|d: &f64| *d > 0.0).ok_or_else(|| d.clone())?;
             let vb = ((limit * 7_600_000.0 / duration - 128_000.0).round() as i64).max(100_000);
             let args = [
-                "-i", &source, "-c:v", "libx264", "-preset", "veryfast", "-b:v", &vb.to_string(), "-maxrate", &vb.to_string(), "-bufsize",
+                "-protocol_whitelist", "file", "-i", &source, "-c:v", "libx264", "-preset", "veryfast", "-b:v", &vb.to_string(), "-maxrate", &vb.to_string(), "-bufsize",
                 &(vb * 2).to_string(), "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", &out,
             ]
             .iter()
             .map(|s| s.to_string())
             .collect();
             ffmpeg(args, duration * 1e6).await?;
+            // the history was wiped meanwhile: the output goes with it
+            if LAST_OUT.with(|l| l.borrow().as_deref() != Some(out.as_str())) {
+                let _ = std::fs::remove_file(&out);
+                return Ok(());
+            }
             copy_uri(&out);
             Ok(())
         }
         .await;
         if let Err(e) = result {
+            let _ = std::fs::remove_file(&out); // a partial output
             crate::lib::notifySend::notify_send("Compress", "Compression failed", &e, vec![]);
         }
         progress().set(-1.0);
     });
+}
+
+/// A history wipe takes the last output (which the history pointed at) too; one still being
+/// written is deleted when it finishes.
+pub fn wipe_last_output() {
+    if let Some(old) = LAST_OUT.with(|l| l.borrow_mut().take()) {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 pub fn open_compress(file: &str, id: u64) {

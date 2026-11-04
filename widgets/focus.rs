@@ -1,49 +1,50 @@
-// Focus task: entry dialog, top label with break progress (widgets/focus.tsx).
+// Focus task: entry dialog, top label with break progress.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::lib::backgroundSection::background_section;
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::process;
 use crate::lib::searchDialog::search_entry;
-use crate::lib::state::State;
 use crate::lib::style::*;
 use crate::ui::entry;
-use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, fill_rect, rgba};
+use crate::ui::node::{Align, Node, Sides, Style, levelbar, rgba};
 use crate::ui::runtime::{self, Timer};
+use crate::ui::state::global_state;
 use crate::ui::wayland::{Anchor, Layer};
 use crate::ui::window::{self, Spec, Win};
 
+/// The wait before a blocked app runs.
+const WAIT_MS: u64 = 10_000;
+/// How long a blocked app may run, and the warning before it closes.
+const RUN_SECS: u64 = 300;
+const WARN_SECS: u64 = 15;
+
 thread_local! {
-    static FOCUS_TEXT: State<String> = State::new(String::new());
-    /// the 10s wait before a blocked app runs
-    static BREAK_WAIT: State<bool> = State::new(false);
     static BREAK_TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
-    static BREAK_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-    static CLOSING_NOTIF: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static CLOSING_NOTIF: Cell<u32> = const { Cell::new(0) };
     /// the break bar's repaint timer is armed
-    static TICKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TICKING: Cell<bool> = const { Cell::new(false) };
 }
 
-pub fn focus_text() -> State<String> {
-    FOCUS_TEXT.with(Clone::clone)
+global_state! {
+    pub fn focus_text() -> String = String::new();
+    /// start of the wait before a blocked app runs
+    fn break_start() -> Option<Instant> = None;
 }
 pub fn focus() -> bool {
     !focus_text().peek().is_empty()
 }
-fn break_wait() -> State<bool> {
-    BREAK_WAIT.with(Clone::clone)
-}
 
 fn end_break() {
     BREAK_TIMERS.with(|t| t.borrow_mut().drain(..).for_each(Timer::cancel));
-    BREAK_START.with(|s| s.set(None));
-    break_wait().set(false);
+    break_start().set(None);
 }
 
 pub fn cancel_break() {
-    if break_wait().peek() {
+    if break_start().peek().is_some() {
         end_break();
     }
 }
@@ -52,35 +53,32 @@ fn active() -> bool {
     BREAK_TIMERS.with(|t| !t.borrow().is_empty())
 }
 
-/// 10s wait shown as a levelbar, then the blocked app runs for at most 5 minutes.
-pub fn start_break(cmd: &str) {
+/// The wait shown as a levelbar, then the blocked app runs for at most RUN_SECS.
+pub fn start_break(argv: Vec<String>) {
     if active() {
         return;
     }
-    BREAK_START.with(|s| s.set(Some(std::time::Instant::now())));
-    break_wait().set(true);
-    let cmd = cmd.to_string();
-    let t = runtime::timeout(10_000, move || {
+    break_start().set(Some(Instant::now()));
+    let t = runtime::timeout(WAIT_MS, move || {
         end_break();
-        let cmd = cmd.clone();
         runtime::spawn(async move {
-            let _ = process::status(&["systemd-run", "--user", "--scope", "--collect", "-p", "RuntimeMaxSec=300", "sh", "-c", &cmd]).await;
+            let max = format!("RuntimeMaxSec={RUN_SECS}");
+            let mut cmd = vec!["systemd-run", "--user", "--scope", "--collect", "-p", &max, "--"];
+            cmd.extend(argv.iter().map(String::as_str));
+            let _ = process::status(&cmd).await;
             end_break();
             let id = CLOSING_NOTIF.with(|n| n.replace(0));
             if id != 0 {
                 crate::lib::notifd::dismiss(id);
             }
         });
-        let t = runtime::timeout(285_000, || {
-            let id = crate::lib::notifySend::notify_send("Focus", "App closing in 15s", "", vec![]);
+        let t = runtime::timeout((RUN_SECS - WARN_SECS) * 1000, || {
+            let id = crate::lib::notifySend::notify_send("Focus", &format!("App closing in {WARN_SECS}s"), "", vec![]);
             CLOSING_NOTIF.with(|n| n.set(id));
         });
         BREAK_TIMERS.with(|x| x.borrow_mut().push(t));
     });
     BREAK_TIMERS.with(|x| x.borrow_mut().push(t));
-    if let Some(w) = window::get("focusTask") {
-        w.redraw();
-    }
 }
 
 pub fn toggle_focus() {
@@ -120,18 +118,6 @@ pub fn focus_menu() {
     );
 }
 
-/// GTK levelbar progress (continuous mode): trough with the filled block over it.
-pub fn levelbar(base: &Style, value: f64, filled: tiny_skia::Color, empty: tiny_skia::Color, height: f32) -> Node {
-    let paint = Rc::new(move |pm: &mut tiny_skia::PixmapMut, r: tiny_skia::Rect, ts: tiny_skia::Transform| {
-        fill_rect(pm, r, empty, ts);
-        if let Some(f) = tiny_skia::Rect::from_xywh(r.x(), r.y(), r.width() * value.clamp(0.0, 1.0) as f32, r.height()) {
-            fill_rect(pm, f, filled, ts);
-        }
-    });
-    let key = Some(crate::ui::node::hash(&(value.to_bits(), [filled, empty].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits)))));
-    Node::new(Kind::Custom { width: 0.0, height, key, paint }, base.inherit())
-}
-
 pub fn focus_task() -> Rc<Win> {
     let spec = Spec { name: "focusTask", anchor: Anchor::Top, layer: Layer::Top, per_monitor: true, ..Default::default() };
     let w = Win::new(spec, |_| {
@@ -141,14 +127,14 @@ pub fn focus_task() -> Rc<Win> {
         l = l.border(Sides::trbl(0.0, BORDER, BORDER, BORDER), blue3());
         l.font.size = 32.0;
         l.font.weight = 700;
-        l.background = Background::Color(dark1());
+        l.background = Some(dark1());
         let text = Style { padding: Sides::vh(SPACE_S, SPACE_M), ..l.inherit() };
-        let wait = break_wait().peek();
-        let progress = BREAK_START.with(|s| s.get()).map_or(0.0, |s| s.elapsed().as_secs_f64() / 10.0);
+        let start = break_start().peek();
+        let progress = start.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0 / WAIT_MS as f64);
         // the bar overlays the card's bottom edge, so the card keeps its size
         Node::vbox(base.inherit(), 0.0, vec![Node::overlay(l, vec![
             Node::label(text, focus_text().peek()),
-            levelbar(&base, progress, blue3(), rgba(255, 255, 255, 0.12), 6.0).align(Align::Fill, Align::End).show(wait),
+            levelbar(&base, progress, blue3(), rgba(255, 255, 255, 0.12), 6.0).align(Align::Fill, Align::End).show(start.is_some()),
         ])])
     });
     let fw = Rc::downgrade(&w);
@@ -158,11 +144,11 @@ pub fn focus_task() -> Rc<Win> {
             w.redraw();
         }
     });
-    w.watch(&break_wait());
-    // the 10s break bar steps at ~15Hz while it runs, not on every frame
+    w.watch(&break_start());
+    // the break bar steps at ~15Hz while it runs, not on every frame
     let fw = Rc::downgrade(&w);
-    break_wait().subscribe(move || {
-        if break_wait().peek() && !TICKING.with(|t| t.replace(true)) {
+    break_start().subscribe(move || {
+        if break_start().peek().is_some() && !TICKING.with(|t| t.replace(true)) {
             tick_bar(fw.clone());
         }
     });
@@ -170,10 +156,9 @@ pub fn focus_task() -> Rc<Win> {
 }
 
 fn tick_bar(w: std::rc::Weak<Win>) {
-    let Some(win) = w.upgrade().filter(|_| active() && BREAK_START.with(|s| s.get()).is_some()) else {
+    let Some(win) = w.upgrade().filter(|_| active() && break_start().peek().is_some()) else {
         return TICKING.with(|t| t.set(false));
     };
     win.redraw();
     runtime::timeout(66, move || tick_bar(w));
 }
-

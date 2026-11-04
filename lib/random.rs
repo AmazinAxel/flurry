@@ -37,11 +37,68 @@ pub fn below(n: u64) -> Option<u64> {
     None
 }
 
+/// Small uniform picks (secrets: password characters) from one getrandom buffer, refilled as
+/// rejection sampling uses it up; zeroed on drop.
+pub struct Rng {
+    buf: [u8; 256],
+    pos: usize,
+}
+
+impl Default for Rng {
+    fn default() -> Rng {
+        Rng { buf: [0; 256], pos: 256 }
+    }
+}
+
+impl Rng {
+    fn byte(&mut self) -> Option<u8> {
+        if self.pos == self.buf.len() {
+            if !fill(&mut self.buf) {
+                return None;
+            }
+            self.pos = 0;
+        }
+        self.pos += 1;
+        Some(self.buf[self.pos - 1])
+    }
+
+    /// Uniform in 0..n for 1 <= n <= 256 (bytes past the last whole multiple of n are rejected);
+    /// None if the kernel gives no randomness.
+    pub fn below(&mut self, n: usize) -> Option<usize> {
+        if n == 0 || n > 256 {
+            return None;
+        }
+        let limit = 256 - 256 % n;
+        loop {
+            let b = self.byte()? as usize;
+            if b < limit {
+                return Some(b % n);
+            }
+        }
+    }
+}
+
+impl Drop for Rng {
+    fn drop(&mut self) {
+        for b in &mut self.buf {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn below_is_in_range() {
         assert!(super::below(3).is_some_and(|i| i < 3));
         assert_eq!(super::below(0), None);
+    }
+
+    #[test]
+    fn rng_below_is_in_range() {
+        let mut r = super::Rng::default();
+        assert!((0..1000).all(|_| r.below(7).is_some_and(|i| i < 7)));
+        assert_eq!(r.below(256).map(|i| i < 256), Some(true));
+        assert_eq!(r.below(0), None);
     }
 }

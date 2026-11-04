@@ -1,9 +1,10 @@
 // Backlight via sysfs (no udev), set through logind.
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 
-use crate::lib::state::State;
 use crate::ui::runtime;
+use crate::ui::state::global_state;
 
 const DIR: &str = "/sys/class/backlight";
 
@@ -20,7 +21,6 @@ thread_local! {
         names.into_iter().min_by_key(|n| (rank(n), n.clone())).unwrap_or_default()
     };
     static MAX: u32 = read(&format!("{DIR}/{}/max_brightness", screen()));
-    static BRIGHTNESS: State<f64> = State::new(read(&path()) as f64 / max().max(1) as f64);
 }
 
 fn read(p: &str) -> u32 {
@@ -41,8 +41,8 @@ pub fn available() -> bool {
     !screen().is_empty()
 }
 
-pub fn brightness() -> State<f64> {
-    BRIGHTNESS.with(Clone::clone)
+global_state! {
+    pub fn brightness() -> f64 = read(&path()) as f64 / max().max(1) as f64;
 }
 
 pub fn set_brightness(percent: f64) {
@@ -59,21 +59,22 @@ pub fn set_brightness(percent: f64) {
 /// so this wakes only for brightness changes, not for every kernel uevent.
 pub fn monitor() {
     let Ok(file) = std::fs::File::open(format!("{DIR}/{}/actual_brightness", screen())) else { return };
-    // reading re-arms the notification; false once it fails (device gone)
+    // reading re-arms the notification; None once it fails (device gone)
     let fd = file.as_raw_fd();
     let rearm = move || {
         let mut b = [0u8; 16];
-        unsafe { libc::pread(file.as_raw_fd(), b.as_mut_ptr().cast(), b.len(), 0) >= 0 }
+        let n = file.read_at(&mut b, 0).ok()?;
+        Some(std::str::from_utf8(&b[..n]).ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0))
     };
-    if !rearm() {
+    if rearm().is_none() {
         return;
     }
     runtime::watch_pri(fd, move || {
-        if !rearm() {
+        let Some(level) = rearm() else {
             // an unread sysfs notification would wake poll() forever
             runtime::unwatch(fd);
             return;
-        }
-        brightness().set(read(&path()) as f64 / max().max(1) as f64);
+        };
+        brightness().set(level as f64 / max().max(1) as f64);
     });
 }

@@ -2,10 +2,12 @@
 // the user's subscription. The page talks to us through console messages (\u{1}claude:user <parts>,
 // \u{1}claude:stop, \u{1}claude:new, \u{1}open:<url>); we build the stream-json input from those,
 // and its output lines go back as data: window.__claude([<line as a JSON string>, ...]).
+// std + libc only: flurry's Cargo.toml also builds it as a test target (CI can't build Servo).
+#![cfg_attr(test, allow(dead_code))]
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -88,15 +90,6 @@ pub fn quote(s: &str) -> String {
     out
 }
 
-/// The page is read from FLURRY_CLAUDE_PAGE (set by the package wrapper; kept out of the binary so
-/// page edits don't rebuild Servo); debug builds fall back to the source tree. A release build's
-/// source path means nothing at runtime (and anyone could create it), so there is no page then.
-pub fn page_url() -> Option<url::Url> {
-    let page = std::env::var_os("FLURRY_CLAUDE_PAGE").map(PathBuf::from);
-    let page = page.or_else(|| cfg!(debug_assertions).then(|| concat!(env!("CARGO_MANIFEST_DIR"), "/claude").into()))?;
-    url::Url::from_file_path(page.join("index.html")).ok()
-}
-
 /// Where `claude` is: $PATH, then the user profiles (the service PATH may lack them).
 fn find_bin() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -113,8 +106,10 @@ fn find_bin() -> Option<PathBuf> {
 pub struct Chat {
     proc: Option<(Child, ChildStdin, ChildStdout)>,
     buf: Vec<u8>,
-    /// input not yet taken by Claude Code (stdin is nonblocking: a big image must not stall the panel)
+    /// input not yet taken by Claude Code from `sent` on (stdin is nonblocking: a big image must
+    /// not stall the panel); emptied once all of it went
     out: Vec<u8>,
+    sent: usize,
     /// found once, looked up again only if it stops working
     bin: Option<PathBuf>,
     stops: u32,
@@ -135,7 +130,7 @@ impl Chat {
 
     fn spawn(&mut self) -> Option<(Child, ChildStdin, ChildStdout)> {
         let cwd = dir()?;
-        let _ = std::fs::create_dir_all(&cwd);
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&cwd);
         if self.bin.is_none() {
             self.bin = find_bin();
         }
@@ -189,17 +184,21 @@ impl Chat {
     /// more ever (gone).
     pub fn flush(&mut self) -> bool {
         let Some((_, stdin, _)) = &mut self.proc else { return false };
-        while !self.out.is_empty() {
-            match stdin.write(&self.out) {
-                Ok(n) if n > 0 => drop(self.out.drain(..n)),
+        while self.sent < self.out.len() {
+            match stdin.write(&self.out[self.sent..]) {
+                Ok(n) if n > 0 => self.sent += n,
                 // the rest on POLLOUT
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
                 _ => {
-                    self.out.clear(); // nothing left to poll for
+                    // nothing left to poll for
+                    self.out.clear();
+                    self.sent = 0;
                     return false;
                 }
             }
         }
+        self.out.clear();
+        self.sent = 0;
         true
     }
 
@@ -239,6 +238,7 @@ impl Chat {
         }
         self.buf.clear();
         self.out.clear();
+        self.sent = 0;
     }
 
     /// Complete event lines read so far; an `exit` event once the process is gone.
@@ -254,14 +254,17 @@ impl Chat {
                 Err(_) => break true,
             }
         };
-        while let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=i).collect();
-            let line = String::from_utf8_lossy(&line).trim().to_string();
+        // complete lines only, and one drain for all of them
+        let end = self.buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        for line in self.buf[..end].split(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(line);
+            let line = line.trim();
             // only what the page renders: text/thinking deltas and the end of a turn
             if line.contains("\"text_delta\"") || line.contains("\"thinking_delta\"") || line.contains("\"type\":\"result\"") {
-                lines.push(line);
+                lines.push(line.to_string());
             }
         }
+        self.buf.drain(..end);
         if eof {
             self.reset();
             lines.push(r#"{"type":"exit"}"#.into());
@@ -294,6 +297,30 @@ mod tests {
         assert!(user_message(" img:image/svg+xml:AAAA").is_none());
         assert!(user_message(" img:image/png:AA\"A").is_none());
         assert!(user_message(" foo").is_none());
+    }
+
+    #[test]
+    fn partial_writes() {
+        let mut child = Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        let mut chat = Chat::default();
+        chat.proc = Some((child, stdin, stdout));
+        // more than the pipe takes at once: the rest goes in over several flushes, in order
+        let line: String = (0..4_000_000u32).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        assert!(chat.write(&line));
+        assert!(chat.write_fd() >= 0);
+        let mut got = vec![];
+        let mut chunk = [0u8; 65536];
+        while got.len() <= line.len() {
+            assert!(chat.flush());
+            let (_, _, out) = chat.proc.as_mut().unwrap();
+            let n = out.read(&mut chunk).unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(got, format!("{line}\n").into_bytes());
+        assert_eq!((chat.write_fd(), chat.out.len(), chat.sent), (-1, 0, 0));
     }
 
     #[test]

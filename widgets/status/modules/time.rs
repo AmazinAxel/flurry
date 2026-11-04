@@ -21,7 +21,7 @@ fn row(base: &Style, s: String, size: f32, weight: u16, bearing: (f32, f32)) -> 
     t.margin = Sides::trbl(RAISE * size, -bearing.1 * size, -RAISE * size, -bearing.0 * size);
     // lockscreen clock look: pale fill, dark drop shadow, wide blue glow
     t.color = alpha(blue1(), 0.9);
-    t.text_shadow = vec![glow(size / 6.0, alpha(blue2(), 0.8))];
+    t.text_shadow = Some(glow(size / 6.0, alpha(blue2(), 0.8)));
     Node::label(t, s).align(Align::Center, Align::Start)
 }
 
@@ -39,12 +39,4 @@ pub fn date(base: &Style, size: f32, day_size: f32, gap: f32) -> Node {
         row(base, format_now("%d"), size, 400, b),
         row(base, format_now("%a"), day_size, 400, DAY_BEARING),
     ])
-}
-
-/// Ink height of the clock and date columns.
-pub fn clock_height(size: f32, gap: f32) -> f32 {
-    2.0 * INK * size + gap
-}
-pub fn date_height(size: f32, day_size: f32, gap: f32) -> f32 {
-    2.0 * INK * size + INK * day_size + 2.0 * gap
 }

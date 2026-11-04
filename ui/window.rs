@@ -1,5 +1,5 @@
-// Named windows (app.toggle_window / get_window), per-monitor instances, focus chains with GTK-like
-// arrow navigation, and redraw-on-state-change wiring.
+// Named windows (toggled by name), per-monitor instances, focus chains with GTK-like arrow
+// navigation, and redraw-on-state-change wiring.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -8,10 +8,11 @@ use std::rc::Rc;
 use tiny_skia::Rect;
 
 use super::node::Node;
-use super::wayland::{self, Anchor, KeyEvent, Keymode, Layer, LayerSpec, PointerEvent, Surface};
-use crate::lib::state::State;
+use super::state::State;
+use super::wayland::{self, Anchor, KeyEvent, Keymode, Layer, PointerEvent, Surface};
 use wayland_client::Proxy;
 use wayland_client::backend::ObjectId;
+use wayland_client::protocol::wl_output::WlOutput;
 
 #[derive(Clone)]
 pub struct Spec {
@@ -20,7 +21,7 @@ pub struct Spec {
     pub anchor: Anchor,
     pub keymode: Keymode,
     pub exclusive: i32,
-    /// rgba dim behind content (`.backgroundDim`)
+    /// rgba dim behind content
     pub dim: Option<[f32; 4]>,
     pub input: bool,
     pub per_monitor: bool,
@@ -45,13 +46,9 @@ impl Default for Spec {
     }
 }
 
-/// What a window's build function sees.
-pub struct View {
-    pub focus: Option<String>,
-}
-
-pub type Build = Rc<dyn Fn(&View) -> Node>;
-pub type KeyHandler = Rc<dyn Fn(&KeyEvent) -> bool>;
+/// Builds the window's tree; gets the focused node's id.
+pub type Build = Rc<dyn Fn(Option<&str>) -> Node>;
+pub type KeyHandler = Rc<dyn Fn(&KeyEvent)>;
 
 pub struct Win {
     pub spec: RefCell<Spec>,
@@ -62,7 +59,7 @@ pub struct Win {
     /// id'd nodes of the last render: id, rect, focusable
     rects: RefCell<Vec<(String, Rect, bool)>>,
     key: RefCell<Option<KeyHandler>>,
-    pointer: RefCell<Option<Rc<dyn Fn(PointerEvent, &str)>>>,
+    pointer: RefCell<Option<Rc<dyn Fn(PointerEvent)>>>,
     on_show: RefCell<Vec<Rc<dyn Fn()>>>,
     pub visibility: State<bool>,
     image: RefCell<Option<Rc<wayland::ShmImage>>>,
@@ -102,9 +99,8 @@ pub fn set_visible(name: &str, v: bool) {
     }
 }
 
-
 impl Win {
-    pub fn new(spec: Spec, build: impl Fn(&View) -> Node + 'static) -> Rc<Win> {
+    pub fn new(spec: Spec, build: impl Fn(Option<&str>) -> Node + 'static) -> Rc<Win> {
         let w = Rc::new(Win {
             spec: RefCell::new(spec.clone()),
             build: Rc::new(build),
@@ -200,53 +196,51 @@ impl Win {
     pub fn on_show(&self, f: impl Fn() + 'static) {
         self.on_show.borrow_mut().push(Rc::new(f));
     }
-    pub fn on_key(&self, f: impl Fn(&KeyEvent) -> bool + 'static) {
+    pub fn on_key(&self, f: impl Fn(&KeyEvent) + 'static) {
         *self.key.borrow_mut() = Some(Rc::new(f));
     }
-    pub fn on_pointer(&self, f: impl Fn(PointerEvent, &str) + 'static) {
+    pub fn on_pointer(&self, f: impl Fn(PointerEvent) + 'static) {
         *self.pointer.borrow_mut() = Some(Rc::new(f));
     }
 
     fn sync_outputs(self: &Rc<Self>) {
         let spec = self.spec.borrow().clone();
-        let outputs = wayland::outputs();
-        let wanted: Vec<(Option<ObjectId>, String, Option<_>)> = if spec.per_monitor {
-            outputs.iter().map(|o| (Some(o.wl.id()), o.name.clone(), Some(o.wl.clone()))).collect()
+        let wanted: Vec<(Option<ObjectId>, Option<WlOutput>)> = if spec.per_monitor {
+            wayland::outputs().into_iter().map(|o| (Some(o.wl.id()), Some(o.wl))).collect()
         } else {
-            vec![(None, String::new(), None)]
+            vec![(None, None)]
         };
-        self.surfaces.borrow_mut().retain(|(k, s)| s.alive() && wanted.iter().any(|(w, _, _)| w == k));
-        for (key, name, output) in wanted {
+        self.surfaces.borrow_mut().retain(|(k, s)| s.alive() && wanted.iter().any(|(w, _)| w == k));
+        for (key, output) in wanted {
             if self.surfaces.borrow().iter().any(|(k, _)| *k == key) {
                 continue;
             }
-            let surface = Rc::new(self.create(&spec, name, output));
+            let surface = Rc::new(self.create(&spec, output.as_ref()));
             self.surfaces.borrow_mut().push((key, surface));
         }
     }
 
-    fn create(self: &Rc<Self>, spec: &Spec, output_name: String, output: Option<wayland_client::protocol::wl_output::WlOutput>) -> Surface {
+    fn create(self: &Rc<Self>, spec: &Spec, output: Option<&WlOutput>) -> Surface {
         let weak = Rc::downgrade(self);
         let build: wayland::BuildFn = Rc::new(move || {
             let Some(win) = weak.upgrade() else { return Node::label(Default::default(), "") };
-            let view = View { focus: win.focus.borrow().clone() };
-            (win.build)(&view)
+            // cloned, not borrowed: the build may grab focus
+            let focus = win.focus.borrow().clone();
+            (win.build)(focus.as_deref())
         });
-        let layer = LayerSpec {
-            namespace: spec.name,
-            layer: spec.layer,
-            anchor: spec.anchor,
-            keymode: spec.keymode,
-            exclusive: spec.exclusive,
-            output,
-            dim: spec.dim,
-            input: spec.input,
-            width: spec.width,
-            height: spec.height,
-        };
-        let s = Surface::layer(layer, build);
+        let s = Surface::layer(spec, output, build);
         if let Some(img) = self.image.borrow().clone() {
             s.set_image(img);
+        }
+        if !spec.per_monitor {
+            // closed by the compositor: hidden, so the next show maps a new one (per-monitor
+            // surfaces follow their outputs instead)
+            let weak = Rc::downgrade(self);
+            s.on_closed(move || {
+                if let Some(w) = weak.upgrade() {
+                    w.set_visible(false);
+                }
+            });
         }
         let weak = Rc::downgrade(self);
         s.on_key(move |ev| {
@@ -258,12 +252,11 @@ impl Win {
             }
         });
         let weak = Rc::downgrade(self);
-        let name = output_name;
         s.on_pointer(move |ev| {
             if let Some(w) = weak.upgrade() {
                 let h = w.pointer.borrow().clone();
                 if let Some(h) = h {
-                    h(ev, &name);
+                    h(ev);
                 }
             }
         });
@@ -279,18 +272,27 @@ impl Win {
         s
     }
 
+    /// The surface whose commits `after_commit`/`on_commit` wait on: none while hidden (no frame
+    /// is coming).
+    fn committing(&self) -> Option<Rc<Surface>> {
+        if !self.visible() {
+            return None;
+        }
+        self.surfaces.borrow().iter().map(|(_, s)| s).find(|s| s.alive()).cloned()
+    }
+
     /// Runs `f` once the first surface's next frame has gone out (right away when not shown).
     pub fn after_commit(&self, f: impl FnOnce() + 'static) {
-        match self.surfaces.borrow().first() {
-            Some((_, s)) => s.after_commit(f),
+        match self.committing() {
+            Some(s) => s.after_commit(f),
             None => super::runtime::idle(f),
         }
     }
 
     /// Runs `f` right after the first surface's next commit, ahead of the flush.
     pub fn on_commit(&self, f: impl FnOnce() + 'static) {
-        match self.surfaces.borrow().first() {
-            Some((_, s)) => s.on_commit(f),
+        match self.committing() {
+            Some(s) => s.on_commit(f),
             None => super::runtime::idle(f),
         }
     }
@@ -358,14 +360,14 @@ impl Win {
     /// GTK child_focus with a direction: nearest focusable that way; returns false at the edge.
     pub fn child_focus(&self, dir: Dir) -> bool {
         let list = self.focusables();
-        let Some(cur) = self.focused() else {
+        // nothing focused, or the focused node gone from the tree: start at the first
+        let Some(&(_, cr)) = self.focused().and_then(|cur| list.iter().find(|(id, _)| *id == cur)) else {
             if let Some((id, _)) = list.first() {
                 self.grab_focus(&id.clone());
                 return true;
             }
             return false;
         };
-        let Some(&(_, cr)) = list.iter().find(|(id, _)| *id == cur) else { return false };
         match pick(&list, cr, dir) {
             Some(id) => {
                 self.grab_focus(&id);
@@ -375,7 +377,7 @@ impl Win {
         }
     }
 
-    /// Arrow navigation with wrap-around (lib/wrapFocus.ts).
+    /// Arrow navigation with wrap-around.
     pub fn wrap_focus(&self, dir: Dir) {
         if self.child_focus(dir) {
             return;
@@ -392,6 +394,37 @@ impl Win {
         }
         if let Some(id) = far {
             self.grab_focus(&id);
+        }
+    }
+
+    /// Tab / Shift+Tab: next or previous focusable in tree order, wrapping around (GTK focus chain).
+    pub fn focus_step(&self, forward: bool) -> bool {
+        let list = self.focusables();
+        if list.is_empty() {
+            return false;
+        }
+        let cur = self.focused().and_then(|f| list.iter().position(|(id, _)| *id == f));
+        let n = list.len();
+        let next = match (cur, forward) {
+            (None, true) => 0,
+            (None, false) => n - 1,
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+        };
+        self.grab_focus(&list[next].0.clone());
+        true
+    }
+
+    /// Layout rect of node `id` from the last render.
+    pub fn rect_of(&self, id: &str) -> Option<Rect> {
+        self.rects.borrow().iter().find(|(i, _, _)| i == id).map(|(_, r, _)| *r)
+    }
+
+    /// Shows a shared image on every surface (wallpaper) instead of a rendered tree.
+    pub fn set_image(&self, img: Rc<wayland::ShmImage>) {
+        *self.image.borrow_mut() = Some(img.clone());
+        for s in self.surfaces() {
+            s.set_image(img.clone());
         }
     }
 }
@@ -450,43 +483,4 @@ fn pick(list: &[(String, Rect)], cur: Rect, dir: Dir) -> Option<String> {
         })
         .min_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)).then(a.1.2.total_cmp(&b.1.2)))
         .map(|(id, _)| id.clone())
-}
-
-impl Win {
-    /// Shows a shared image on every surface (wallpaper) instead of a rendered tree.
-    pub fn set_image(&self, img: Option<Rc<wayland::ShmImage>>) {
-        *self.image.borrow_mut() = img.clone();
-        if let Some(img) = img {
-            for s in self.surfaces() {
-                s.set_image(img.clone());
-            }
-        }
-    }
-}
-
-impl Win {
-    /// Layout rect of node `id` from the last render.
-    pub fn rect_of(&self, id: &str) -> Option<Rect> {
-        self.rects.borrow().iter().find(|(i, _, _)| i == id).map(|(_, r, _)| *r)
-    }
-}
-
-impl Win {
-    /// Tab / Shift+Tab: next or previous focusable in tree order, wrapping around (GTK focus chain).
-    pub fn focus_step(&self, forward: bool) -> bool {
-        let list = self.focusables();
-        if list.is_empty() {
-            return false;
-        }
-        let cur = self.focused().and_then(|f| list.iter().position(|(id, _)| *id == f));
-        let n = list.len();
-        let next = match (cur, forward) {
-            (None, true) => 0,
-            (None, false) => n - 1,
-            (Some(i), true) => (i + 1) % n,
-            (Some(i), false) => (i + n - 1) % n,
-        };
-        self.grab_focus(&list[next].0.clone());
-        true
-    }
 }

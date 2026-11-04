@@ -52,12 +52,19 @@ mod ffi {
         pub width: i32,
         pub height: i32,
     }
+    #[repr(C)]
+    pub struct hb_variation {
+        pub tag: u32,
+        pub value: f32,
+    }
 
     pub type MoveFn = extern "C" fn(*mut hb_draw_funcs, *mut c_void, *mut c_void, f32, f32, *mut c_void);
     pub type QuadFn = extern "C" fn(*mut hb_draw_funcs, *mut c_void, *mut c_void, f32, f32, f32, f32, *mut c_void);
     pub type CubicFn =
         extern "C" fn(*mut hb_draw_funcs, *mut c_void, *mut c_void, f32, f32, f32, f32, f32, f32, *mut c_void);
     pub type CloseFn = extern "C" fn(*mut hb_draw_funcs, *mut c_void, *mut c_void, *mut c_void);
+
+    pub const HB_DIRECTION_LTR: c_uint = 4;
 
     #[link(name = "harfbuzz")]
     unsafe extern "C" {
@@ -70,6 +77,8 @@ mod ffi {
         pub fn hb_face_destroy(face: *mut hb_face);
         pub fn hb_font_create(face: *mut hb_face) -> *mut hb_font;
         pub fn hb_font_set_scale(font: *mut hb_font, x: c_int, y: c_int);
+        pub fn hb_font_set_variations(font: *mut hb_font, vars: *const hb_variation, n: c_uint);
+        pub fn hb_ot_var_has_data(face: *mut hb_face) -> c_int;
         pub fn hb_font_get_h_extents(font: *mut hb_font, ext: *mut hb_font_extents) -> c_int;
         pub fn hb_font_get_nominal_glyph(font: *mut hb_font, cp: u32, glyph: *mut u32) -> c_int;
         pub fn hb_font_get_glyph_extents(font: *mut hb_font, glyph: u32, ext: *mut hb_glyph_extents) -> c_int;
@@ -77,6 +86,7 @@ mod ffi {
         pub fn hb_buffer_create() -> *mut hb_buffer;
         pub fn hb_buffer_destroy(buf: *mut hb_buffer);
         pub fn hb_buffer_add_utf8(buf: *mut hb_buffer, text: *const c_char, len: c_int, off: c_uint, n: c_int);
+        pub fn hb_buffer_set_direction(buf: *mut hb_buffer, dir: c_uint);
         pub fn hb_buffer_guess_segment_properties(buf: *mut hb_buffer);
         pub fn hb_buffer_get_glyph_infos(buf: *mut hb_buffer, len: *mut c_uint) -> *mut hb_glyph_info;
         pub fn hb_buffer_get_glyph_positions(buf: *mut hb_buffer, len: *mut c_uint) -> *mut hb_glyph_position;
@@ -97,15 +107,21 @@ struct Face {
     font: *mut hb_font,
     upem: f32,
     png: bool,
+    /// has a wght axis (or others): opened once more per weight
+    variable: bool,
+    /// bounded, dropped by trim_caches
     outlines: RefCell<HashMap<u32, Option<Rc<Path>>>>,
 }
 
 impl Face {
-    fn open(path: &str, index: u32) -> Option<Face> {
+    /// `wght` > 0 sets that axis on a variable face. fontconfig's named-instance bits of `index` are
+    /// dropped: it never reports the variations it matched (Sora's Regular for medium), so the
+    /// weight is set here instead.
+    fn open(path: &str, index: u32, wght: f32) -> Option<Face> {
         let c = CString::new(path).ok()?;
         unsafe {
             let blob = hb_blob_create_from_file(c.as_ptr());
-            let face = hb_face_create(blob, index);
+            let face = hb_face_create(blob, index & 0xFFFF);
             hb_blob_destroy(blob);
             // an unreadable file still makes an (empty) face
             if hb_face_get_glyph_count(face) == 0 {
@@ -114,10 +130,15 @@ impl Face {
             }
             let upem = hb_face_get_upem(face) as f32;
             let png = hb_ot_color_has_png(face) != 0;
+            let variable = hb_ot_var_has_data(face) != 0;
             let font = hb_font_create(face);
             hb_face_destroy(face); // the font holds its own reference
             hb_font_set_scale(font, upem as c_int, upem as c_int);
-            Some(Face { font, upem, png, outlines: RefCell::default() })
+            if variable && wght > 0.0 {
+                // clamped to the axis range by HarfBuzz
+                hb_font_set_variations(font, &hb_variation { tag: u32::from_be_bytes(*b"wght"), value: wght }, 1);
+            }
+            Some(Face { font, upem, png, variable, outlines: RefCell::default() })
         }
     }
 
@@ -132,7 +153,11 @@ impl Face {
             return p.clone();
         }
         let path = draw_glyph(self.font, glyph).map(Rc::new);
-        self.outlines.borrow_mut().insert(glyph, path.clone());
+        let mut m = self.outlines.borrow_mut();
+        if m.len() >= 2048 {
+            m.clear();
+        }
+        m.insert(glyph, path.clone());
         path
     }
 
@@ -206,14 +231,21 @@ fn draw_glyph(font: *mut hb_font, glyph: u32) -> Option<Path> {
 
 /// A family resolved to its primary face plus fontconfig's fallback chain.
 struct Family {
-    faces: Vec<Rc<Face>>,
-    /// fontconfig 90-synthetic.conf: bold requested from a face no heavier than medium
-    embolden: Vec<bool>,
+    /// and embolden (fontconfig 90-synthetic.conf: bold requested from a face no heavier than medium)
+    faces: Vec<(Rc<Face>, bool)>,
 }
 
 thread_local! {
     static FAMILIES: RefCell<HashMap<(&'static str, i32), Rc<Family>>> = RefCell::default();
-    static FILES: RefCell<HashMap<(&'static str, u32), Option<Rc<Face>>>> = RefCell::default();
+    /// (file, index, wght bits; 0 unvaried)
+    static FILES: RefCell<HashMap<(&'static str, u32, u32), Option<Rc<Face>>>> = RefCell::default();
+}
+
+/// A file's face, at `wght` if it is variable.
+fn open_face(file: &'static str, index: u32, wght: f32) -> Option<Rc<Face>> {
+    let get = |w: f32| FILES.with(|m| m.borrow_mut().entry((file, index, w.to_bits())).or_insert_with(|| Face::open(file, index, w).map(Rc::new)).clone());
+    let base = get(0.0)?;
+    if base.variable { get(wght) } else { Some(base) }
 }
 
 /// (family, fontconfig weight, file, index, embolden), in fallback order.
@@ -243,16 +275,11 @@ fn family(name: &'static str, weight: i32) -> Rc<Family> {
     }
     let rows = font_rows().iter().filter(|r| r.0 == name);
     let nearest = rows.clone().map(|r| r.1).min_by_key(|w| (w - weight).abs());
-    let mut faces = vec![];
-    let mut embolden = vec![];
-    for &(_, _, file, index, bold) in rows.filter(|r| Some(r.1) == nearest) {
-        let face = FILES.with(|m| m.borrow_mut().entry((file, index)).or_insert_with(|| Face::open(file, index).map(Rc::new)).clone());
-        if let Some(f) = face {
-            faces.push(f);
-            embolden.push(bold);
-        }
-    }
-    let fam = Rc::new(Family { faces, embolden });
+    // the CSS weight fc_weight came from
+    let wght = match weight { ..=80 => 400.0, 81..=100 => 500.0, 101..=180 => 600.0, _ => 700.0 };
+    let rows = rows.filter(|r| Some(r.1) == nearest);
+    let faces = rows.filter_map(|&(_, _, file, index, bold)| Some((open_face(file, index, wght)?, bold))).collect();
+    let fam = Rc::new(Family { faces });
     FAMILIES.with(|m| m.borrow_mut().insert((name, weight), fam.clone()));
     fam
 }
@@ -335,9 +362,8 @@ pub enum Wrap {
     Word,
 }
 
-struct Run {
-    glyphs: Vec<(usize, u32, f32, f32, f32, usize)>, // face, glyph, advance, x_off, y_off, byte cluster
-}
+/// face, glyph, advance, x_off, y_off, byte cluster
+type Shaped = (usize, u32, f32, f32, f32, usize);
 
 /// Combining marks, ZWJ, variation selectors, skin tones and tags: shaped with what precedes them.
 fn joins_previous(c: char) -> bool {
@@ -347,39 +373,46 @@ fn joins_previous(c: char) -> bool {
         | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0xE0100..=0xE01EF)
 }
 
-fn shape_run(fam: &Family, size: f32, text: &str) -> Run {
-    // Split into runs per face: first face that has the char, like Pango's fallback.
+/// Shapes one paragraph left to right. Runs split per face (first face that has the char, like
+/// Pango's fallback).
+fn shape_run(fam: &Family, size: f32, text: &str) -> Vec<Shaped> {
     let mut glyphs = vec![];
     if fam.faces.is_empty() {
-        return Run { glyphs };
+        return glyphs;
     }
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     // a char asking for emoji presentation (VS16) takes a color face that has it
     let face_for = |k: usize| {
         let c = chars[k].1;
         let color = chars.get(k + 1).is_some_and(|n| n.1 == '\u{FE0F}');
-        color.then(|| fam.faces.iter().position(|f| f.png && f.has(c))).flatten().or_else(|| fam.faces.iter().position(|f| f.has(c))).unwrap_or(0)
+        let faces = &fam.faces;
+        color.then(|| faces.iter().position(|(f, _)| f.png && f.has(c))).flatten().or_else(|| faces.iter().position(|(f, _)| f.has(c))).unwrap_or(0)
     };
     let mut i = 0;
     while i < chars.len() {
         let face = face_for(i);
         let mut j = i + 1;
-        while j < chars.len() && (chars[j].1.is_whitespace() || joins_previous(chars[j].1) || face_for(j) == face) {
+        while j < chars.len() {
+            let c = chars[j].1;
+            if !joins_previous(c) && !c.is_whitespace() && face_for(j) != face {
+                break;
+            }
             j += 1;
         }
         let begin = chars[i].0;
         let end = if j < chars.len() { chars[j].0 } else { text.len() };
-        shape_face(&fam.faces[face], face, size, &text[begin..end], begin, &mut glyphs);
+        shape_face(&fam.faces[face].0, face, size, &text[begin..end], begin, &mut glyphs);
         i = j;
     }
-    Run { glyphs }
+    glyphs
 }
 
-fn shape_face(f: &Face, idx: usize, size: f32, s: &str, base: usize, out: &mut Vec<(usize, u32, f32, f32, f32, usize)>) {
+fn shape_face(f: &Face, idx: usize, size: f32, s: &str, base: usize, out: &mut Vec<Shaped>) {
     let scale = size / f.upem;
     unsafe {
         let buf = hb_buffer_create();
         hb_buffer_add_utf8(buf, s.as_ptr().cast(), s.len() as c_int, 0, s.len() as c_int);
+        hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
         hb_buffer_guess_segment_properties(buf);
         hb_shape(f.font, buf, std::ptr::null(), 0);
         let (mut n, mut m) = (0, 0);
@@ -413,9 +446,11 @@ thread_local! {
 
 const LAYOUT_CACHE: usize = 512;
 
-/// Drops every cached layout, glyph mask and color glyph (nothing on screen needs them right now).
+/// Drops every cached layout, outline, glyph mask and color glyph (nothing on screen needs them
+/// right now).
 pub fn trim_caches() {
     LAYOUTS.with(|c| *c.borrow_mut() = HashMap::new());
+    FILES.with(|m| m.borrow().values().flatten().for_each(|f| *f.outlines.borrow_mut() = HashMap::new()));
     GLYPHS.with(|c| *c.borrow_mut() = (HashMap::new(), 0));
     EMOJI.with(|c| *c.borrow_mut() = HashMap::new());
 }
@@ -490,7 +525,7 @@ pub fn layout_spaced(
 
 fn layout_uncached(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, ellipsize: bool) -> Layout {
     let fam = family(font.family, font.fc_weight());
-    let (ascent, descent) = fam.faces.first().map(|f| f.extents()).unwrap_or((0.8, 0.2));
+    let (ascent, descent) = fam.faces.first().map(|(f, _)| f.extents()).unwrap_or((0.8, 0.2));
     let (ascent, descent) = (ascent * font.size, descent * font.size);
     // no tab stops or carriage returns: tabs are spaces, CRs are dropped
     let clean;
@@ -506,24 +541,27 @@ fn layout_uncached(text: &str, font: &Font, max_width: Option<f32>, wrap: Wrap, 
         match (max_width, wrap) {
             (Some(max), Wrap::Word) => wrap_run(para, &run, max, &mut lines),
             (Some(max), Wrap::None) if ellipsize => lines.push(ellipsize_run(&fam, font, &run, max)),
-            _ => lines.push(to_line(&run.glyphs)),
+            _ => lines.push(to_line(&run)),
         }
     }
     Layout { family: fam, size: font.size, lines, ascent, line_height: (ascent + descent).ceil(), hash: Cell::new(0) }
 }
 
-fn to_line(glyphs: &[(usize, u32, f32, f32, f32, usize)]) -> Line {
-    let mut x = 0.0;
-    let mut out = Vec::with_capacity(glyphs.len());
+/// Places `glyphs` after the end of `line`.
+fn append(line: &mut Line, glyphs: &[Shaped]) {
     for &(face, id, adv, xo, yo, _) in glyphs {
-        out.push(Glyph { face, id, x: x + xo, y: yo });
-        x += adv;
+        line.glyphs.push(Glyph { face, id, x: line.width + xo, y: yo });
+        line.width += adv;
     }
-    Line { glyphs: out, width: x }
 }
 
-fn wrap_run(text: &str, run: &Run, max: f32, lines: &mut Vec<Line>) {
-    let g = &run.glyphs;
+fn to_line(glyphs: &[Shaped]) -> Line {
+    let mut line = Line { glyphs: Vec::with_capacity(glyphs.len()), width: 0.0 };
+    append(&mut line, glyphs);
+    line
+}
+
+fn wrap_run(text: &str, g: &[Shaped], max: f32, lines: &mut Vec<Line>) {
     let mut start = 0;
     while start < g.len() {
         let mut x = 0.0;
@@ -551,21 +589,30 @@ fn wrap_run(text: &str, run: &Run, max: f32, lines: &mut Vec<Line>) {
             visible -= 1;
         }
         lines.push(to_line(&g[start..visible]));
+        // nor do the spaces a break lands before
         start = end;
+        while start < g.len() && text[g[start].5..].starts_with(' ') {
+            start += 1;
+        }
     }
     if g.is_empty() {
         lines.push(Line::default());
     }
 }
 
-fn ellipsize_run(fam: &Family, font: &Font, run: &Run, max: f32) -> Line {
-    let full = to_line(&run.glyphs);
+/// "…" and its width.
+fn dots(fam: &Family, font: &Font) -> (Vec<Shaped>, f32) {
+    let dots = shape_run(fam, font.size, "…");
+    let w = dots.iter().map(|g| g.2).sum();
+    (dots, w)
+}
+
+fn ellipsize_run(fam: &Family, font: &Font, g: &[Shaped], max: f32) -> Line {
+    let full = to_line(g);
     if full.width <= max {
         return full;
     }
-    let dots = shape_run(fam, font.size, "…");
-    let dots_w: f32 = dots.glyphs.iter().map(|g| g.2).sum();
-    let g = &run.glyphs;
+    let (dots, dots_w) = dots(fam, font);
     let mut keep = 0;
     let mut x = 0.0;
     while keep < g.len() && x + g[keep].2 + dots_w <= max {
@@ -576,26 +623,20 @@ fn ellipsize_run(fam: &Family, font: &Font, run: &Run, max: f32) -> Line {
     while keep > 0 && keep < g.len() && g[keep].5 == g[keep - 1].5 {
         keep -= 1;
     }
-    let mut glyphs = g[..keep].to_vec();
-    glyphs.extend(dots.glyphs);
-    to_line(&glyphs)
+    let mut line = to_line(&g[..keep]);
+    append(&mut line, &dots);
+    line
 }
 
 /// A cut line ended with an ellipsis, glyphs dropped from its end until it fits in `max`.
 fn ellipsize_line(fam: &Family, font: &Font, line: &mut Line, max: f32) {
-    let dots = shape_run(fam, font.size, "…");
-    let dots_w: f32 = dots.glyphs.iter().map(|g| g.2).sum();
+    let (dots, dots_w) = dots(fam, font);
     while line.width + dots_w > max
         && let Some(g) = line.glyphs.pop()
     {
         line.width = g.x;
     }
-    let mut x = line.width;
-    for &(face, id, adv, xo, yo, _) in &dots.glyphs {
-        line.glyphs.push(Glyph { face, id, x: x + xo, y: yo });
-        x += adv;
-    }
-    line.width = x;
+    append(line, &dots);
 }
 
 thread_local! {
@@ -621,8 +662,16 @@ pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, 
                 continue;
             }
         }
+        // nor glyphs left or right of it (a scrolled entry); two em cover any glyph's overhang
+        let margin = 2.0 * layout.size * dev_scale;
         for g in &line.glyphs {
-            let face = &fam.faces[g.face];
+            if axis {
+                let gx = ts.sx * (x + g.x) + ts.tx;
+                if gx < -margin || gx > pixmap.width() as f32 + margin {
+                    continue;
+                }
+            }
+            let (face, bold) = &fam.faces[g.face];
             let s = layout.size / face.upem;
             if face.png
                 && let Some(cg) = emoji(face, g.id, s * dev_scale)
@@ -636,14 +685,14 @@ pub fn draw(pixmap: &mut tiny_skia::PixmapMut, layout: &Layout, x: f32, y: f32, 
                     let pp = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, opacity: color.alpha(), ..Default::default() };
                     pixmap.draw_pixmap(0, 0, png.as_ref(), &pp, t, None);
                 }
+                continue;
+            }
+            let t = ts.pre_translate(x + g.x, baseline + g.y).pre_scale(s, s);
+            if t.kx == 0.0 && t.ky == 0.0 && t.sx == t.sy && t.sx > 0.0 {
+                blit_glyph(pixmap, face, g.id, *bold, t, color);
             } else if let Some(path) = face.outline(g.id) {
-                let t = ts.pre_translate(x + g.x, baseline + g.y).pre_scale(s, s);
-                if t.kx == 0.0 && t.ky == 0.0 && t.sx == t.sy && t.sx > 0.0 {
-                    blit_glyph(pixmap, face, g.id, &path, fam.embolden[g.face], t, color);
-                    continue;
-                }
                 pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, t, None);
-                if fam.embolden[g.face] {
+                if *bold {
                     // cairo/FreeType synthetic bold: outline grown by em/24
                     let stroke = tiny_skia::Stroke { width: face.upem / 24.0, ..Default::default() };
                     pixmap.stroke_path(&path, &paint, &stroke, t, None);
@@ -688,15 +737,16 @@ thread_local! {
 const GLYPH_BUDGET: usize = 4 << 20;
 
 /// Draws an outline glyph from its cached coverage mask: rasterizing every glyph every frame was
-/// most of a text-heavy window's paint time. Positions snap to quarter pixels.
-fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, path: &Path, embolden: bool, t: tiny_skia::Transform, color: tiny_skia::Color) {
+/// most of a text-heavy window's paint time. Positions snap to quarter pixels; the outline is only
+/// fetched on a miss.
+fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, embolden: bool, t: tiny_skia::Transform, color: tiny_skia::Color) {
     // snapped first, then split: a phase of 4/4 is the next pixel's 0, not a separate cache entry
     let (qx, qy) = ((t.tx * 4.0).round(), (t.ty * 4.0).round());
     let (px, py) = ((qx / 4.0).floor(), (qy / 4.0).floor());
     let (fx, fy) = ((qx - px * 4.0) as u8, (qy - py * 4.0) as u8);
     let key = (Rc::as_ptr(face) as usize, glyph, t.sx.to_bits(), embolden, fx, fy);
     let mask = GLYPHS.with(|c| c.borrow().0.get(&key).cloned()).unwrap_or_else(|| {
-        let m = rasterize(face, path, embolden, t.sx, fx as f32 / 4.0, fy as f32 / 4.0).map(Rc::new);
+        let m = face.outline(glyph).and_then(|path| rasterize(face, &path, embolden, t.sx, fx as f32 / 4.0, fy as f32 / 4.0)).map(Rc::new);
         GLYPHS.with(|c| {
             let (map, bytes) = &mut *c.borrow_mut();
             let size = m.as_ref().map_or(0, |m| m.mask.data().len()) + 64;

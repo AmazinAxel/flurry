@@ -1,14 +1,10 @@
-// Which centered status menu is open (lib/asideState.ts).
+// Which centered status menu is open.
 
-use crate::lib::state::State;
+use crate::ui::state::global_state;
 use crate::ui::window;
 
-thread_local! {
-    static CURRENT: State<Option<&'static str>> = State::new(None);
-}
-
-pub fn current() -> State<Option<&'static str>> {
-    CURRENT.with(Clone::clone)
+global_state! {
+    pub fn current() -> Option<&'static str> = None;
 }
 
 pub fn toggle_menu(name: &'static str) {

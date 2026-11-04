@@ -1,4 +1,4 @@
-// Clipboard history dialog (widgets/clipboard/clipboard.tsx + clipboardItem.tsx).
+// Clipboard history dialog.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -16,16 +16,15 @@ use crate::lib::searchDialog::search_entry;
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::style::*;
 use crate::ui::entry;
-use crate::ui::node::{Align, Background, Kind, Node, Sides, Style, rgba};
+use crate::ui::node::{Align, Kind, Node, Sides, Style, rgba};
 use crate::ui::{image, runtime, window};
-use crate::widgets::clipboard::compress::open_compress;
+use crate::widgets::clipboard::compress::{open_compress, wipe_last_output};
 
 const MAX_W: f32 = 380.0;
 const MAX_H: f32 = 150.0;
 
-/// Thumbnails decoded per show (newest media first), and kept at most.
+/// Thumbnails decoded (newest media first), and kept.
 const THUMB_ROWS: usize = 12;
-const THUMB_CAP: usize = 24;
 
 #[derive(Clone)]
 enum Thumb {
@@ -39,17 +38,20 @@ struct Item {
     id: u64,
     content: String,
     path: Option<String>,
-    image: Option<String>, // WxH
+    /// content is its WxH
+    image: bool,
     video: bool,
+    /// text length, when known (a short entry, or its preview whole)
+    chars: Option<usize>,
+    len: u64,
     mime: String,
     search: String,
 }
 
 thread_local! {
+    /// only while the dialog is up
     static ITEMS: RefCell<Vec<Item>> = const { RefCell::new(Vec::new()) };
     static THUMBS: RefCell<HashMap<u64, Thumb>> = RefCell::default();
-    /// THUMBS ids, least recently shown first
-    static THUMB_LRU: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     static QUERY: RefCell<String> = const { RefCell::new(String::new()) };
     static SELECTED: Cell<Option<u64>> = const { Cell::new(None) };
     static PRODUCE: Rc<runtime::Queue> = Rc::default();
@@ -75,16 +77,19 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn entry_path(e: &Entry) -> Option<String> {
+/// The whole text of a short entry whose preview was cut (at 100 chars).
+fn full_text(e: &Entry) -> Option<String> {
+    (e.preview.ends_with('…') && e.len <= 4096).then(|| std::fs::read_to_string(entry_file(e.id, &e.mime)).ok()).flatten()
+}
+
+fn entry_path(e: &Entry, full: Option<&str>) -> Option<String> {
     if e.mime.starts_with("image/") {
         return Some(entry_file(e.id, &e.mime));
     }
     if e.preview.trim().contains(' ') {
         return None; // not a path
     }
-    // the preview is cut at 100 chars: the path itself comes from the entry file
-    let file = if e.len <= 4096 { std::fs::read_to_string(entry_file(e.id, &e.mime)).ok() } else { None };
-    let single = file.as_deref().unwrap_or(&e.preview).trim();
+    let single = full.unwrap_or(&e.preview).trim();
     if single.contains(char::is_whitespace) {
         return None;
     }
@@ -95,7 +100,7 @@ pub fn entry_path(e: &Entry) -> Option<String> {
     path.starts_with('/').then_some(path)
 }
 
-pub fn is_video(p: &str) -> bool {
+fn is_video(p: &str) -> bool {
     let l = p.to_lowercase();
     [".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"].iter().any(|e| l.ends_with(e))
 }
@@ -146,32 +151,23 @@ fn thumb_size(w: f32, h: f32, k: f32) -> (u32, u32, f32) {
     ((w * s).round().max(1.0) as u32, (h * s).round().max(1.0) as u32, s)
 }
 
+/// Decoded straight at the thumbnail size: no full-size intermediate.
 fn load_scaled(bytes: &[u8], k: f32) -> Option<Pixmap> {
-    let src = image::decode(bytes)?;
-    let (w, h, s) = thumb_size(src.width() as f32, src.height() as f32, k);
-    let mut out = Pixmap::new(w, h)?;
-    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
-    out.draw_pixmap(0, 0, src.as_ref(), &paint, tiny_skia::Transform::from_scale(s, s), None);
-    Some(out)
+    let fit = |w: u32, h: u32| {
+        let (tw, th, _) = thumb_size(w as f32, h as f32, k);
+        (tw, th)
+    };
+    let size = Cell::new((0, 0));
+    let alloc = |w: u32, h: u32| {
+        size.set((w, h));
+        Some(vec![0u8; w as usize * h as usize * 4])
+    };
+    let px = image::decode_into(bytes, image::THUMB_PIXELS, fit, alloc)?;
+    let (w, h) = size.get();
+    Pixmap::from_vec(px, tiny_skia::IntSize::from_wh(w, h)?)
 }
 
-/// Marks `id` most recently used, evicting the least recently used finished thumbnails past the cap.
-fn touch_thumb(id: u64) {
-    THUMB_LRU.with(|l| {
-        let mut l = l.borrow_mut();
-        l.retain(|i| *i != id);
-        l.push(id);
-        THUMBS.with(|t| {
-            let mut t = t.borrow_mut();
-            while l.len() > THUMB_CAP {
-                let old = l.remove(0);
-                t.remove(&old);
-            }
-        });
-    });
-}
-
-/// Thumbnails are produced one at a time (produceQueue), in memory: nothing lands in the runtime dir.
+/// Thumbnails are produced one at a time (PRODUCE), in memory: nothing lands in the runtime dir.
 fn request_thumb(item: &Item) {
     if THUMBS.with(|t| t.borrow().contains_key(&item.id)) {
         return;
@@ -191,7 +187,8 @@ fn request_thumb(item: &Item) {
             }
             let bytes = if video {
                 let scale = format!("scale=w={}:h={}:force_original_aspect_ratio=decrease", MAX_W * k, MAX_H * k);
-                let argv = ["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"];
+                // local files only: a crafted video can't make ffmpeg fetch URLs
+                let argv = ["ffmpeg", "-v", "error", "-protocol_whitelist", "file", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"];
                 read_output(&argv, 5000)
             } else {
                 std::fs::read(&src).ok()
@@ -201,10 +198,8 @@ fn request_thumb(item: &Item) {
         .await
         .flatten();
         let thumb = pix.map(|p| Thumb::Ready(crate::ui::node::Pic::new(p), k)).unwrap_or(Thumb::Failed);
-        // dropped meanwhile (wipe, stale entry): don't resurrect it
-        if THUMBS.with(|t| t.borrow_mut().get_mut(&id).map(|t| *t = thumb).is_some()) {
-            touch_thumb(id);
-        }
+        // dropped meanwhile (hidden, wipe, stale entry): don't resurrect it
+        THUMBS.with(|t| t.borrow_mut().get_mut(&id).map(|t| *t = thumb));
         if let Some(w) = window::get("clipboard") {
             w.redraw();
         }
@@ -218,25 +213,31 @@ fn request_thumbs() {
     if streaming_mode().peek() || !window::get("clipboard").is_some_and(|w| w.visible()) {
         return;
     }
-    let media: Vec<Item> = ITEMS.with(|i| i.borrow().iter().filter(|x| x.image.is_some() || x.video).cloned().collect());
-    for item in media.iter().take(THUMB_ROWS) {
+    for item in media().iter() {
         request_thumb(item);
     }
 }
 
+/// The rows that get thumbnails.
+fn media() -> Vec<Item> {
+    ITEMS.with(|i| i.borrow().iter().filter(|x| x.image || x.video).take(THUMB_ROWS).cloned().collect())
+}
+
 fn describe(item: &Item) -> String {
-    if let Some(dims) = &item.image {
-        format!("Image ({dims})")
+    if item.image {
+        format!("Image ({})", item.content)
     } else if item.video {
         format!("Video ({})", item.path.as_deref().unwrap_or("").rsplit('/').next().unwrap_or(""))
+    } else if let Some(n) = item.chars {
+        format!("Text ({n} chars)")
     } else {
-        format!("Text ({} chars)", item.content.encode_utf16().count())
+        format!("Text ({} KiB)", item.len.div_ceil(1024))
     }
 }
 
 /// An empty box of the image thumbnail's size, from the stored WxH.
 fn placeholder(base: &Style, item: &Item) -> Option<Node> {
-    let (w, h) = item.image.as_deref()?.split_once('x')?;
+    let (w, h) = item.image.then_some(&item.content)?.split_once('x')?;
     let (w, h): (f32, f32) = (w.parse().ok()?, h.parse().ok()?);
     // past THUMB_PIXELS the decode is refused: no thumbnail to hold room for
     if w < 1.0 || h < 1.0 || (w as u64).saturating_mul(h as u64) > image::THUMB_PIXELS {
@@ -247,27 +248,26 @@ fn placeholder(base: &Style, item: &Item) -> Option<Node> {
     Some(Node::vbox(base.inherit(), 0.0, vec![]).size(tw as f32 / k, th as f32 / k).align(Align::Center, Align::Center))
 }
 
-fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
+fn item_node(base: &Style, item: &Item, row: &Style) -> Node {
     if streaming_mode().peek() {
-        return Some(Node::label(row.inherit(), describe(item)).xalign(0.0));
+        return Node::label(row.inherit(), describe(item)).xalign(0.0);
     }
-    if item.image.is_some() || item.video {
+    if item.image || item.video {
         return match THUMBS.with(|t| t.borrow().get(&item.id).cloned()) {
             Some(Thumb::Ready(p, k)) => {
-                touch_thumb(item.id);
                 let (w, h) = (p.pix.width() as f32 / k, p.pix.height() as f32 / k);
                 let s = base.inherit();
                 let pic = Node::new(Kind::Picture { pixmap: crate::ui::node::Img::Pix(p), cover: false, blur: 0.0, density: k }, base.inherit());
                 let mut kids = vec![pic];
                 if item.video {
-                    let ps = Style { background: Background::Color(rgba(0, 0, 0, 0.5)), padding: Sides::all(SPACE_M), color: tiny_skia::Color::WHITE, ..base.inherit() };
+                    let ps = Style { background: Some(rgba(0, 0, 0, 0.5)), padding: Sides::all(SPACE_M), color: tiny_skia::Color::WHITE, ..base.inherit() };
                     kids.push(Node::icon(ps, "media-playback-start-symbolic", 42.0).align(Align::Center, Align::Center));
                 }
-                Some(Node::overlay(s, kids).size(w, h).align(Align::Center, Align::Center))
+                Node::overlay(s, kids).size(w, h).align(Align::Center, Align::Center)
             }
             // images: an empty box of the thumbnail's size, so nothing moves when it lands
-            Some(Thumb::Loading) => Some(placeholder(base, item).unwrap_or_else(|| Node::label(row.inherit(), describe(item)).xalign(0.0))),
-            Some(Thumb::Failed) | None => Some(Node::label(row.inherit(), describe(item)).xalign(0.0)),
+            Some(Thumb::Loading) => placeholder(base, item).unwrap_or_else(|| Node::label(row.inherit(), describe(item)).xalign(0.0)),
+            Some(Thumb::Failed) | None => Node::label(row.inherit(), describe(item)).xalign(0.0),
         };
     }
     let mut n = Node::label(row.inherit(), item.content.clone()).xalign(0.0);
@@ -275,49 +275,64 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Option<Node> {
         l.wrap = true;
         l.max_width_chars = Some(1.0);
     }
-    Some(n)
+    n
 }
 
-fn visible_rows() -> Vec<Item> {
-    let q = QUERY.with(|q| q.borrow().clone());
+/// `f` gets the rows the query and loading state let through (borrowed: nothing is cloned). It
+/// must not change ITEMS or THUMBS (no hiding the dialog from inside).
+fn with_visible_rows<R>(f: impl FnOnce(&[&Item]) -> R) -> R {
     let streaming = streaming_mode().peek();
-    // filter first, clone only what is shown
-    THUMBS.with(|t| {
-        let t = t.borrow();
-        ITEMS.with(|i| {
-            i.borrow()
-                .iter()
-                .filter(|i| streaming || !i.video || !matches!(t.get(&i.id), Some(Thumb::Loading)))
-                .filter(|i| q.is_empty() || i.search.contains(&q))
-                .cloned()
-                .collect()
+    QUERY.with(|q| {
+        let q = q.borrow();
+        THUMBS.with(|t| {
+            let t = t.borrow();
+            ITEMS.with(|i| {
+                let items = i.borrow();
+                let rows: Vec<&Item> = items
+                    .iter()
+                    .filter(|i| streaming || !i.video || !matches!(t.get(&i.id), Some(Thumb::Loading)))
+                    .filter(|i| q.is_empty() || i.search.contains(q.as_str()))
+                    .collect();
+                f(&rows)
+            })
         })
     })
 }
 
 fn select_top(keep: bool) {
-    let rows = visible_rows();
     let cur = SELECTED.with(Cell::get);
-    if !keep || cur.is_none() || !rows.iter().any(|r| Some(r.id) == cur) {
-        SELECTED.with(|s| s.set(rows.first().map(|r| r.id)));
+    let top = with_visible_rows(|rows| (!keep || cur.is_none() || !rows.iter().any(|r| Some(r.id) == cur)).then(|| rows.first().map(|r| r.id)));
+    if let Some(top) = top {
+        SELECTED.with(|s| s.set(top));
     }
 }
 
 fn move_selection(delta: i64) {
-    let rows = visible_rows();
-    if rows.is_empty() {
-        return;
+    let sel = SELECTED.with(Cell::get);
+    let next = with_visible_rows(|rows| {
+        if rows.is_empty() {
+            return None;
+        }
+        let i = rows.iter().position(|r| Some(r.id) == sel).map(|i| i as i64).unwrap_or(-1);
+        Some(rows[crate::lib::wrapFocus::wrap_index(i, delta, rows.len() as i64) as usize].id)
+    });
+    if let Some(id) = next {
+        SELECTED.with(|s| s.set(Some(id)));
     }
-    let i = rows.iter().position(|r| Some(r.id) == SELECTED.with(Cell::get)).map(|i| i as i64).unwrap_or(-1);
-    let j = crate::lib::wrapFocus::wrap_index(i, delta, rows.len() as i64) as usize;
-    SELECTED.with(|s| s.set(Some(rows[j].id)));
 }
 
 fn selected_item() -> Option<Item> {
-    let rows = visible_rows();
     let sel = SELECTED.with(Cell::get);
-    rows.iter().find(|r| Some(r.id) == sel).cloned().or_else(|| rows.first().cloned())
+    with_visible_rows(|rows| rows.iter().find(|r| Some(r.id) == sel).or_else(|| rows.first()).map(|r| (*r).clone()))
 }
+
+/// The scroll's height; it centers the selected row.
+const SCROLL_H: f32 = 460.0;
+/// A row is at least its padding and border tall, so only rows this close to the selected one
+/// can be on screen; the rest are never laid out (the result looks the same: with REACH rows of
+/// at least ROW_MIN on a side, the centering is never clamped on that side).
+const ROW_MIN: f32 = 2.0 * (SPACE_M + BORDER);
+const REACH: usize = (SCROLL_H / ROW_MIN) as usize + 2;
 
 fn hide() {
     window::set_visible("clipboard", false);
@@ -328,25 +343,69 @@ fn activate(item: &Item) {
     copy_entry(item.id, &item.mime);
 }
 
-fn new_item(e: Entry) -> Item {
-    let image = e.mime.starts_with("image/").then(|| e.preview.clone());
-    let path = entry_path(&e);
-    let video = path.as_deref().is_some_and(|p| is_video(p) && std::path::Path::new(p).exists());
-    let search = format!("{}{}", if image.is_some() { "image " } else { "" }, e.preview.to_lowercase());
-    Item { id: e.id, content: e.preview, path, image, video, mime: e.mime, search }
+/// Whether the row needs the disk: a cut short text (its whole text) or a path (whether it exists).
+fn needs_disk(e: &Entry) -> bool {
+    !e.mime.starts_with("image/") && (e.preview.ends_with('…') && e.len <= 4096 || entry_path(e, None).is_some())
 }
 
-/// Rebuilt from the history, keeping rows (and thumbnails) of entries still in it.
+/// `disk` false (on the loop): no reads, a cut text counts as its preview and a video path as
+/// present; `needs_disk` rows are made again with `disk` on a worker thread.
+fn new_item(e: Entry, disk: bool) -> Item {
+    let image = e.mime.starts_with("image/");
+    let full = if disk { full_text(&e) } else { None };
+    let path = entry_path(&e, full.as_deref());
+    let video = path.as_deref().is_some_and(|p| is_video(p) && (!disk || std::path::Path::new(p).exists()));
+    let chars = match &full {
+        Some(t) => Some(t.chars().count()),
+        None => (!e.preview.ends_with('…')).then(|| e.preview.chars().count()),
+    };
+    let search = format!("{}{}", if image { "image " } else { "" }, e.preview.to_lowercase());
+    Item { id: e.id, content: e.preview, path, image, video, chars, len: e.len, mime: e.mime, search }
+}
+
+/// Rebuilt from the history, keeping rows (and thumbnails) of entries still in it. New rows show
+/// at once; those that need the disk are corrected once a worker has read it.
 fn refresh_items() {
-    let ids: Vec<u64> = ITEMS.with(|i| {
+    let disk: Vec<Entry> = ITEMS.with(|i| {
         let mut old: HashMap<u64, Item> = i.take().into_iter().map(|x| (x.id, x)).collect();
-        let items: Vec<Item> = crate::lib::clipboard::history().into_iter().map(|e| old.remove(&e.id).unwrap_or_else(|| new_item(e))).collect();
-        let ids = items.iter().map(|x| x.id).collect();
+        let mut disk = vec![];
+        let items: Vec<Item> = crate::lib::clipboard::history()
+            .into_iter()
+            .map(|e| {
+                old.remove(&e.id).unwrap_or_else(|| {
+                    if needs_disk(&e) {
+                        disk.push(e.clone());
+                    }
+                    new_item(e, false)
+                })
+            })
+            .collect();
         *i.borrow_mut() = items;
-        ids
+        disk
     });
-    THUMBS.with(|t| t.borrow_mut().retain(|id, _| ids.contains(id)));
-    THUMB_LRU.with(|l| l.borrow_mut().retain(|id| ids.contains(id)));
+    items_changed();
+    if disk.is_empty() {
+        return;
+    }
+    runtime::spawn(async move {
+        let Some(made) = runtime::blocking(move || disk.into_iter().map(|e| new_item(e, true)).collect::<Vec<_>>()).await else { return };
+        // rows gone meanwhile (hidden, wipe) stay gone
+        let mut made: HashMap<u64, Item> = made.into_iter().map(|x| (x.id, x)).collect();
+        ITEMS.with(|i| {
+            for item in i.borrow_mut().iter_mut() {
+                if let Some(m) = made.remove(&item.id) {
+                    *item = m;
+                }
+            }
+        });
+        items_changed();
+    });
+}
+
+fn items_changed() {
+    // only the rows that get one keep their thumbnail
+    let keep: Vec<u64> = media().iter().map(|x| x.id).collect();
+    THUMBS.with(|t| t.borrow_mut().retain(|id, _| keep.contains(id)));
     select_top(true);
     request_thumbs();
     if let Some(w) = window::get("clipboard") {
@@ -358,7 +417,7 @@ fn show_in_file_manager(file: &str) {
     if let Some(bus) = crate::lib::dbus::session() {
         let msg = crate::lib::dbus::method("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1", "ShowItems")
             .append2(vec![crate::lib::clipboard::uri(file)], "");
-        bus.call_cb(msg, |_| {});
+        bus.send(msg);
     }
 }
 
@@ -379,6 +438,7 @@ fn with_prefix(prefix: &[&str], file: String) -> Vec<String> {
 fn wipe() {
     hide();
     crate::lib::clipboard::wipe();
+    wipe_last_output();
 }
 
 pub fn clipboard() {
@@ -391,36 +451,40 @@ pub fn clipboard() {
         }
     }));
     let ec = e.clone();
-    let build = move |_: &window::View| {
+    let build = move |_: Option<&str>| {
         let base = window();
-        let rows = visible_rows();
         let sel = SELECTED.with(Cell::get);
-        let mut nodes = vec![];
         let mut center = None;
-        let count = rows.len();
-        for (i, item) in rows.iter().enumerate() {
-            let selected = Some(item.id) == sel;
-            let mut s = base.inherit();
-            s.padding = Sides::all(SPACE_M);
-            s = s.border(Sides::all(BORDER), dark4());
-            s.background = Background::Color(dark2());
-            s.margin.bottom = if i + 1 == count { 0.0 } else { BORDER };
-            s.color = light1();
-            if selected {
-                s = focus_outline(s);
+        let (nodes, count) = with_visible_rows(|rows| {
+            let count = rows.len();
+            // with no selection the list shows from the top
+            let at = rows.iter().position(|r| Some(r.id) == sel).unwrap_or(0);
+            let mut nodes = vec![];
+            for (i, item) in rows.iter().enumerate().take(at + REACH + 1).skip(at.saturating_sub(REACH)) {
+                let selected = Some(item.id) == sel;
+                let mut s = base.inherit();
+                s.padding = Sides::all(SPACE_M);
+                s = s.border(Sides::all(BORDER), dark4());
+                s.background = Some(dark2());
+                s.margin.bottom = if i + 1 == count { 0.0 } else { BORDER };
+                s.color = light1();
+                if selected {
+                    s = focus_outline(s);
+                }
+                let inner = item_node(&base, item, &s);
+                if selected {
+                    center = Some(nodes.len());
+                }
+                nodes.push(Node::vbox(s, 0.0, vec![inner]));
             }
-            let Some(inner) = item_node(&base, item, &s) else { continue };
-            if selected {
-                center = Some(nodes.len());
-            }
-            nodes.push(Node::vbox(s, 0.0, vec![inner]));
-        }
+            (nodes, count)
+        });
         // room for the first and last rows' outline inside the clip; the last row's hangs into the
         // card's padding, so the rows end as far from the border as they do at the sides
         let list = Node::vbox(Style { padding: Sides::trbl(SPACE_M, 0.0, BORDER, 0.0), ..base.inherit() }, 0.0, nodes);
-        let scroll = Node::scroll(Style { margin: Sides::trbl(0.0, 0.0, -BORDER, 0.0), ..base.inherit() }, 460.0, center, list).show(count > 0);
+        let scroll = Node::scroll(Style { margin: Sides::trbl(0.0, 0.0, -BORDER, 0.0), ..base.inherit() }, SCROLL_H, center, list).show(count > 0);
         let header = search_entry(&base, &ec);
-        background_section(&base, header, Some(scroll), 700.0, 500.0)
+        background_section(&base, header, Some(scroll), CARD_HEIGHT, CARD_WIDTH)
     };
     let ctrl = |k: Keysym, f: fn()| -> (Keysym, crate::lib::inputControl::Action) { (k, Rc::new(f)) };
     let w = input_control("clipboard", build, Opts {
@@ -442,8 +506,9 @@ pub fn clipboard() {
             ctrl(Keysym::k, || move_selection(-1)),
             ctrl(Keysym::j, || move_selection(1)),
             ctrl(Keysym::c, || {
-                if let Some(i) = visible_rows().get(1) {
-                    activate(i); // copy 2nd recent entry
+                // copy 2nd recent entry
+                if let Some(i) = with_visible_rows(|rows| rows.get(1).map(|r| (*r).clone())) {
+                    activate(&i);
                 }
             }),
             ctrl(Keysym::e, || with_file(Some(|f| !is_video(f)), |f, _| launch(&with_prefix(&["swappy", "-f"], f)))),
@@ -456,6 +521,14 @@ pub fn clipboard() {
         ..Default::default()
     });
     w.watch(&streaming_mode());
+    // hidden: rows and thumbnails go, rebuilt on the next show
+    let v = w.visibility.clone();
+    w.visibility.subscribe(move || {
+        if !v.peek() {
+            ITEMS.with(|i| i.borrow_mut().clear());
+            THUMBS.with(|t| t.borrow_mut().clear());
+        }
+    });
     streaming_mode().subscribe(|| {
         request_thumbs(); // rows themselves just redraw (watched above): no refetch gap
     });
@@ -473,7 +546,7 @@ mod tests {
 
     #[test]
     fn finds_entry_paths() {
-        let e = |mime: &str, preview: &str| entry_path(&Entry { id: 7, mime: mime.into(), len: 1 << 20, preview: preview.into() });
+        let e = |mime: &str, preview: &str| entry_path(&Entry { id: 7, mime: mime.into(), len: 1 << 20, preview: preview.into() }, None);
         assert_eq!(e("image/jpeg", "1x1"), Some(entry_file(7, "image/jpeg")));
         assert_eq!(e("text/uri-list", "file:///home/a/x%20y.mp4").as_deref(), Some("/home/a/x y.mp4"));
         assert_eq!(e("text/plain", "/tmp/a b"), None);

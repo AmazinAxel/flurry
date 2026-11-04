@@ -1,34 +1,46 @@
 // Sideview controller. The web view itself lives in the `flurry-sideview` process (Servo),
-// prespawned hidden once the shell is up and stopped by closeSideview; this side keeps the state
-// machine, the dim window and the color scheme sync.
+// started by the first show and stopped by closeSideview; this side keeps the state machine, the
+// dim window, passes the color scheme on and opens the links the pages ask for.
 
 use std::cell::{Cell, RefCell};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use crate::config::sideview_url;
-use crate::lib::dbus::{self, SignalFilter, method, set_prop};
+use crate::lib::colorScheme::{self, dark};
 use crate::lib::inputControl::DIM;
+use crate::lib::style;
+use crate::settings;
 use crate::ui::node::{Node, Style};
 use crate::ui::runtime;
 use crate::ui::wayland::{Anchor, Layer};
 use crate::ui::window::{self, Spec, Win};
 
-/// Longest command line written: a pipe write up to PIPE_BUF is all or nothing, so a full pipe
-/// drops a command instead of tearing it.
-const PIPE_BUF: usize = 4096;
+/// Built-in sideview pages; settings.sideview overrides and extends them.
+const BUILT_IN: &[(&str, &str)] = &[("assistant", "flurry:claude")];
+
+fn sideview_url(page: &str) -> Option<&'static str> {
+    settings::SIDEVIEW.iter().chain(BUILT_IN).find(|(p, _)| *p == page).map(|(_, u)| *u)
+}
+
+struct Helper {
+    pid: u32,
+    pidfd: Rc<OwnedFd>,
+    stdin: ChildStdin,
+}
 
 thread_local! {
-    static HELPER: RefCell<Option<(Child, ChildStdin)>> = const { RefCell::new(None) };
+    static HELPER: RefCell<Option<Helper>> = const { RefCell::new(None) };
     static VISIBLE: Cell<bool> = const { Cell::new(false) };
     static FOCUSED: Cell<bool> = const { Cell::new(false) };
     /// the helper reported the panel on screen since the last show
     static MAPPED: Cell<bool> = const { Cell::new(false) };
     static PUSHED_ASIDE: Cell<bool> = const { Cell::new(false) };
     static CURRENT: RefCell<Option<String>> = const { RefCell::new(None) };
-    static WIDTH: Cell<u32> = const { Cell::new(400) };
-    static DARK: Cell<bool> = const { Cell::new(true) };
+    static WIDTH: Cell<u32> = const { Cell::new(style::SIDEVIEW_WIDTH) };
+    static OPENED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// The dim goes up only with the panel actually on screen, and only while it has the keyboard.
@@ -48,108 +60,127 @@ fn helper_gone() {
     sync_dim();
 }
 
-/// Whether the sideview is shown; a helper that died takes its panel (and the dim) with it.
 fn visible() -> bool {
-    let died = HELPER.with(|h| h.borrow_mut().as_mut().is_some_and(|(child, _)| child.try_wait().ok().flatten().is_some()));
-    if died {
-        helper_gone();
-    }
     VISIBLE.with(Cell::get)
 }
 
-/// Exit of helper `pid` runs the cleanup right away (pidfd), not at the next command.
-fn watch_exit(pid: u32) {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
-    if fd < 0 {
-        return; // old kernel: noticed by visible() at the next command
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let raw = fd.as_raw_fd();
+/// A pidfd can't hit a reused pid, even after the reap.
+fn kill(pidfd: &OwnedFd) {
+    unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) };
+}
+
+/// Reaps the helper on exit; the current one's exit also takes its panel down.
+fn watch_exit(child: Child, pidfd: Rc<OwnedFd>) {
+    let pid = child.id();
+    let raw = pidfd.as_raw_fd();
+    let child = RefCell::new(child);
     runtime::watch(raw, move || {
         runtime::unwatch(raw);
-        let _keep = &fd;
+        let _keep = &pidfd;
+        let _ = child.borrow_mut().try_wait();
         // a closed helper's exit (close_sideview) leaves the current one alone
-        if HELPER.with(|h| h.borrow().as_ref().is_some_and(|(c, _)| c.id() == pid)) {
-            visible();
+        if HELPER.with(|h| h.borrow().as_ref().is_some_and(|h| h.pid == pid)) {
+            helper_gone();
         }
     });
 }
 
-/// Helper stdout lines: "mapped" once the panel is on screen after a show.
+/// A page's link, opened outside the sandbox: http(s) only, one a second at most.
+fn open(url: &str) {
+    let ok = (url.starts_with("https://") || url.starts_with("http://")) && !url.chars().any(|c| c.is_whitespace() || c.is_control());
+    let now = Instant::now();
+    if !ok || !visible() || OPENED_AT.with(Cell::get).is_some_and(|at| now - at < Duration::from_secs(1)) {
+        return;
+    }
+    OPENED_AT.with(|o| o.set(Some(now)));
+    crate::lib::apps::launch(&["xdg-open".into(), url.into()]);
+}
+
+/// Helper stdout lines: "mapped" once the panel is on screen after a show, "closed" when its
+/// output went away, "open <url>" for a link the user followed.
 fn watch_stdout(out: ChildStdout) {
     let raw = out.as_raw_fd();
-    unsafe { libc::fcntl(raw, libc::F_SETFL, libc::fcntl(raw, libc::F_GETFL) | libc::O_NONBLOCK) };
+    runtime::set_nonblocking(raw, true);
     let out = RefCell::new(out);
     let line = RefCell::new(Vec::<u8>::new());
     runtime::watch(raw, move || {
-        let mut buf = [0u8; 512];
-        loop {
+        let mut buf = [0u8; 4096];
+        let mut lines = vec![];
+        let eof = loop {
             match out.borrow_mut().read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => break true,
                 Ok(n) => {
                     let mut line = line.borrow_mut();
                     for &b in &buf[..n] {
                         if b != b'\n' {
                             // anything else it prints is no command of ours: never kept past a line
-                            if line.len() < 64 {
+                            if line.len() < 4096 {
                                 line.push(b);
                             }
                             continue;
                         }
-                        if *line == b"mapped" && VISIBLE.with(Cell::get) {
-                            MAPPED.with(|m| m.set(true));
-                            sync_dim();
-                        }
+                        lines.push(String::from_utf8_lossy(&line).into_owned());
                         line.clear();
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return,
-                Err(_) => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break false,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break true,
+            }
+        };
+        for l in lines {
+            match l.split_once(' ') {
+                None if l == "mapped" && visible() => {
+                    MAPPED.with(|m| m.set(true));
+                    sync_dim();
+                }
+                None if l == "closed" && visible() => hide_sideview(),
+                Some(("open", url)) => open(url),
+                _ => {}
             }
         }
-        // EOF: the helper is exiting (its exit is watched separately)
-        runtime::unwatch(raw);
+        if eof {
+            // the helper is exiting (its exit is watched separately)
+            runtime::unwatch(raw);
+        }
     });
 }
 
-/// One command line, without blocking: dropped when the helper isn't reading (pipe full).
-fn write_line(s: &mut ChildStdin, cmd: &str) {
+/// One command line, without blocking; false if it didn't all go in (the helper isn't reading,
+/// or a torn line).
+fn write_line(s: &mut ChildStdin, cmd: &str) -> bool {
     let line = format!("{cmd}\n");
-    if line.len() > PIPE_BUF {
-        return;
-    }
-    // EINTR before anything was written; a few tries at most
-    for _ in 0..3 {
-        match s.write(line.as_bytes()) {
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            _ => return,
-        }
-    }
+    s.write(line.as_bytes()).is_ok_and(|n| n == line.len())
 }
 
 /// Starts the helper (hidden) if none runs; false if it can't be.
-fn ensure_helper(h: &mut Option<(Child, ChildStdin)>) -> bool {
+fn ensure_helper(h: &mut Option<Helper>) -> bool {
     if h.is_some() {
         return true;
     }
     let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("flurry-sideview")));
     let exe = exe.filter(|p| p.exists()).map(|p| p.into_os_string()).unwrap_or_else(|| "flurry-sideview".into());
-    let Ok(mut child) = Command::new(exe).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn() else { return false };
-    let (Some(mut s), Some(out)) = (child.stdin.take(), child.stdout.take()) else {
+    // its one argument: the panel background before a page paints
+    let bg = style::dark1().to_color_u8();
+    let bg = format!("{:02x}{:02x}{:02x}", bg.red(), bg.green(), bg.blue());
+    let Ok(mut child) = Command::new(exe).arg(bg).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn() else { return false };
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) } as i32;
+    let (Some(mut stdin), Some(out), true) = (child.stdin.take(), child.stdout.take(), fd >= 0) else {
         let _ = child.kill();
-        std::thread::spawn(move || child.wait());
+        let _ = child.wait();
         return false;
     };
-    let fd = s.as_raw_fd();
-    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) };
+    let pidfd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+    runtime::set_nonblocking(stdin.as_raw_fd(), true);
     watch_stdout(out);
-    watch_exit(child.id());
+    let pid = child.id();
+    watch_exit(child, pidfd.clone());
     MAPPED.with(|m| m.set(false));
-    write_line(&mut s, &format!("dark {}", DARK.with(Cell::get)));
-    write_line(&mut s, &format!("width {}", WIDTH.with(Cell::get)));
-    write_line(&mut s, &focus_cmd());
-    *h = Some((child, s));
+    // an empty pipe takes these whole
+    write_line(&mut stdin, &format!("dark {}", dark().peek()));
+    write_line(&mut stdin, &format!("width {}", WIDTH.with(Cell::get)));
+    write_line(&mut stdin, &focus_cmd());
+    *h = Some(Helper { pid, pidfd, stdin });
     true
 }
 
@@ -159,23 +190,26 @@ fn focus_cmd() -> String {
     format!("focus {focused} {}", if ignore { "ignore" } else { "exclusive" })
 }
 
-/// Only `show` starts the helper (when the prespawned one is gone); other commands without one
-/// are moot (a new helper gets the current state first). False if there is no helper after all.
+/// Only `show` starts the helper; other commands without one are moot (a new helper gets the
+/// current state first). A helper that can't take a command is stopped: its state would be wrong.
+/// False if there is no helper after all.
 fn send(cmd: &str) -> bool {
-    visible();
-    HELPER.with(|h| {
+    let sent = HELPER.with(|h| {
         let mut h = h.borrow_mut();
         if cmd.starts_with("show ") && !ensure_helper(&mut h) {
-            return false;
+            return None;
         }
-        match h.as_mut() {
-            Some((_, s)) => {
-                write_line(s, cmd);
-                true
-            }
-            None => false,
+        let h = h.as_mut()?;
+        if write_line(&mut h.stdin, cmd) {
+            return Some(true);
         }
-    })
+        kill(&h.pidfd);
+        Some(false)
+    });
+    if sent == Some(false) {
+        helper_gone();
+    }
+    sent == Some(true)
 }
 
 fn set_focused(focused: bool) {
@@ -231,67 +265,23 @@ pub fn toggle_sideview() {
 /// Destroys all web views (the whole helper process).
 pub fn close_sideview() {
     hide_sideview();
-    if let Some((mut child, stdin)) = HELPER.with(|h| h.borrow_mut().take()) {
-        drop(stdin); // EOF: the helper exits by itself (stopping Claude Code)
-        runtime::timeout(1000, move || {
-            if child.try_wait().ok().flatten().is_none() {
-                let _ = child.kill();
-            }
-            std::thread::spawn(move || child.wait()); // reaped off the loop
-        });
+    if let Some(Helper { pidfd, stdin, .. }) = HELPER.with(|h| h.borrow_mut().take()) {
+        drop(stdin); // EOF: the helper exits by itself (stopping Claude Code); its watch reaps it
+        runtime::timeout(1000, move || kill(&pidfd));
     }
     CURRENT.with(|c| c.borrow_mut().take());
 }
 
 pub fn toggle_sideview_size() {
-    let next = if WIDTH.with(Cell::get) == 400 { 700 } else { 400 };
+    let next = if WIDTH.with(Cell::get) == style::SIDEVIEW_WIDTH { style::SIDEVIEW_WIDE } else { style::SIDEVIEW_WIDTH };
     WIDTH.with(|w| w.set(next));
     send(&format!("width {next}"));
 }
 
-/// Mirrors dark/light mode into the night light temperature (and the web views).
-fn apply_color_scheme(dark: bool) {
-    DARK.with(|d| d.set(dark));
-    if let Some(bus) = dbus::session() {
-        let mut m = set_prop("rs.wl-gammarelay", "/", "rs.wl.gammarelay", "Temperature", if dark { 3500u16 } else { 6500u16 });
-        m.set_auto_start(false);
-        bus.send(m);
-    }
-    send(&format!("dark {dark}"));
-}
-
-fn read_scheme() {
-    let Some(bus) = dbus::session() else { return };
-    let m = method("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings", "ReadOne")
-        .append2("org.freedesktop.appearance", "color-scheme");
-    bus.call_cb(m, |r| {
-        // 1 = prefer dark
-        let v = r.ok().and_then(|m| m.read1::<dbus::Variant<Box<dyn dbus::RefArg>>>().ok()).and_then(|v| v.0.as_u64());
-        apply_color_scheme(v == Some(1));
-    });
-}
-
 pub fn sideview() {
     Win::new(Spec { name: "sideviewDim", layer: Layer::Top, anchor: Anchor::all(), dim: Some(DIM), ..Default::default() }, |_| Node::hbox(Style::default(), 0.0, vec![]));
-    // hidden and ready by the first show, which then only maps the panel
-    runtime::idle(|| HELPER.with(|h| _ = ensure_helper(&mut h.borrow_mut())));
-    let Some(bus) = dbus::session() else { return };
-    bus.subscribe(
-        SignalFilter {
-            sender: Some("org.freedesktop.portal.Desktop".into()),
-            interface: Some("org.freedesktop.portal.Settings".into()),
-            member: Some("SettingChanged".into()),
-            ..Default::default()
-        },
-        |m| {
-            if let Ok((ns, key, v)) = m.read3::<&str, &str, dbus::Variant<Box<dyn dbus::RefArg>>>()
-                && ns == "org.freedesktop.appearance"
-                && key == "color-scheme"
-            {
-                apply_color_scheme(v.0.as_u64() == Some(1));
-            }
-        },
-    );
-    read_scheme();
-    bus.watch_name("rs.wl-gammarelay", || apply_color_scheme(DARK.with(Cell::get)), || {});
+    dark().subscribe(|| {
+        send(&format!("dark {}", dark().peek()));
+    });
+    colorScheme::start();
 }

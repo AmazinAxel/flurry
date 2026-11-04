@@ -42,21 +42,20 @@ pub struct Shadow {
     pub x: f32,
     pub y: f32,
     pub blur: f32,
-    pub spread: f32,
     pub color: Color,
-    pub inset: bool,
     /// `color`'s alpha over the color the glyph is drawn in
     pub own_color: bool,
 }
 
 impl Shadow {
     pub(crate) fn over(&self, drawn: Color) -> Shadow {
-        Shadow { color: if self.own_color { alpha(drawn, self.color.alpha() * drawn.alpha()) } else { self.color }, ..*self }
+        // `alpha` already multiplies in the drawn color's own alpha
+        Shadow { color: if self.own_color { alpha(drawn, self.color.alpha()) } else { self.color }, ..*self }
     }
 }
 
 pub fn shadow(x: f32, y: f32, blur: f32, color: Color) -> Shadow {
-    Shadow { x, y, blur, spread: 0.0, color, inset: false, own_color: false }
+    Shadow { x, y, blur, color, own_color: false }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -69,19 +68,13 @@ pub enum Align {
 }
 
 #[derive(Clone, Debug)]
-pub enum Background {
-    None,
-    Color(Color),
-}
-
-#[derive(Clone, Debug)]
 pub struct Style {
     pub margin: Sides,
     pub padding: Sides,
     pub border: Sides,
     /// top, right, bottom, left
     pub border_color: [Color; 4],
-    pub background: Background,
+    pub background: Option<Color>,
     pub color: Color,
     pub font: Font,
     pub min_width: f32,
@@ -89,10 +82,10 @@ pub struct Style {
     pub max_width: Option<f32>,
     pub min_height: f32,
     pub opacity: f32,
-    pub box_shadow: Vec<Shadow>,
+    pub box_shadow: Option<Shadow>,
     pub outline: Option<(f32, f32, Color)>, // width, offset, color
-    pub text_shadow: Vec<Shadow>,
-    pub icon_shadow: Vec<Shadow>,
+    pub text_shadow: Option<Shadow>,
+    pub icon_shadow: Option<Shadow>,
     pub translate_y: f32,
     /// CSS line-height in px (Pango absolute line height, extra space split above/below)
     pub line_height: Option<f32>,
@@ -107,17 +100,17 @@ impl Default for Style {
             padding: Sides::default(),
             border: Sides::default(),
             border_color: [TRANSPARENT; 4],
-            background: Background::None,
+            background: None,
             color: Color::WHITE,
             font: Font { family: crate::lib::style::SORA, weight: 400, size: 16.0 },
             min_width: 0.0,
             max_width: None,
             min_height: 0.0,
             opacity: 1.0,
-            box_shadow: vec![],
+            box_shadow: None,
             outline: None,
-            text_shadow: vec![],
-            icon_shadow: vec![],
+            text_shadow: None,
+            icon_shadow: None,
             translate_y: 0.0,
             line_height: None,
         }
@@ -130,8 +123,8 @@ impl Style {
         Style {
             color: self.color,
             font: self.font.clone(),
-            text_shadow: self.text_shadow.clone(),
-            icon_shadow: self.icon_shadow.clone(),
+            text_shadow: self.text_shadow,
+            icon_shadow: self.icon_shadow,
             line_height: self.line_height,
             ..Style::default()
         }
@@ -617,9 +610,6 @@ impl Node {
             return;
         }
         self.rect = Rect::from_xywh(self.rect.x(), self.rect.y() + dy, self.rect.width(), self.rect.height()).unwrap_or(self.rect);
-        if let Some(Some(b)) = self.bounds.get() {
-            self.bounds.set(Some(b.transform(Transform::from_translate(0.0, dy))));
-        }
         for c in &mut self.children {
             c.shift_y(dy);
         }
@@ -670,9 +660,9 @@ impl Node {
     /// What the node itself paints (children excluded), translate_y applied.
     fn self_bounds(&self) -> Option<Rect> {
         let s = &self.style;
-        let paints_self = !matches!(s.background, Background::None)
+        let paints_self = s.background.is_some()
             || s.border.top + s.border.right + s.border.bottom + s.border.left > 0.0
-            || !s.box_shadow.is_empty()
+            || s.box_shadow.is_some()
             || s.outline.is_some()
             || !matches!(self.kind, Kind::Box { .. } | Kind::Overlay | Kind::Scroll { .. });
         if !paints_self {
@@ -683,8 +673,8 @@ impl Node {
         };
         let r = self.rect.transform(Transform::from_translate(0.0, s.translate_y)).unwrap_or(self.rect);
         let mut out = r;
-        for sh in s.box_shadow.iter().filter(|s| !s.inset) {
-            out = union(out, grow(r, sh.spread + sh.blur * 1.5, sh.x, sh.y));
+        if let Some(sh) = s.box_shadow {
+            out = union(out, grow(r, sh.blur * 1.5, sh.x, sh.y));
         }
         if let Some((w, off, _)) = s.outline {
             out = union(out, grow(r, w + off, 0.0, 0.0));
@@ -733,11 +723,11 @@ impl Node {
         let mut h = std::hash::DefaultHasher::new();
         let f = |h: &mut std::hash::DefaultHasher, v: &[f32]| v.iter().for_each(|x| x.to_bits().hash(h));
         let col = |h: &mut std::hash::DefaultHasher, c: Color| f(h, &[c.red(), c.green(), c.blue(), c.alpha()]);
-        let shadows = |h: &mut std::hash::DefaultHasher, v: &[Shadow]| {
-            for sh in v {
-                f(h, &[sh.x, sh.y, sh.blur, sh.spread]);
+        let shadows = |h: &mut std::hash::DefaultHasher, v: &Option<Shadow>| {
+            if let Some(sh) = v {
+                f(h, &[sh.x, sh.y, sh.blur]);
                 col(h, sh.color);
-                (sh.inset, sh.own_color).hash(h);
+                sh.own_color.hash(h);
             }
             0xff.hash(h);
         };
@@ -749,8 +739,8 @@ impl Node {
         }
         s.border_color.iter().for_each(|c| col(&mut h, *c));
         match s.background {
-            Background::None => 0u8.hash(&mut h),
-            Background::Color(c) => col(&mut h, c),
+            None => 0u8.hash(&mut h),
+            Some(c) => col(&mut h, c),
         }
         col(&mut h, s.color);
         shadows(&mut h, &s.box_shadow);
@@ -813,15 +803,11 @@ impl Node {
     fn paint_inner(&self, pm: &mut PixmapMut, ts: Transform) {
         let ts = ts.pre_translate(0.0, self.style.translate_y);
         let r = self.rect;
-        for s in self.style.box_shadow.iter().filter(|s| !s.inset) {
+        if let Some(s) = &self.style.box_shadow {
             paint_box_shadow(pm, r, s, ts);
         }
-        match &self.style.background {
-            Background::None => {}
-            Background::Color(c) => fill_rect(pm, r, *c, ts),
-        }
-        for s in self.style.box_shadow.iter().filter(|s| s.inset) {
-            paint_inset_shadow(pm, r, s, ts);
+        if let Some(c) = self.style.background {
+            fill_rect(pm, r, c, ts);
         }
         paint_border(pm, r, self.style.border, self.style.border_color, ts);
 
@@ -831,7 +817,7 @@ impl Node {
                 let layout = self.label_layout(c.width());
                 let x = c.x() + ((c.width() - layout.width()) * l.xalign).max(0.0);
                 let y = c.y() + ((c.height() - layout.height()) / 2.0).max(0.0);
-                for s in &self.style.text_shadow {
+                if let Some(s) = self.style.text_shadow {
                     paint_text_shadow(pm, &layout, x, y, &s.over(self.style.color), ts);
                 }
                 text::draw(pm, &layout, x, y, self.style.color, ts);
@@ -839,7 +825,7 @@ impl Node {
             Kind::Icon { name, size } => {
                 let x = c.x() + ((c.width() - size) / 2.0).floor();
                 let y = c.y() + ((c.height() - size) / 2.0).floor();
-                for s in &self.style.icon_shadow {
+                if let Some(s) = self.style.icon_shadow {
                     paint_icon_shadow(pm, name, *size, x, y, &s.over(self.style.color), ts);
                 }
                 icons::draw(pm, name, *size, x, y, self.style.color, ts);
@@ -943,6 +929,18 @@ pub fn fill_rect(pm: &mut PixmapMut, r: Rect, c: Color, ts: Transform) {
     }
 }
 
+/// GTK levelbar progress (continuous mode): trough with the filled block over it.
+pub fn levelbar(base: &Style, value: f64, filled: Color, empty: Color, height: f32) -> Node {
+    let paint = Rc::new(move |pm: &mut PixmapMut, r: Rect, ts: Transform| {
+        fill_rect(pm, r, empty, ts);
+        if let Some(f) = Rect::from_xywh(r.x(), r.y(), r.width() * value.clamp(0.0, 1.0) as f32, r.height()) {
+            fill_rect(pm, f, filled, ts);
+        }
+    });
+    let key = Some(hash(&(value.to_bits(), [filled, empty].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits)))));
+    Node::new(Kind::Custom { width: 0.0, height, key, paint }, base.inherit())
+}
+
 fn paint_border(pm: &mut PixmapMut, r: Rect, b: Sides, c: [Color; 4], ts: Transform) {
     let (l, t, rr, bb) = (r.left(), r.top(), r.right(), r.bottom());
     // GTK draws borders as four trapezoids; with square corners and equal colors rects are identical
@@ -1042,9 +1040,7 @@ pub(crate) fn blurred(pm: &mut PixmapMut, bounds: Rect, radius: f32, color: Colo
 }
 
 fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
-    let Some(sr) = Rect::from_ltrb(r.left() - s.spread + s.x, r.top() - s.spread + s.y, r.right() + s.spread + s.x, r.bottom() + s.spread + s.y) else {
-        return;
-    };
+    let sr = r.transform(Transform::from_translate(s.x, s.y)).unwrap_or(r);
     // drawn into a layer just big enough, then the border box is cut out (shadows are outside only)
     let scale = ts.sx;
     let pad = (s.blur * scale * 1.5).ceil() + 2.0;
@@ -1131,23 +1127,6 @@ fn blit_part(pm: &mut PixmapMut, src: tiny_skia::PixmapRef, x: i32, y: i32, (l, 
     }
 }
 
-fn paint_inset_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
-    // inset: the area between the padding box and a rect shrunk by spread (offset by x/y)
-    // inner clipped to the box, so the even-odd fill stays inside it
-    let inner = Rect::from_ltrb(r.left() + s.spread + s.x, r.top() + s.spread + s.y, r.right() - s.spread + s.x, r.bottom() - s.spread + s.y);
-    let Some(inner) = inner.and_then(|i| i.intersect(&r)) else {
-        fill_rect(pm, r, s.color, ts);
-        return;
-    };
-    let mut pb = PathBuilder::new();
-    pb.push_rect(r);
-    pb.push_rect(inner);
-    let Some(path) = pb.finish() else { return };
-    let mut paint = Paint::default();
-    paint.set_color(s.color);
-    pm.fill_path(&path, &paint, FillRule::EvenOdd, ts, None);
-}
-
 pub(crate) fn paint_text_shadow(pm: &mut PixmapMut, layout: &Layout, x: f32, y: f32, s: &Shadow, ts: Transform) {
     let bounds = Rect::from_xywh(x + s.x, y + s.y, layout.width().max(1.0), layout.height().max(1.0)).unwrap();
     if s.blur <= 0.0 {
@@ -1200,7 +1179,8 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
     let dev = c.transform(ts).unwrap_or(c);
     let pad = (radius * ts.sx * 1.5).ceil();
     let (ox, oy) = (dev.left().floor() - pad, dev.top().floor() - pad);
-    let key = hash(&(dev.width().to_bits(), dev.height().to_bits(), (dev.left() - dev.left().floor()).to_bits(), (dev.top() - dev.top().floor()).to_bits(), radius.to_bits()));
+    // the image placement too: the same device rect at another scale shows a different crop
+    let key = hash(&([dev.width(), dev.height(), dev.left() - dev.left().floor(), dev.top() - dev.top().floor(), radius, ts.sx, ts.sy].map(f32::to_bits)));
     // one entry per window header and monitor: a single slot made every window switch re-blur the
     // wallpaper. Only the current image's: a new wallpaper drops the old one's blurs.
     let cached = BLURRED.with(|b| {
@@ -1336,10 +1316,7 @@ fn cut_from_blurred(layer: &mut Pixmap, img: &Img, t: Transform, area: Rect, rad
 
 /// rgba from 0-255 channels and 0-1 alpha.
 pub fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
-    match Color::from_rgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a) {
-        Some(c) => c,
-        None => Color::TRANSPARENT,
-    }
+    Color::from_rgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a).unwrap_or(TRANSPARENT)
 }
 
 pub fn hex(v: u32) -> Color {
@@ -1347,10 +1324,7 @@ pub fn hex(v: u32) -> Color {
 }
 
 pub fn alpha(c: Color, a: f32) -> Color {
-    match Color::from_rgba(c.red(), c.green(), c.blue(), c.alpha() * a) {
-        Some(c) => c,
-        None => Color::TRANSPARENT,
-    }
+    Color::from_rgba(c.red(), c.green(), c.blue(), c.alpha() * a).unwrap_or(TRANSPARENT)
 }
 
 /// An owned picture (thumbnails) with an identity that is never reused, unlike its address.

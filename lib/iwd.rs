@@ -1,15 +1,16 @@
-// iwd over DBus (lib/iwd.ts): the station's live state shared by the Wi-Fi menu and the status
-// icon, and a passphrase agent so secrets never go through argv. The object tree and the ordered
-// network list stay cached and live (menu open or not), so the menu builds from them without a call.
+// iwd over DBus: the station's live state shared by the Wi-Fi menu and the status icon, and a
+// passphrase agent so secrets never go through argv. The object tree and the ordered network list
+// stay cached, so the menu builds from them without a call; scan results are only re-read while
+// the networks are shown.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::lib::dbus::{self, ManagedObjects, Message, PropMap, SignalFilter, method, prop_bool, prop_str};
-use crate::lib::state::State;
-use crate::ui::entry::wipe;
+use crate::ui::entry::Secret;
 use crate::ui::runtime;
+use crate::ui::state::global_state;
 
 pub const IWD: &str = "net.connman.iwd";
 pub const DEVICE: &str = "net.connman.iwd.Device";
@@ -20,36 +21,31 @@ const AGENT: &str = "net.connman.iwd.Agent";
 const AGENT_PATH: &str = "/org/flurry/IwdAgent";
 
 thread_local! {
-    static STARTED: Cell<bool> = const { Cell::new(false) };
     /// first object with a Station interface (its Device shares the path); "" when none
     static STATION_PATH: RefCell<String> = const { RefCell::new(String::new()) };
-    static POWERED: State<bool> = State::new(false);
-    static STATE: State<String> = State::new(String::new());
-    static SCANNING: State<bool> = State::new(false);
     static GEN: Cell<u32> = const { Cell::new(0) };
     /// last GetManagedObjects, kept current by PropertiesChanged; empty without iwd
     static OBJECTS: RefCell<ManagedObjects> = RefCell::default();
     /// the station's GetOrderedNetworks: (network path, signal in 100*dBm), best first; empty
     /// without a powered station
     static ORDERED: RefCell<Vec<(String, i16)>> = const { RefCell::new(Vec::new()) };
-    static LISTENERS: RefCell<Vec<Rc<dyn Fn()>>> = RefCell::default();
-    /// (network path, passphrase) handed to the agent for the Connect in flight
-    static SECRET: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+    /// the network list is on screen: finished scans re-read it
+    static SHOWN: Cell<bool> = const { Cell::new(false) };
+    /// (network path, passphrase) handed to the agent for the Connect in flight; our copy is wiped,
+    /// libdbus's marshalled reply is not (it frees without clearing)
+    static SECRET: RefCell<Option<(String, Secret)>> = const { RefCell::new(None) };
 }
 
 pub fn station() -> String {
     STATION_PATH.with(|s| s.borrow().clone())
 }
-/// Device.Powered of the station's device (false until iwd answers).
-pub fn powered() -> State<bool> {
-    POWERED.with(Clone::clone)
-}
-/// Station.State ("connected", "connecting", ...), "" without a station.
-pub fn state() -> State<String> {
-    STATE.with(Clone::clone)
-}
-pub fn scanning() -> State<bool> {
-    SCANNING.with(Clone::clone)
+global_state! {
+    /// Device.Powered of the station's device (false until iwd answers).
+    pub fn powered() -> bool = false;
+    /// Station.State ("connected", "connecting", ...), "" without a station.
+    pub fn state() -> String = String::new();
+    pub fn scanning() -> bool = false;
+    fn changed_state() -> () = ();
 }
 
 /// The cached object tree.
@@ -64,13 +60,16 @@ pub fn ordered() -> Vec<(String, i16)> {
 /// `f` runs after any iwd change (signals, a refresh landing, iwd appearing or vanishing); the
 /// caches are current by then.
 pub fn on_change(f: impl Fn() + 'static) {
-    LISTENERS.with(|l| l.borrow_mut().push(Rc::new(f)));
+    changed_state().subscribe(f);
 }
 
 fn changed() {
-    for f in LISTENERS.with(|l| l.borrow().clone()) {
-        f();
-    }
+    changed_state().notify();
+}
+
+/// Whether the network list is on screen; finished scans re-read it only then.
+pub fn show_networks(on: bool) {
+    SHOWN.with(|s| s.set(on));
 }
 
 pub async fn call(path: &str, iface: &str, member: &str, build: impl FnOnce(Message) -> Message) -> Result<Message, String> {
@@ -81,10 +80,7 @@ pub async fn call(path: &str, iface: &str, member: &str, build: impl FnOnce(Mess
 fn clear() {
     OBJECTS.with(|o| o.borrow_mut().clear());
     ORDERED.with(|o| o.borrow_mut().clear());
-    STATION_PATH.with(|s| s.borrow_mut().clear());
-    powered().set(false);
-    state().set(String::new());
-    scanning().set(false);
+    apply_objects(&ManagedObjects::new());
 }
 
 /// Re-reads the object tree, the station's state and its ordered networks into the caches, then
@@ -160,14 +156,7 @@ pub async fn device() -> Option<String> {
 }
 
 fn queue_refresh() {
-    thread_local! {
-        static Q: Cell<bool> = const { Cell::new(false) };
-    }
-    if Q.with(|q| q.replace(true)) {
-        return;
-    }
-    runtime::idle(|| {
-        Q.with(|q| q.set(false));
+    runtime::idle_once(|| {
         runtime::spawn(async {
             refresh().await;
         });
@@ -187,7 +176,7 @@ fn on_properties(path: &str, iface: &str, p: PropMap) {
             if let Some(v) = prop_bool(&p, "Scanning") {
                 scanning().set(v);
                 // a finished scan reorders the networks and updates their signal
-                if !v {
+                if !v && SHOWN.with(Cell::get) {
                     queue_refresh();
                 }
             }
@@ -209,8 +198,8 @@ fn on_properties(path: &str, iface: &str, p: PropMap) {
 }
 
 /// Only these objects appearing or going change what the menu or the icon show.
-fn relevant(ifaces: &[&str]) -> bool {
-    ifaces.iter().any(|i| [STATION, DEVICE, NETWORK, KNOWN_NETWORK].contains(i))
+fn relevant(ifaces: &[String]) -> bool {
+    ifaces.iter().any(|i| [STATION, DEVICE, NETWORK, KNOWN_NETWORK].contains(&i.as_str()))
 }
 
 fn from_iwd(bus: &dbus::Bus, m: &Message) -> bool {
@@ -218,9 +207,7 @@ fn from_iwd(bus: &dbus::Bus, m: &Message) -> bool {
 }
 
 fn take_secret() {
-    if let Some((_, mut pw)) = SECRET.with(|s| s.borrow_mut().take()) {
-        wipe(&mut pw);
-    }
+    SECRET.with(|s| s.borrow_mut().take());
 }
 
 fn export_agent(bus: &Rc<dbus::Bus>) {
@@ -234,11 +221,7 @@ fn export_agent(bus: &Rc<dbus::Bus>) {
         let net: dbus::Path = m.read1().ok()?;
         let secret = SECRET.with(|s| s.borrow_mut().take_if(|(p, _)| p.as_str() == &*net));
         match secret {
-            Some((_, mut pw)) => {
-                let reply = m.method_return().append1(pw.as_str());
-                wipe(&mut pw);
-                Some(reply)
-            }
+            Some((_, pw)) => Some(m.method_return().append1(pw.as_str())),
             None => canceled(m),
         }
     });
@@ -260,24 +243,29 @@ fn register_agent(bus: &dbus::Bus) {
     bus.call_cb(msg, |_| {});
 }
 
-/// Network.Connect; a non-empty `passphrase` answers the agent's request for this network, then is wiped.
-pub async fn connect(network: &str, passphrase: Option<String>) {
+/// Network.Connect; a `passphrase` answers the agent's request for this network, then is wiped.
+/// Err is iwd's error (e.g. a wrong passphrase); None when the attempt was cut short on purpose
+/// (another connect or a disconnect aborted it).
+pub async fn connect(network: &str, passphrase: Option<Secret>) -> Result<(), Option<String>> {
     take_secret();
     if let Some(pw) = passphrase {
         SECRET.with(|s| *s.borrow_mut() = Some((network.to_string(), pw)));
     }
-    let _ = call(network, NETWORK, "Connect", |m| m).await;
-    take_secret();
+    let res = call(network, NETWORK, "Connect", |m| m).await;
+    // a newer join's secret stays for its own request
+    SECRET.with(|s| s.borrow_mut().take_if(|(p, _)| p.as_str() == network));
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) if e.starts_with("net.connman.iwd.Aborted") => Err(None),
+        Err(e) => Err(Some(e)),
+    }
 }
 
-/// Idempotent: subscribes once, keeps the station state live across iwd restarts.
+/// Called once at launch; keeps the station state live across iwd restarts.
 pub fn start() {
-    if STARTED.with(|s| s.replace(true)) {
-        return;
-    }
     let Some(bus) = dbus::system() else { return };
     bus.subscribe(
-        SignalFilter { sender: Some(IWD.into()), interface: Some("org.freedesktop.DBus.Properties".into()), member: Some("PropertiesChanged".into()), ..Default::default() },
+        SignalFilter::properties_changed(Some(IWD)),
         |m| {
             if let (Some(path), Ok((iface, changed))) = (m.path(), m.read2::<&str, PropMap>()) {
                 on_properties(&path, iface, changed);
@@ -287,7 +275,7 @@ pub fn start() {
     bus.subscribe(SignalFilter { sender: Some(IWD.into()), interface: Some("org.freedesktop.DBus.ObjectManager".into()), ..Default::default() }, |m| {
         let added = m.read2::<dbus::Path, HashMap<String, PropMap>>().ok().map(|(_, i)| i.into_keys().collect::<Vec<_>>());
         let ifaces = added.or_else(|| m.read2::<dbus::Path, Vec<String>>().ok().map(|(_, i)| i)).unwrap_or_default();
-        if relevant(&ifaces.iter().map(String::as_str).collect::<Vec<_>>()) {
+        if relevant(&ifaces) {
             queue_refresh();
         }
     });

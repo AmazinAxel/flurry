@@ -1,14 +1,16 @@
-// Copying and the clipboard history, in-process over wlr-data-control (lib/clipboard.ts + cliphist).
+// Copying and the clipboard history, in-process over wlr-data-control.
 // History: one file per entry (raw bytes, named by content hash) and an index of
 // `id\tmime\tlen\tpreview` lines, newest first, in $XDG_CACHE_HOME/flurry/clipboard. Hashing and
 // disk writes run on worker threads, one job at a time; HISTORY itself only changes on the loop.
 
 use std::cell::{Cell, RefCell};
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::lib::xdg::write_atomic;
+use crate::ui::entry::Secret;
+use crate::ui::runtime::{blocking, spawn};
 use crate::ui::wayland;
 
 const TEXT: [&str; 5] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING"];
@@ -21,14 +23,15 @@ const MAX_BYTES: usize = 32 << 20;
 /// All entry files together; the oldest go first past it.
 const BUDGET: u64 = 256 << 20;
 
-fn offer(mimes: &[&str], data: &[u8]) -> Vec<(String, Arc<[u8]>)> {
-    let data: Arc<[u8]> = data.into();
+/// One copy of `data`, wiped once the last offer goes.
+fn offer(mimes: &[&str], data: &[u8]) -> Vec<(String, Arc<Secret>)> {
+    let data = Arc::new(Secret::new(data.to_vec()));
     mimes.iter().map(|m| (m.to_string(), data.clone())).collect()
 }
 
 /// Selections set here list `wayland::OWN_MIME`: the history records them directly instead of
 /// reading them back through a pipe.
-fn set(offers: Vec<(String, Arc<[u8]>)>) -> Option<u64> {
+fn set(offers: Vec<(String, Arc<Secret>)>) -> Option<u64> {
     wayland::set_selection(Arc::new(offers))
 }
 
@@ -63,7 +66,7 @@ pub fn copy_login(user: &str, password: &str) {
 /// Never stored in the history; cleared after 45s if the clipboard still holds it.
 pub fn copy_sensitive(text: &str) {
     let mut offers = offer(&TEXT, text.as_bytes());
-    offers.push((SECRET_HINT.into(), Arc::from(&b"secret"[..])));
+    offers.push((SECRET_HINT.into(), Arc::new(Secret::new(b"secret".to_vec()))));
     if let Some(token) = set(offers) {
         let _ = crate::ui::runtime::timeout(45_000, move || wayland::clear_selection(token));
     }
@@ -71,18 +74,21 @@ pub fn copy_sensitive(text: &str) {
 
 /// Copies a history entry back as what it was copied as.
 pub fn copy_entry(id: u64, mime: &str) {
-    let Ok(data) = std::fs::read(entry_file(id, mime)) else { return };
-    let mut mimes = if mime.starts_with("image/") { vec![mime] } else { TEXT.to_vec() };
-    if mime == "text/uri-list" {
-        mimes.insert(0, mime); // paste the ACTUAL file
-    }
-    set(offer(&mimes, &data));
-    promote(id);
+    let (path, mime) = (entry_file(id, mime), mime.to_string());
+    spawn(async move {
+        let Some(data) = blocking(move || std::fs::read(path).ok()).await.flatten() else { return };
+        let mut mimes = if mime.starts_with("image/") { vec![mime.as_str()] } else { TEXT.to_vec() };
+        if mime == "text/uri-list" {
+            mimes.insert(0, mime.as_str()); // paste the ACTUAL file
+        }
+        set(offer(&mimes, &data));
+        promote(id);
+    });
 }
 
 /// Moves the entry to the top under its own id (older entries' ids aren't the content hash).
 fn promote(id: u64) {
-    crate::ui::runtime::spawn(async move {
+    spawn(async move {
         let disk = DISK.with(Clone::clone);
         let _turn = disk.lock().await;
         let index = with_history(|h| {
@@ -92,7 +98,7 @@ fn promote(id: u64) {
         });
         let Some(index) = index else { return };
         changed();
-        crate::ui::runtime::blocking(move || write_atomic(&format!("{}/index", dir()), index.as_bytes())).await;
+        write_index(index).await;
     });
 }
 
@@ -109,17 +115,28 @@ pub struct Entry {
 }
 
 thread_local! {
-    /// newest first, read on first use
+    /// newest first, read on first use. By design there is no expiry and no per-source exclusion:
+    /// entries go only past CAP/BUDGET or on wipe, and only SECRET_HINT selections are skipped.
     static HISTORY: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };
+    /// the index exists but couldn't be read: neither overwritten nor cleaned up after, this run
+    static LOAD_FAILED: Cell<bool> = const { Cell::new(false) };
     static ON_CHANGE: RefCell<Option<Rc<dyn Fn()>>> = RefCell::default();
     /// disk jobs (records, wipes, cleanup), one at a time and in order
     static DISK: Rc<crate::ui::runtime::Queue> = Rc::default();
     /// bumped by wipe: a record started before it is dropped
     static WIPES: Cell<u64> = const { Cell::new(0) };
+    /// the selection waiting to be recorded: only the latest, however fast they come
+    static PENDING: RefCell<Option<(String, Vec<u8>)>> = const { RefCell::new(None) };
+    /// a record task is waiting for its disk turn (it takes PENDING then)
+    static QUEUED: Cell<bool> = const { Cell::new(false) };
 }
 
 fn dir() -> String {
     format!("{}/flurry/clipboard", crate::lib::xdg::cache_dir())
+}
+
+fn index_path() -> String {
+    format!("{}/index", dir())
 }
 
 /// Images keep an extension so editors and viewers open the file as is.
@@ -135,14 +152,9 @@ pub fn entry_file(id: u64, mime: &str) -> String {
 fn parse_index(text: &str) -> Vec<Entry> {
     text.lines()
         .filter_map(|l| {
-            // previews never hold tabs: 3 fields is the older index without sizes
-            let p: Vec<&str> = l.splitn(4, '\t').collect();
-            let (id, mime) = (p.first()?.parse().ok()?, p.get(1)?.to_string());
-            let (len, preview) = match p[..] {
-                [_, _, len, preview] => (len.parse().ok()?, preview),
-                [_, _, preview] => (std::fs::metadata(entry_file(id, &mime)).map(|m| m.len()).unwrap_or(0), preview),
-                _ => return None,
-            };
+            // previews never hold tabs
+            let mut p = l.splitn(4, '\t');
+            let (id, mime, len, preview) = (p.next()?.parse().ok()?, p.next()?.to_string(), p.next()?.parse().ok()?, p.next()?);
             Some(Entry { id, mime, len, preview: preview.into() })
         })
         .collect()
@@ -152,8 +164,37 @@ fn format_index(entries: &[Entry]) -> String {
     entries.iter().map(|e| format!("{}\t{}\t{}\t{}\n", e.id, e.mime, e.len, e.preview)).collect()
 }
 
+fn load() -> Vec<Entry> {
+    match std::fs::read(index_path()) {
+        Ok(b) => {
+            let text = String::from_utf8_lossy(&b);
+            let entries = parse_index(&text);
+            if entries.len() != text.lines().count() {
+                // an unknown line names a file cleanup would delete: leave the history on disk alone
+                eprintln!("flurry: clipboard index: unreadable lines: history kept on disk as is");
+                LOAD_FAILED.with(|f| f.set(true));
+            }
+            entries
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => {
+            eprintln!("flurry: clipboard index: {e}: history kept on disk as is");
+            LOAD_FAILED.with(|f| f.set(true));
+            vec![]
+        }
+    }
+}
+
 fn with_history<R>(f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
-    HISTORY.with(|h| f(h.borrow_mut().get_or_insert_with(|| parse_index(&std::fs::read_to_string(format!("{}/index", dir())).unwrap_or_default()))))
+    HISTORY.with(|h| f(h.borrow_mut().get_or_insert_with(load)))
+}
+
+/// Writes the index off the loop; false if it wasn't written.
+async fn write_index(index: String) -> bool {
+    if LOAD_FAILED.with(Cell::get) {
+        return false;
+    }
+    blocking(move || write_atomic(&index_path(), index.as_bytes(), 0o600).is_ok()).await.unwrap_or(false)
 }
 
 /// FNV-1a 64: stable across builds, so ids (file names) stay valid.
@@ -163,16 +204,6 @@ fn fnv1a(data: &[u8]) -> u64 {
 
 pub fn history() -> Vec<Entry> {
     with_history(|h| h.clone())
-}
-
-fn write_private(path: &str, data: &[u8]) -> bool {
-    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path).and_then(|mut f| f.write_all(data)).is_ok()
-}
-
-/// tmp + rename: a crash mid-write never leaves a torn file under the real name.
-fn write_atomic(path: &str, data: &[u8]) -> bool {
-    let tmp = format!("{path}.tmp");
-    write_private(&tmp, data) && std::fs::rename(&tmp, path).is_ok()
 }
 
 fn changed() {
@@ -197,24 +228,32 @@ fn record(mime: &str, data: Vec<u8>) {
     if data.len() > MAX_BYTES {
         return;
     }
-    let mime = mime.to_string();
-    let wipes = WIPES.with(Cell::get);
-    crate::ui::runtime::spawn(async move {
+    PENDING.with(|p| *p.borrow_mut() = Some((mime.to_string(), data)));
+    if QUEUED.with(|q| q.replace(true)) {
+        return;
+    }
+    spawn(async move {
         let disk = DISK.with(Clone::clone);
         let _turn = disk.lock().await;
+        QUEUED.with(|q| q.set(false));
+        // a wipe clears PENDING; one during the work below drops it
+        let Some((mime, data)) = PENDING.with(|p| p.borrow_mut().take()) else { return };
+        let wipes = WIPES.with(Cell::get);
         // files the history already has needn't be written again
         let known: Vec<(u64, u64)> = with_history(|h| h.iter().map(|e| (e.id, e.len)).collect());
-        let m = mime.clone();
-        let entry = crate::ui::runtime::blocking(move || {
-            let preview = preview(&m, &data)?;
+        let entry = blocking(move || {
+            let preview = preview(&mime, &data)?;
             let (id, len) = (fnv1a(&data), data.len() as u64);
-            if !known.contains(&(id, len)) {
+            let path = entry_file(id, &mime);
+            // same id and length: still a collision unless the stored bytes match
+            if !known.contains(&(id, len)) || std::fs::read(&path).ok().as_deref() != Some(&data[..]) {
                 let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir());
-                if !write_atomic(&entry_file(id, &m), &data) {
+                if let Err(e) = write_atomic(&path, &data, 0o600) {
+                    eprintln!("flurry: clipboard entry {path}: {e}");
                     return None;
                 }
             }
-            Some(Entry { id, mime: m, len, preview })
+            Some(Entry { id, mime, len, preview })
         })
         .await
         .flatten();
@@ -223,10 +262,10 @@ fn record(mime: &str, data: Vec<u8>) {
             return;
         }
         let update = with_history(|h| {
-            if h.first().is_some_and(|e| e.id == entry.id && e.len == entry.len) {
+            if h.first().is_some_and(|e| *e == entry) {
                 return None;
             }
-            // same id, other length: a hash collision whose file was just replaced
+            // same id: a repeat, or a collision whose file was just replaced
             h.retain(|e| e.id != entry.id);
             h.insert(0, entry);
             let mut keep = h.len().min(CAP);
@@ -243,38 +282,45 @@ fn record(mime: &str, data: Vec<u8>) {
         });
         let Some((index, dropped)) = update else { return };
         changed();
-        crate::ui::runtime::blocking(move || {
-            // files go only once the index no longer names them
-            if write_atomic(&format!("{}/index", dir()), index.as_bytes()) {
+        // files go only once the index no longer names them
+        if write_index(index).await {
+            blocking(move || {
                 for e in dropped {
                     let _ = std::fs::remove_file(entry_file(e.id, &e.mime));
                 }
-            }
-        })
-        .await;
+            })
+            .await;
+        }
     });
 }
 
 pub fn wipe() {
     WIPES.with(|w| w.set(w.get() + 1));
+    PENDING.with(|p| p.borrow_mut().take());
     with_history(Vec::clear);
+    // the files are gone below: the next index may be written again
+    LOAD_FAILED.with(|f| f.set(false));
     changed();
-    crate::ui::runtime::spawn(async {
+    spawn(async {
         let disk = DISK.with(Clone::clone);
         let _turn = disk.lock().await;
-        crate::ui::runtime::blocking(|| std::fs::remove_dir_all(dir())).await;
+        blocking(|| std::fs::remove_dir_all(dir())).await;
     });
 }
 
-/// Files the index doesn't name (a crash between writes, older builds): deleted, off the loop.
+/// Files the index doesn't name (a crash between writes): deleted, off the loop.
 fn cleanup() {
-    crate::ui::runtime::spawn(async {
+    spawn(async {
         let disk = DISK.with(Clone::clone);
         let _turn = disk.lock().await;
         let keep: Vec<String> = with_history(|h| h.iter().map(|e| entry_file(e.id, &e.mime)).collect());
-        crate::ui::runtime::blocking(move || {
+        // an unreadable index names nothing: every file would go
+        if LOAD_FAILED.with(Cell::get) {
+            return;
+        }
+        blocking(move || {
             let Ok(rd) = std::fs::read_dir(dir()) else { return };
-            let index = format!("{}/index", dir());
+            let index = index_path();
             for e in rd.flatten() {
                 let p = e.path().to_string_lossy().into_owned();
                 if p != index && !keep.contains(&p) {
@@ -286,7 +332,7 @@ fn cleanup() {
     });
 }
 
-/// Records every new selection from here on (text preferred, then file lists, then images);
+/// Records every new selection from here on (file lists preferred, then text, then images);
 /// `on_change` runs whenever the history changes.
 pub fn watch(on_change: impl Fn() + 'static) {
     ON_CHANGE.with(|c| *c.borrow_mut() = Some(Rc::new(on_change)));
@@ -297,7 +343,8 @@ pub fn watch(on_change: impl Fn() + 'static) {
         if has(SECRET_HINT) || has(wayland::OWN_MIME) {
             return;
         }
-        let Some(mime) = TEXT.into_iter().chain(["text/uri-list", "image/png", "image/jpeg"]).find(|m| has(m)) else { return };
+        // file managers offer the paths as text too: keep them as files
+        let Some(mime) = ["text/uri-list"].into_iter().chain(TEXT).chain(["image/png", "image/jpeg"]).find(|m| has(m)) else { return };
         let stored = if TEXT.contains(&mime) { "text/plain" } else { mime };
         wayland::read_selection(mime, MAX_BYTES, 5000, move |data| {
             if let Some(d) = data {
@@ -325,8 +372,8 @@ mod tests {
         assert_eq!(parse_index(&format_index(&e)), e);
         // a torn or foreign line is skipped, never a panic
         assert_eq!(parse_index("x\ty\tz\n3\ttext/plain\n4\ttext/plain\tx\ty\n").len(), 0);
-        // the older index without sizes still loads
-        assert_eq!(parse_index("3\ttext/plain\tdeleted entry\n")[0].preview, "deleted entry");
+        // the older 3-field index (no sizes) is no longer read
+        assert!(parse_index("3\ttext/plain\tdeleted entry\n").is_empty());
         assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(preview("text/plain", b"  second line\n\tthird line ").as_deref(), Some("second line third line"));
         assert_eq!(preview("text/plain", " \n".as_bytes()), None);

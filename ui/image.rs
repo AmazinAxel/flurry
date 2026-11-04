@@ -79,6 +79,24 @@ fn jpeg_dims(d: &mut zune_jpeg::JpegDecoder<&[u8]>, max: u64) -> Option<(u32, u3
     (!too_big(w, h, max)).then_some((w as u32, h as u32, o))
 }
 
+/// Decodes into the front of `dst` (sized w*h*4), then widens it to RGBA in place: grayscale
+/// JPEGs come out as Luma whatever colorspace was asked for. Opaque, so already premultiplied.
+fn jpeg_frame(d: &mut zune_jpeg::JpegDecoder<&[u8]>, dst: &mut [u8]) -> Option<()> {
+    let (w, h) = d.dimensions()?;
+    let n = w * h;
+    let ch = d.get_output_colorspace()?.num_components();
+    let dst = dst.get_mut(..n * 4)?;
+    d.decode_into(dst).ok()?;
+    match ch {
+        4 => {}
+        3 => expand::<3>(dst, n, |p| [p[0], p[1], p[2], 255]),
+        2 => expand::<2>(dst, n, |p| [p[0], p[0], p[0], p[1]]),
+        1 => expand::<1>(dst, n, |p| [p[0], p[0], p[0], 255]),
+        _ => return None,
+    }
+    Some(())
+}
+
 /// The orientation tag (0x0112) of IFD0 in EXIF data starting at its TIFF header; 1 when absent.
 fn exif_orientation(e: &[u8]) -> u8 {
     let le = match e.get(..2) {
@@ -132,9 +150,9 @@ fn decode_pixels(bytes: &[u8], max: u64) -> Option<(Vec<u8>, u32, u32)> {
         [0xff, 0xd8, ..] => {
             let mut d = jpeg_decoder(bytes);
             let (w, h, o) = jpeg_dims(&mut d, max)?;
-            // opaque, so already premultiplied
-            let px = d.decode().ok()?;
-            (px.len() == w as usize * h as usize * 4).then(|| orient(px, w, h, o))
+            let mut px = vec![0; w as usize * h as usize * 4];
+            jpeg_frame(&mut d, &mut px)?;
+            Some(orient(px, w, h, o))
         }
         _ => None,
     }
@@ -152,17 +170,11 @@ pub fn dims(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
-/// Sniffs the format from the header; at most THUMB_PIXELS.
-pub fn decode(bytes: &[u8]) -> Option<Pixmap> {
-    let (px, w, h) = decode_pixels(bytes, THUMB_PIXELS)?;
-    Pixmap::from_vec(px, IntSize::from_wh(w, h)?)
-}
-
 /// Decodes upright as premultiplied RGBA (at most `max` pixels) into the `w`x`h` buffer `alloc`
-/// provides (`buf` its bytes), shrunk to the size `fit` picks for the upright size when that is
-/// smaller. Straight into the buffer, with no intermediate copy, when nothing needs transforming.
-pub fn decode_into<T>(
-    bytes: &[u8], max: u64, fit: impl Fn(u32, u32) -> (u32, u32), alloc: impl FnOnce(u32, u32) -> Option<T>, buf: impl Fn(&mut T) -> &mut [u8],
+/// provides, shrunk to the size `fit` picks for the upright size when that is smaller. Straight
+/// into the buffer, with no intermediate copy, when nothing needs transforming.
+pub fn decode_into<T: AsMut<[u8]>>(
+    bytes: &[u8], max: u64, fit: impl Fn(u32, u32) -> (u32, u32), alloc: impl FnOnce(u32, u32) -> Option<T>,
 ) -> Option<T> {
     let target = |w: u32, h: u32| {
         let (tw, th) = fit(w, h);
@@ -174,7 +186,7 @@ pub fn decode_into<T>(
             let (w, h) = (reader.info().width, reader.info().height);
             if target(w, h) == (w, h) {
                 let mut t = alloc(w, h)?;
-                png_frame(&mut reader, buf(&mut t))?;
+                png_frame(&mut reader, t.as_mut())?;
                 return Some(t);
             }
         }
@@ -183,7 +195,7 @@ pub fn decode_into<T>(
             let (w, h, o) = jpeg_dims(&mut d, max)?;
             if o == 1 && target(w, h) == (w, h) {
                 let mut t = alloc(w, h)?;
-                d.decode_into(buf(&mut t)).ok()?;
+                jpeg_frame(&mut d, t.as_mut())?;
                 return Some(t);
             }
         }
@@ -192,7 +204,7 @@ pub fn decode_into<T>(
     let (px, w, h) = decode_pixels(bytes, max)?;
     let (tw, th) = target(w, h);
     let mut t = alloc(tw, th)?;
-    let out = buf(&mut t);
+    let out = t.as_mut();
     if (tw, th) == (w, h) {
         out.get_mut(..px.len())?.copy_from_slice(&px);
     } else {

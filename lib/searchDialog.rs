@@ -1,6 +1,6 @@
-// Search entry + result rows dialog (lib/searchDialog.tsx), shared by launcher and pass.
+// Search entry + result rows dialog, shared by launcher and pass.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use xkbcommon::xkb::Keysym;
@@ -9,7 +9,7 @@ use crate::lib::backgroundSection::background_section;
 use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::style::*;
 use crate::ui::entry::{self, EntryRef, Look};
-use crate::ui::node::{Background, Node, Sides, Style, rgba};
+use crate::ui::node::{Node, Sides, Style, rgba};
 use crate::ui::window::{self, Win};
 
 pub struct SearchSpec<T> {
@@ -35,7 +35,7 @@ pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str) -> Node {
     let mut s = base.inherit();
     s.min_height = 36.0;
     s.padding = Sides::vh(0.0, SPACE_M);
-    s.background = Background::Color(rgba(255, 255, 255, 0.04));
+    s.background = Some(rgba(255, 255, 255, 0.04));
     s = s.border(Sides::all(BORDER), dark4());
     // Graphite entry text; :focus-within never matches (GTK does not consider layer windows active)
     s.color = rgba(255, 255, 255, 0.7);
@@ -44,18 +44,11 @@ pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str) -> Node {
 
 /// Entry text in the style's color, with the Graphite selection.
 fn look(s: &Style) -> Look {
-    Look { color: s.color, placeholder: s.color, selection_bg: hex_sel(), selection_fg: sel_fg(), caret: false }
-}
-
-pub fn hex_sel() -> tiny_skia::Color {
-    crate::ui::node::hex(0xdbdee5)
-}
-pub fn sel_fg() -> tiny_skia::Color {
-    rgba(0, 0, 0, 0.87)
+    Look { color: s.color, placeholder: s.color, selection_bg: crate::ui::node::hex(0xdbdee5), selection_fg: rgba(0, 0, 0, 0.87), caret: false }
 }
 
 /// `.searchableDialog button` row, selected/disabled states.
-pub fn row_style(base: &Style, selected: bool, sensitive: bool) -> Style {
+fn row_style(base: &Style, selected: bool, sensitive: bool) -> Style {
     let mut s = button(base);
     if selected {
         s = focus_outline(s);
@@ -69,14 +62,15 @@ pub fn row_style(base: &Style, selected: bool, sensitive: bool) -> Style {
 pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>) -> Rc<Win> {
     let entry = entry::new("");
     let items: Rc<RefCell<Vec<T>>> = Rc::default();
-    let selected: Rc<RefCell<Option<usize>>> = Rc::default();
+    // index into items; meaningless while they're empty
+    let selected: Rc<Cell<usize>> = Rc::default();
     let spec = Rc::new(spec);
 
     {
         let (items, selected, spec) = (items.clone(), selected.clone(), spec.clone());
         entry.borrow_mut().on_change = Some(Rc::new(move |text: &str| {
             let list = (spec.search)(text);
-            *selected.borrow_mut() = (!list.is_empty()).then_some(0);
+            selected.set(0);
             *items.borrow_mut() = list;
             if let Some(w) = window::get(name) {
                 w.redraw();
@@ -86,23 +80,23 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
 
     let build = {
         let (entry, items, selected, spec) = (entry.clone(), items.clone(), selected.clone(), spec.clone());
-        move |_: &window::View| {
+        move |_: Option<&str>| {
             let base = window();
             let list = items.borrow();
-            let sel = *selected.borrow();
+            let sel = selected.get();
             let rows: Vec<Node> = list
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
                     let sensitive = spec.sensitive.as_ref().is_none_or(|f| f(item));
-                    let s = row_style(&base, sel == Some(i), sensitive);
+                    let s = row_style(&base, sel == i, sensitive);
                     let inner = (spec.row)(item, &s);
                     Node::hbox(s, 0.0, vec![inner])
                 })
                 .collect();
             let content = Node::vbox(base.inherit(), BORDER, rows).show(!list.is_empty());
             let header = search_entry(&base, &entry);
-            background_section(&base, header, Some(content), 700.0, 500.0)
+            background_section(&base, header, Some(content), CARD_HEIGHT, CARD_WIDTH)
         }
     };
 
@@ -113,7 +107,7 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
                 && matches!(ev.sym, Keysym::Return | Keysym::KP_Enter)
                 && ev.shift
             {
-                let top = selected.borrow().and_then(|i| items.borrow().get(i).cloned());
+                let top = items.borrow().get(selected.get()).cloned();
                 if let Some(t) = top {
                     sa(&t);
                 }
@@ -129,17 +123,16 @@ pub fn search_dialog<T: Clone + 'static>(name: &'static str, spec: SearchSpec<T>
             };
             let len = items.borrow().len();
             if len > 0 {
-                let cur = selected.borrow().map(|i| i as i64).unwrap_or(-1);
-                *selected.borrow_mut() = Some(crate::lib::wrapFocus::wrap_index(cur, delta, len as i64) as usize);
+                selected.set(crate::lib::wrapFocus::wrap_index(selected.get() as i64, delta, len as i64) as usize);
             }
             true
         })
     };
 
     let activate = {
-        let (items, selected, spec) = (items.clone(), selected.clone(), spec.clone());
+        let (items, selected, spec) = (items, selected, spec.clone());
         Rc::new(move || {
-            let top = selected.borrow().and_then(|i| items.borrow().get(i).cloned());
+            let top = items.borrow().get(selected.get()).cloned();
             // insensitive rows are shown, not activated
             if let Some(t) = top.filter(|t| spec.sensitive.as_ref().is_none_or(|f| f(t))) {
                 (spec.activate)(&t);

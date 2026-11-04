@@ -1,21 +1,16 @@
 // Quickstatus menu: clock, status icons and date, the media block, then the quicksettings sliders and outputs.
 
-use crate::lib::audio;
+use crate::lib::mediaPlayer::{is_playing, playlist, song};
 use crate::lib::menuWindow::GAP;
+use crate::lib::style::*;
+use crate::ui::node::{Align, Node, Sides, Style};
+use crate::widgets::status::modules::{mpris::track, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
+use crate::widgets::status::quicksettings::quicksettings::quick_settings;
 
 /// Ink height of the clock and date; the group is centered in the wallpaper's width.
 const TOP_HEIGHT: f32 = 220.0;
 /// Text size of the controls under the wallpaper.
 const CONTROL_FONT: f32 = 19.0;
-use crate::lib::mediaPlayer::{is_playing, playlist, song};
-use crate::lib::style::*;
-use crate::ui::node::{Align, Background, Node, Sides, Style};
-use crate::widgets::status::modules::{mpris::track, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
-use crate::widgets::status::quicksettings::quicksettings::quick_settings;
-
-pub fn volume_icon() -> &'static str {
-    audio::default_speaker().map(|s| s.volume_icon()).unwrap_or("audio-volume-muted-symbolic")
-}
 
 /// The playlist's style color name from settings (anything unknown is blue2).
 fn playlist_color() -> tiny_skia::Color {
@@ -32,7 +27,7 @@ fn playlist_color() -> tiny_skia::Color {
 
 /// Play/pause on the left with the mpd song, or the MPRIS track while mpd is paused;
 /// just a centered button when there is neither. Always as tall as title plus artist.
-fn media(base: &Style) -> Node {
+fn media(base: &Style, focus: Option<&str>) -> Node {
     let info = |title: String, artist: String| {
         let mut t = base.inherit();
         t.font.size = 22.0;
@@ -49,20 +44,24 @@ fn media(base: &Style) -> Node {
     let playlist = playlist_color();
     let playing = is_playing().peek();
     let bar = Style {
-        background: Background::Color(playlist),
+        background: Some(playlist),
         margin: Sides::vh(SPACE_M, 0.0),
         min_height: info(" ".into(), " ".into()).measure_h(f32::MAX).1,
         ..base.inherit()
     }
     .border(Sides::all(BORDER), lighter(playlist));
-    let btn = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
+    let mut btn_style = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
+    if focus == Some("mediaBtn") {
+        btn_style = focus_outline(btn_style);
+    }
+    let btn = Node::hbox(btn_style, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).focusable("mediaBtn");
     let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
-    let Some((title, artist)) = text else {
-        return Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).expand(true, false).align(Align::Center, Align::Fill).id("mediaBtn")])
-            .id("media");
+    let children = match text {
+        Some((title, artist)) => vec![btn, info(title, artist)],
+        None => vec![btn.expand(true, false).align(Align::Center, Align::Fill)],
     };
-    Node::hbox(bar, 0.0, vec![Node::hbox(btn, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).id("mediaBtn"), info(title, artist)]).id("media")
+    Node::hbox(bar, 0.0, children).id("media")
 }
 
 /// Wallpaper part (clock | icons | date on one GAP grid, as tall as each other) and the controls under it.
@@ -73,7 +72,6 @@ pub fn quickstatus(base: &Style, focus: Option<&str>) -> (Node, Option<Node>) {
     // both columns TOP_HEIGHT tall: 2 rows + gap for the clock, 3 rows + 2 gaps for the date
     let c = (TOP_HEIGHT - GAP) / 1.5;
     let d = (TOP_HEIGHT - 2.0 * GAP) / (1.5 + 0.75 * day);
-    debug_assert!((time::clock_height(c, GAP) - time::date_height(d, day * d, GAP)).abs() < 0.5);
     // clock and date padded to the same width so the icons sit on the center line
     let (mut clock, mut date) = (time::clock(base, c, GAP), time::date(base, d, day * d, GAP));
     let (cw, dw) = (clock.measure_w().1, date.measure_w().1);
@@ -82,5 +80,5 @@ pub fn quickstatus(base: &Style, focus: Option<&str>) -> (Node, Option<Node>) {
     let top = Node::hbox(base.inherit(), GAP, vec![clock, icons, date]).expand(true, false).align(Align::Center, Align::Center);
     let mut big = base.clone();
     big.font.size = CONTROL_FONT;
-    (top, Some(Node::vbox(big.inherit(), 0.0, vec![media(&big), quick_settings(&big, focus)]).expand(true, false)))
+    (top, Some(Node::vbox(big.inherit(), 0.0, vec![media(&big, focus), quick_settings(&big, focus)]).expand(true, false)))
 }

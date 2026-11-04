@@ -2,7 +2,7 @@
 
 use tiny_skia::Color;
 
-use crate::ui::node::{Background, Shadow, Sides, Style, alpha, hex, rgba, shadow};
+use crate::ui::node::{Shadow, Sides, Style, alpha, hex, rgba, shadow};
 use crate::ui::text::Font;
 
 pub fn dark1() -> Color { hex(0x2e3440) }
@@ -28,6 +28,13 @@ pub const SPACE_M: f32 = 8.0;
 pub const SPACE_L: f32 = 16.0;
 /// Gap of the windows sway tiles: edge-anchored widgets line up with them.
 pub const SWAY_GAP: f32 = 5.0;
+/// The centered cards (launcher, clipboard, status menus): width, and the height they center in,
+/// so they share a top edge.
+pub const CARD_WIDTH: f32 = 500.0;
+pub const CARD_HEIGHT: f32 = 700.0;
+/// The sideview panel's width, and its wide size (`toggleSideviewSize`).
+pub const SIDEVIEW_WIDTH: u32 = 400;
+pub const SIDEVIEW_WIDE: u32 = 700;
 /// Blur of every bloom.
 pub const BLOOM: f32 = 8.0;
 
@@ -58,27 +65,27 @@ pub fn window() -> Style {
     Style {
         color: light1(),
         font: font(SORA, 16.0),
-        text_shadow: vec![own_bloom()],
-        icon_shadow: vec![own_bloom()],
+        text_shadow: Some(own_bloom()),
+        icon_shadow: Some(own_bloom()),
         ..Style::default()
     }
 }
 
 /// `.statusElement`
 pub fn status_element(base: &Style) -> Style {
-    Style { background: Background::Color(dark1()), margin: Sides::all(SPACE_L), ..base.inherit() }
+    Style { background: Some(dark1()), margin: Sides::all(SPACE_L), ..base.inherit() }
         .border(Sides::all(BORDER), blue3())
 }
 
 /// `.widgetBackground`
 pub fn widget_background(base: &Style) -> Style {
-    Style { background: Background::Color(dark1()), padding: Sides::all(SPACE_L), ..base.inherit() }.border(Sides::all(BORDER), blue3())
+    Style { background: Some(dark1()), padding: Sides::all(SPACE_L), ..base.inherit() }.border(Sides::all(BORDER), blue3())
 }
 
 /// Graphite `button` (border from style.css, square corners from `* { border-radius: 0 }`)
 pub fn button(base: &Style) -> Style {
     let mut s = Style {
-        background: Background::Color(rgba(255, 255, 255, 0.04)),
+        background: Some(rgba(255, 255, 255, 0.04)),
         padding: Sides::all(SPACE_M),
         min_height: 16.0, // a 16px icon's button comes out square
         min_width: 16.0,
@@ -92,14 +99,14 @@ pub fn button(base: &Style) -> Style {
 /// Frosted look for anything over the tinted wallpaper (menu buttons, calendar): white text on
 /// translucent black; blue marks the active/selected item.
 pub fn frosted(mut s: Style) -> Style {
-    s.background = Background::Color(alpha(dark1(), 0.6));
+    s.background = Some(alpha(dark1(), 0.6));
     s.color = light1();
     s
 }
 
 /// `button.active, .button.selected, list row:selected, ...`
 pub fn button_active(mut s: Style) -> Style {
-    s.background = Background::Color(blue3());
+    s.background = Some(blue3());
     s.border_color = [blue3(); 4];
     s
 }

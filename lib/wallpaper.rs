@@ -1,14 +1,15 @@
-// Random wallpaper from ~/Wallpapers (lib/wallpaper.tsx). The decoded image, shrunk to cover the
-// largest output, lives in exactly one shm buffer: every monitor's background surface shows it, and
+// Random wallpaper from settings' WALLPAPER_DIR. The decoded image, shrunk to cover the largest
+// output, lives in exactly one shm buffer: every monitor's background surface shows it, and
 // BackgroundSection headers and the lockscreen draw from the same memory.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use crate::lib::state::State;
+use crate::settings::WALLPAPER_DIR;
 use crate::ui::image;
 use crate::ui::node::{Img, Kind, Node, Style};
 use crate::ui::runtime;
+use crate::ui::state::global_state;
 use crate::ui::wayland::{Anchor, Layer, ShmImage, ShmPixels};
 use crate::ui::window::{Spec, Win};
 
@@ -16,6 +17,8 @@ use crate::ui::window::{Spec, Win};
 pub struct Wallpaper {
     pub path: String,
     pub shm: Rc<ShmImage>,
+    /// the file's own size, before shrinking
+    full: (u32, u32),
 }
 
 impl PartialEq for Wallpaper {
@@ -24,15 +27,20 @@ impl PartialEq for Wallpaper {
     }
 }
 
-thread_local! {
-    static CURRENT: State<Option<Wallpaper>> = State::new(None);
-    static NEXT: RefCell<Option<Wallpaper>> = const { RefCell::new(None) };
-    static LOADING: Cell<bool> = const { Cell::new(false) };
-    static SHOW_NEXT: Cell<bool> = const { Cell::new(false) };
+/// What to decode: a random file other than the current one, or the current one again (larger).
+enum Pick {
+    Other(Option<String>),
+    Same(String),
 }
 
-pub fn current() -> State<Option<Wallpaper>> {
-    CURRENT.with(Clone::clone)
+thread_local! {
+    static LOADING: Cell<bool> = const { Cell::new(false) };
+    /// asked for while a decode ran: runs once it lands
+    static QUEUED: RefCell<Option<Pick>> = const { RefCell::new(None) };
+}
+
+global_state! {
+    pub fn current() -> Option<Wallpaper> = None;
 }
 
 /// Images under `dir`: only regular files (symlinks followed) named like a jpeg or png, so a
@@ -74,61 +82,85 @@ fn cover_size(w: u32, h: u32, outputs: &[(f64, f64)]) -> (u32, u32) {
     ((w as f64 * s).ceil() as u32, (h as f64 * s).ceil() as u32)
 }
 
-/// A random wallpaper other than `cur`, read and decoded into shared memory, shrunk to cover the
-/// largest output; a few candidates are tried in case one is broken. Runs on a worker thread
-/// (listing included).
-fn load(cur: Option<String>) -> Option<(String, ShmPixels)> {
-    let mut files = vec![];
-    list_files(&format!("{}/Wallpapers", crate::lib::xdg::home_dir()), &mut files);
-    files.retain(|f| Some(f) != cur.as_ref());
+fn wallpaper_dir() -> String {
+    if WALLPAPER_DIR.starts_with('/') { WALLPAPER_DIR.to_string() } else { format!("{}/{WALLPAPER_DIR}", crate::lib::xdg::home_dir()) }
+}
+
+/// `path` read and decoded into shared memory, shrunk to cover the largest output, with its full size.
+fn decode(path: &str, outputs: &[(f64, f64)]) -> Option<(ShmPixels, (u32, u32))> {
+    let bytes = std::fs::read(path).ok()?;
+    let full = Cell::new((0, 0));
+    let fit = |w, h| {
+        full.set((w, h));
+        cover_size(w, h, outputs)
+    };
+    image::decode_into(&bytes, image::WALLPAPER_PIXELS, fit, ShmPixels::new).map(|p| (p, full.get()))
+}
+
+/// The picked wallpaper decoded; for a random one a few candidates are tried in case one is
+/// broken. Runs on a worker thread (listing included).
+fn load(pick: Pick) -> Option<(String, ShmPixels, (u32, u32))> {
     let outputs = output_sizes();
+    let cur = match pick {
+        Pick::Same(path) => return decode(&path, &outputs).map(|(p, full)| (path, p, full)),
+        Pick::Other(cur) => cur,
+    };
+    let mut files = vec![];
+    list_files(&wallpaper_dir(), &mut files);
+    files.retain(|f| Some(f) != cur.as_ref());
     for _ in 0..3 {
         if files.is_empty() {
             break;
         }
         let Some(i) = crate::lib::random::below(files.len() as u64).map(|i| i as usize) else { break };
         let path = files.swap_remove(i);
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let fit = |w, h| cover_size(w, h, &outputs);
-        if let Some(p) = image::decode_into(&bytes, image::WALLPAPER_PIXELS, fit, ShmPixels::new, ShmPixels::data) {
-            return Some((path, p));
+        if let Some((p, full)) = decode(&path, &outputs) {
+            return Some((path, p, full));
         }
     }
     None
 }
 
-/// Swaps in another random wallpaper at once: the next one is always decoded ahead of time, which
-/// costs a second (output-sized) image in memory. Decodes never block the loop (lock, unlock, startup).
+/// Shows another random wallpaper once it's decoded (only one image is ever held). Decodes never
+/// block the loop (lock, unlock, startup).
 pub fn random_wallpaper() {
-    match NEXT.with(|n| n.borrow_mut().take()) {
-        Some(next) => {
-            current().set(Some(next));
-            preload();
-        }
-        None => {
-            // nothing ready (startup, or switching faster than decoding): show it when it is
-            SHOW_NEXT.with(|s| s.set(true));
-            preload();
-        }
+    let cur = current().with(|c| c.as_ref().map(|c| c.path.clone()));
+    start(Pick::Other(cur));
+}
+
+/// A newly plugged output larger than the current decode covers gets it re-decoded at its size.
+fn outputs_changed() {
+    let Some(w) = current().peek() else { return };
+    let outputs = output_sizes();
+    let (nw, nh) = cover_size(w.full.0, w.full.1, &outputs);
+    if nw > w.shm.width || nh > w.shm.height {
+        start(Pick::Same(w.path));
     }
 }
 
-fn preload() {
+fn start(pick: Pick) {
     if LOADING.with(|l| l.replace(true)) {
+        // a random pick is decoded at the current outputs anyway: it covers a re-decode
+        QUEUED.with(|q| {
+            let mut q = q.borrow_mut();
+            if !matches!((&pick, &*q), (Pick::Same(_), Some(Pick::Other(_)))) {
+                *q = Some(pick);
+            }
+        });
         return;
     }
-    let cur = current().with(|c| c.as_ref().map(|c| c.path.clone()));
     runtime::spawn(async move {
-        let loaded = runtime::blocking(move || load(cur)).await.flatten();
+        let loaded = runtime::blocking(move || load(pick)).await.flatten();
         LOADING.with(|l| l.set(false));
-        let show = SHOW_NEXT.with(|s| s.replace(false));
-        let Some((path, pixels)) = loaded else { return };
-        let w = Wallpaper { path, shm: ShmImage::from_pixels(pixels) };
-        if show {
-            current().set(Some(w));
-            preload();
-        } else {
-            NEXT.with(|n| *n.borrow_mut() = Some(w));
+        if let Some((path, pixels, full)) = loaded {
+            current().set(Some(Wallpaper { path, shm: ShmImage::from_pixels(pixels), full }));
+        }
+        // queued against what's showing now
+        let cur = current().with(|c| c.as_ref().map(|c| c.path.clone()));
+        match QUEUED.with(|q| q.borrow_mut().take()) {
+            Some(Pick::Other(_)) => start(Pick::Other(cur)),
+            Some(Pick::Same(_)) => outputs_changed(),
+            None => {}
         }
     });
 }
@@ -155,9 +187,10 @@ pub fn wallpaper_window() -> Rc<Win> {
     let apply = |w: &Rc<Win>| {
         if let Some(cur) = current().peek() {
             w.show();
-            w.set_image(Some(cur.shm));
+            w.set_image(cur.shm);
         }
     };
+    crate::lib::sway::subscribe(&["output"], |_| outputs_changed());
     let win = Rc::downgrade(&w);
     current().subscribe(move || {
         if let Some(w) = win.upgrade() {

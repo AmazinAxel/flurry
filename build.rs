@@ -20,8 +20,7 @@ fn flatten(group: &usvg::Group, opacity: f32, out: &mut String) {
                     }
                 }
                 if let Some(stroke) = p.stroke()
-                    && let Some(s) = stroke.to_tiny_skia_stroke()
-                    && let Some(outline) = p.data().stroke(&s, 1.0)
+                    && let Some(outline) = p.data().stroke(&stroke.to_tiny_skia(), 1.0)
                     && let Some(path) = outline.transform(ts)
                 {
                     push_shape(&path, opacity * stroke.opacity().get(), false, out);
@@ -29,29 +28,6 @@ fn flatten(group: &usvg::Group, opacity: f32, out: &mut String) {
             }
             _ => {}
         }
-    }
-}
-
-trait ToStroke {
-    fn to_tiny_skia_stroke(&self) -> Option<usvg::tiny_skia_path::Stroke>;
-}
-impl ToStroke for usvg::Stroke {
-    fn to_tiny_skia_stroke(&self) -> Option<usvg::tiny_skia_path::Stroke> {
-        Some(usvg::tiny_skia_path::Stroke {
-            width: self.width().get(),
-            miter_limit: self.miterlimit().get(),
-            line_cap: match self.linecap() {
-                usvg::LineCap::Butt => usvg::tiny_skia_path::LineCap::Butt,
-                usvg::LineCap::Round => usvg::tiny_skia_path::LineCap::Round,
-                usvg::LineCap::Square => usvg::tiny_skia_path::LineCap::Square,
-            },
-            line_join: match self.linejoin() {
-                usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => usvg::tiny_skia_path::LineJoin::Miter,
-                usvg::LineJoin::Round => usvg::tiny_skia_path::LineJoin::Round,
-                usvg::LineJoin::Bevel => usvg::tiny_skia_path::LineJoin::Bevel,
-            },
-            dash: None,
-        })
     }
 }
 
@@ -85,15 +61,13 @@ fn main() {
     // sorted by the full icon name: icons.rs looks them up with a binary search
     found.sort();
 
-    let mut out = String::from("pub static ICONS: &[(&str, f32, &[Shape])] = &[\n");
+    let mut out = format!("const ICON_COUNT: usize = {};\npub static ICONS: [(&str, f32, &[Shape]); ICON_COUNT] = [\n", found.len());
     for (name, file) in &found {
-        let tree = match std::fs::read(file).map_err(|e| e.to_string()).and_then(|d| usvg::Tree::from_data(&d, &usvg::Options::default()).map_err(|e| e.to_string())) {
-            Ok(t) => t,
-            Err(e) => {
-                println!("cargo:warning=icon {name} not baked: {e}");
-                continue;
-            }
-        };
+        // a vendored icon that doesn't parse is a broken tree, not something to ship without
+        let tree = std::fs::read(file)
+            .map_err(|e| e.to_string())
+            .and_then(|d| usvg::Tree::from_data(&d, &usvg::Options::default()).map_err(|e| e.to_string()))
+            .unwrap_or_else(|e| panic!("icon {name}: {e}"));
         writeln!(out, "    (\"{name}\", {:?}, &[", tree.size().width()).unwrap();
         flatten(tree.root(), 1.0, &mut out);
         out.push_str("    ]),\n");

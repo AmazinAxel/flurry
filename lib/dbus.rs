@@ -55,6 +55,21 @@ pub struct SignalFilter {
 }
 
 impl SignalFilter {
+    /// org.freedesktop.DBus.Properties.PropertiesChanged, from `sender` when given.
+    pub fn properties_changed(sender: Option<&str>) -> SignalFilter {
+        SignalFilter {
+            sender: sender.map(String::from),
+            interface: Some("org.freedesktop.DBus.Properties".into()),
+            member: Some("PropertiesChanged".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The bus's own NameOwnerChanged.
+    pub fn name_owner_changed() -> SignalFilter {
+        SignalFilter { sender: Some(DBUS.into()), interface: Some(DBUS.into()), member: Some("NameOwnerChanged".into()), ..Default::default() }
+    }
+
     fn rule(&self) -> String {
         let mut r = String::from("type='signal'");
         for (k, v) in [
@@ -129,9 +144,13 @@ fn get(slot: &'static std::thread::LocalKey<RefCell<Option<Rc<Bus>>>>, kind: Bus
     let weak = Rc::downgrade(&bus);
     runtime::before_poll(move || {
         if let Some(b) = weak.upgrade() {
-            b.ch.flush();
-            // libdbus may have buffered messages already read off the socket
-            b.dispatch();
+            // never a blocking flush: a stuck bus keeps the rest queued for the next pass
+            if b.ch.has_messages_to_send() {
+                b.pump();
+            } else {
+                // libdbus may have buffered messages already read off the socket
+                b.dispatch();
+            }
         }
     });
     slot.with(|s| *s.borrow_mut() = Some(bus.clone()));
@@ -141,14 +160,10 @@ fn get(slot: &'static std::thread::LocalKey<RefCell<Option<Rc<Bus>>>>, kind: Bus
 impl Bus {
     fn pump(&self) {
         if self.ch.read_write(Some(Duration::ZERO)).is_err() {
-            // bus gone (logout): stop watching or poll() would spin on the hung-up fd
-            runtime::unwatch(self.ch.watch().fd);
-            // no reply will come
-            let pending: Vec<_> = self.replies.borrow_mut().drain().map(|(_, v)| v).collect();
-            for (cb, t) in pending {
-                t.cancel();
-                cb(Err("disconnected".into()));
-            }
+            // bus gone (dbus restart, logout): its subscriptions, the sleep inhibitor and the
+            // notification name with it. Exit so systemd restarts the shell (the lock marker relocks).
+            eprintln!("flurry: D-Bus connection lost, exiting");
+            std::process::exit(1);
         }
         self.dispatch();
     }
@@ -269,14 +284,7 @@ impl Bus {
             return;
         }
         self.owners.borrow_mut().insert(name.into(), String::new());
-        let f = SignalFilter {
-            sender: Some(DBUS.into()),
-            interface: Some(DBUS.into()),
-            member: Some("NameOwnerChanged".into()),
-            arg0: Some(name.into()),
-            ..Default::default()
-        };
-        self.add_match(f.rule());
+        self.add_match(SignalFilter { arg0: Some(name.into()), ..SignalFilter::name_owner_changed() }.rule());
         let (owners, name) = (self.owners.clone(), name.to_string());
         let msg = method(DBUS, "/org/freedesktop/DBus", DBUS, "GetNameOwner").append1(name.as_str());
         self.call_cb(msg, move |r| {
@@ -308,13 +316,7 @@ impl Bus {
         let want = name.to_string();
         let (a, v) = (appeared.clone(), vanished.clone());
         self.subscribe(
-            SignalFilter {
-                sender: Some(DBUS.into()),
-                interface: Some(DBUS.into()),
-                member: Some("NameOwnerChanged".into()),
-                arg0: Some(name.into()),
-                ..Default::default()
-            },
+            SignalFilter { arg0: Some(name.into()), ..SignalFilter::name_owner_changed() },
             move |m| {
                 if let Ok((n, _old, new)) = m.read3::<&str, &str, &str>()
                     && n == want
@@ -323,7 +325,7 @@ impl Bus {
                 }
             },
         );
-        let msg = method("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner").append1(name);
+        let msg = method(DBUS, "/org/freedesktop/DBus", DBUS, "NameHasOwner").append1(name);
         self.call_cb(msg, move |r| match r.ok().and_then(|m| m.read1::<bool>().ok()) {
             Some(true) => appeared(),
             _ => vanished(),

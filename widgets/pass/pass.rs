@@ -15,7 +15,7 @@ thread_local! {
 }
 
 /// pass's own rule: $PASSWORD_STORE_DIR, else ~/.password-store
-fn store() -> String {
+pub(crate) fn store() -> String {
     std::env::var("PASSWORD_STORE_DIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| format!("{}/.password-store", crate::lib::xdg::home_dir()))
 }
 
@@ -73,31 +73,30 @@ fn copy_pair(name: &str) {
     window::set_visible("pass", false);
     let name = name.to_string();
     runtime::spawn(async move {
-        let mut out = exec(&["pass", "show", "--", &name]).await.unwrap_or_default();
+        let mut out = match exec(&["pass", "show", "--", &name]).await {
+            Ok(o) => o,
+            Err(mut e) => {
+                crate::lib::notifySend::notify_send("Pass", "pass show failed", e.trim(), vec![]);
+                crate::ui::entry::wipe(&mut e);
+                return;
+            }
+        };
         let mut lines = out.split('\n');
         let password = lines.next().unwrap_or("");
-        let login = lines.next().unwrap_or("");
         if !password.is_empty() {
-            let stripped = strip_login(login);
-            let user = if stripped.is_empty() { name.rsplit('/').next().unwrap_or("").to_string() } else { stripped };
+            // only a labelled login line: any other second line may be a secret (an OTP URI, a note)
+            let user = lines.next().and_then(strip_login).filter(|u| !u.is_empty()).unwrap_or_else(|| name.rsplit('/').next().unwrap_or("").to_string());
             copy_login(&user, password);
         }
         crate::ui::entry::wipe(&mut out);
     });
 }
 
-/// `/^\s*(login|username|user|email):\s*/i` removed, trimmed
-pub fn strip_login(line: &str) -> String {
-    let t = line.trim_start();
-    let lower = t.to_lowercase();
-    for key in ["login", "username", "user", "email"] {
-        if let Some(rest) = lower.strip_prefix(key)
-            && rest.starts_with(':')
-        {
-            return t[key.len() + 1..].trim().to_string();
-        }
-    }
-    line.trim().to_string()
+/// The value of a `login:`/`username:`/`user:`/`email:` line (any case), trimmed; None for any other line.
+pub fn strip_login(line: &str) -> Option<String> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    ["login", "username", "user", "email"].iter().any(|k| key.eq_ignore_ascii_case(k)).then(|| value.trim().to_string())
 }
 
 pub fn pass() {
@@ -130,9 +129,10 @@ mod tests {
 
     #[test]
     fn login_prefix() {
-        assert_eq!(strip_login("  Login: me@x "), "me@x");
-        assert_eq!(strip_login("user:bob"), "bob");
-        assert_eq!(strip_login("plain"), "plain");
+        assert_eq!(strip_login("  Login: me@x ").as_deref(), Some("me@x"));
+        assert_eq!(strip_login("user:bob").as_deref(), Some("bob"));
+        assert_eq!(strip_login("plain"), None);
+        assert_eq!(strip_login("otpauth://totp/x?secret=y"), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
-// Bluetooth device menu (widgets/status/bluetooth.tsx).
+// Bluetooth device menu.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 use xkbcommon::xkb::Keysym;
 
@@ -8,19 +8,18 @@ use crate::lib::menuState::{current, focus_menu};
 use crate::lib::bluetooth::{self as bt, Device, bt as bt_state};
 use crate::lib::deviceMenu::{DeviceMenu, FocusMemory, Trailing, aside_row, device_menu, device_row};
 use crate::lib::json;
-use crate::lib::state::State;
 use crate::ui::node::{Node, Style};
-use crate::ui::runtime;
+use crate::ui::runtime::{self, Timer};
+use crate::ui::state::global_state;
 use crate::ui::wayland::KeyEvent;
 use crate::widgets::status::quicksettings::sound::{stop_pending, switch_to_bluetooth_sink};
 
+/// A scan started from the menu stops after this long.
+const SCAN_MS: u64 = 60_000;
+
 thread_local! {
-    static STICKY: State<Vec<String>> = State::new(vec![]);
-    static ORDER: State<Vec<String>> = State::new(load_order());
-    static SCAN_TOKEN: Cell<u32> = const { Cell::new(0) };
+    static SCAN_TIMER: Cell<Option<Timer>> = const { Cell::new(None) };
     static FOCUSED: FocusMemory = const { FocusMemory::new("bt:") };
-    /// powered + per-device connected/connecting, to refocus only when one changes
-    static LAST: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 fn order_path() -> String {
@@ -36,26 +35,20 @@ fn load_order() -> Vec<String> {
 }
 
 fn save_order(addresses: &[String]) {
-    let prev = ORDER.with(|o| o.peek());
+    let prev = order().peek();
     let next: Vec<String> = addresses.iter().cloned().chain(prev.into_iter().filter(|a| !addresses.contains(a))).collect();
     let text = format!("[{}]", next.iter().map(|a| json::quote(a)).collect::<Vec<_>>().join(","));
     let path = order_path();
     if let Some(dir) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // never a half-written file
-    let tmp = format!("{path}.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-    ORDER.with(|o| o.set(next));
+    let _ = crate::lib::xdg::write_atomic(&path, text.as_bytes(), 0o600);
+    order().set(next);
 }
 
-pub fn order() -> State<Vec<String>> {
-    ORDER.with(Clone::clone)
-}
-pub fn sticky() -> State<Vec<String>> {
-    STICKY.with(Clone::clone)
+global_state! {
+    pub fn order() -> Vec<String> = load_order();
+    pub fn sticky() -> Vec<String> = vec![];
 }
 
 fn name_substitute(n: &str) -> String {
@@ -70,9 +63,11 @@ fn has_name(d: &Device) -> bool {
     !d.alias.is_empty() && d.alias.replace('-', ":") != d.address
 }
 
+/// Named devices that are known, connected, found by a scan or just used; and any device
+/// asking to pair, so its request can be answered.
 fn listed(d: &Device) -> bool {
-    let discovering = bt_state().with(|b| b.discovering());
-    has_name(d) && (d.paired || d.trusted || d.connected || discovering || sticky().with(|s| s.contains(&d.address)))
+    let (discovering, asking) = bt_state().with(|b| (b.discovering(), b.pairing.as_ref().is_some_and(|p| p.device == d.path)));
+    asking || has_name(d) && (is_known(d) || d.connected || discovering || sticky().with(|s| s.contains(&d.address)))
 }
 
 /// Known devices in the saved order first, then the rest in discovery order.
@@ -81,7 +76,7 @@ fn visible_devices() -> Vec<Device> {
         return vec![];
     }
     let ord = order().peek();
-    let rank = |d: &Device| if is_known(d) { ord.iter().position(|a| *a == d.address).map(|i| i + 1).unwrap_or(ord.len() + 1) } else { usize::MAX };
+    let rank = |d: &Device| if is_known(d) { ord.iter().position(|a| *a == d.address).unwrap_or(ord.len()) } else { usize::MAX };
     let mut list = bt_state().with(|b| b.devices.clone());
     list.sort_by_key(rank);
     list
@@ -124,13 +119,6 @@ pub fn focus_target() -> Option<String> {
     Some(focus_device().map(|d| row_id(&d)).unwrap_or_else(|| "scan".into()))
 }
 
-pub fn refocus() {
-    focus_menu("bluetooth", focus_target);
-}
-
-fn signature() -> String {
-    bt_state().with(|b| std::iter::once(b.powered().to_string()).chain(b.devices.iter().map(|d| format!("{}{}{}", d.path, d.connected, d.connecting))).collect())
-}
 
 /// A confirmation nobody can answer (menu closed) is rejected.
 fn reject_unseen() {
@@ -142,8 +130,7 @@ fn reject_unseen() {
 pub fn start() {
     current().subscribe(|| {
         if current().peek() == Some("bluetooth") {
-            LAST.with(|l| *l.borrow_mut() = signature());
-            return refocus();
+            return;
         }
         reject_unseen();
         if bt_state().with(|b| b.discovering()) {
@@ -153,21 +140,14 @@ pub fn start() {
             sticky().set(vec![]);
         }
     });
+    bt_state().subscribe(reject_unseen);
     // power and connected/connecting changes move focus back onto the focused device
-    bt_state().subscribe(|| {
-        reject_unseen();
-        if current().peek() != Some("bluetooth") {
-            return;
-        }
-        let sig = signature();
-        if LAST.with(|l| l.replace(sig.clone())) != sig {
-            refocus();
-        }
-    });
+    let links = bt_state().map(|b| (b.powered(), b.devices.iter().map(|d| (d.path.clone(), d.connected, d.connecting)).collect::<Vec<_>>()));
+    links.subscribe(|| focus_menu("bluetooth", focus_target));
 }
 
 fn icon(d: &Device) -> &'static str {
-    crate::ui::icons::find(&format!("{}-symbolic", d.icon)).filter(|_| !d.icon.is_empty()).unwrap_or("bluetooth-symbolic")
+    crate::ui::icons::find(&format!("{}-symbolic", d.icon)).unwrap_or("bluetooth-symbolic")
 }
 
 pub fn menu(base: &Style, focus: Option<&str>) -> Node {
@@ -195,7 +175,6 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
         powered: b.powered(),
         power_icon: "bluetooth-active-symbolic",
         scanning: b.discovering(),
-        empty: rows.is_empty(),
         focus,
         rows,
     })
@@ -240,15 +219,15 @@ pub fn activate(id: &str) -> bool {
                 return true;
             }
             bt::set_discovery(true);
-            let token = SCAN_TOKEN.with(|t| {
-                t.set(t.get() + 1);
-                t.get()
-            });
-            runtime::timeout(60_000, move || {
-                if SCAN_TOKEN.with(Cell::get) == token && bt_state().with(|b| b.discovering()) {
+            let timer = runtime::timeout(SCAN_MS, || {
+                SCAN_TIMER.with(|t| t.set(None));
+                if bt_state().with(|b| b.discovering()) {
                     bt::set_discovery(false);
                 }
             });
+            if let Some(old) = SCAN_TIMER.with(|t| t.replace(Some(timer))) {
+                old.cancel();
+            }
         }
         _ => {
             let Some(d) = device_by_id(id) else { return false };
@@ -265,9 +244,11 @@ pub fn activate(id: &str) -> bool {
                 return true;
             }
             sticky().update(|s| {
-                if !s.contains(&d.address) {
+                let new = !s.contains(&d.address);
+                if new {
                     s.push(d.address.clone());
                 }
+                new
             });
             if bt_state().with(|b| b.discovering()) {
                 bt::set_discovery(false);
@@ -280,11 +261,15 @@ pub fn activate(id: &str) -> bool {
             let path = d.path.clone();
             bt::pair(&path, move |ok| {
                 if !ok {
-                    return sticky().update(|s| s.retain(|a| *a != d.address));
+                    return sticky().update(|s| {
+                        let n = s.len();
+                        s.retain(|a| *a != d.address);
+                        s.len() != n
+                    });
                 }
                 bt::trust(&d.path);
                 save_order(&known_devices().iter().map(|d| d.address.clone()).collect::<Vec<_>>());
-                connect_and_switch(d.clone());
+                connect_and_switch(d);
             });
         }
     }
@@ -298,8 +283,11 @@ pub fn key(id: &str, ev: &KeyEvent) -> bool {
         bt::answer(false);
         return true;
     }
-    if ev.sym == Keysym::BackSpace && is_known(&d) && !bt_state().with(|b| b.discovering()) {
-        bt::remove(&d.adapter, &d.path);
+    if ev.sym == Keysym::BackSpace {
+        if is_known(&d) && !bt_state().with(|b| b.discovering()) {
+            bt::remove(&d.adapter, &d.path);
+        }
+        return true;
     }
     let delta = match ev.lower() {
         Keysym::Up | Keysym::k => -1,
