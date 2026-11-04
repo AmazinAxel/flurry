@@ -939,8 +939,12 @@ fn main() {
         // the claude page: its requests out, Claude Code's events back in
         for (wv, m) in frame.messages.take() {
             if m == "claude:new" {
+                chat.set_full(false);
                 chat.reset();
                 chat.prewarm(); // the next chat starts without a process launch
+            } else if m == "claude:fast" || m == "claude:full" {
+                chat.set_full(m == "claude:full");
+                chat.prewarm();
             } else if m == "claude:stop" {
                 chat.interrupt();
             } else if let Some(parts) = m.strip_prefix("claude:user") {

@@ -1,6 +1,6 @@
 // The `flurry:claude` page: a local chat (claude/index.html) backed by Claude Code in print mode on
 // the user's subscription. The page talks to us through console messages (\u{1}claude:user <parts>,
-// \u{1}claude:stop, \u{1}claude:new, \u{1}open:<url>); we build the stream-json input from those,
+// \u{1}claude:stop, \u{1}claude:new, \u{1}claude:fast / full, \u{1}open:<url>); we build the stream-json input from those,
 // and its output lines go back as data: window.__claude([<line as a JSON string>, ...]).
 // std + libc only: flurry's Cargo.toml also builds it as a test target (CI can't build Servo).
 #![cfg_attr(test, allow(dead_code))]
@@ -113,6 +113,8 @@ pub struct Chat {
     /// found once, looked up again only if it stops working
     bin: Option<PathBuf>,
     stops: u32,
+    /// Opus at medium effort; else (the default) Fast: Sonnet at low effort
+    full: bool,
 }
 
 impl Chat {
@@ -134,14 +136,14 @@ impl Chat {
         if self.bin.is_none() {
             self.bin = find_bin();
         }
-        let proc = Self::spawn_bin(self.bin.as_ref()?, &cwd);
+        let proc = Self::spawn_bin(self.bin.as_ref()?, &cwd, self.full);
         if proc.is_none() {
             self.bin = None; // gone since: looked up again next time
         }
         proc
     }
 
-    fn spawn_bin(bin: &Path, cwd: &Path) -> Option<(Child, ChildStdin, ChildStdout)> {
+    fn spawn_bin(bin: &Path, cwd: &Path, full: bool) -> Option<(Child, ChildStdin, ChildStdout)> {
         let mut cmd = Command::new(bin);
         // dies with the helper, however that goes
         unsafe {
@@ -155,7 +157,7 @@ impl Chat {
             // system prompt, so the first turn costs ~650 tokens, not ~38000;
             // sessions are saved under this cwd, so `claude -c` / `-r` there continues them
             .args(["-p", "--tools", "", "--setting-sources", "", "--strict-mcp-config"])
-            .args(["--model", "opus", "--effort", "medium"])
+            .args(if full { ["--model", "opus", "--effort", "medium"] } else { ["--model", "sonnet", "--effort", "low"] })
             // summarized thinking for the status line (billed as thinking already is: no extra tokens)
             .args(["--settings", r#"{"showThinkingSummaries":true}"#])
             .args(["--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
@@ -228,6 +230,14 @@ impl Chat {
         self.stops += 1;
         let line = format!(r#"{{"type":"control_request","request_id":"stop{}","request":{{"subtype":"interrupt"}}}}"#, self.stops);
         self.write(&line);
+    }
+
+    /// Ctrl+M on an empty chat: a process of the other mode replaces the running one.
+    pub fn set_full(&mut self, full: bool) {
+        if self.full != full {
+            self.full = full;
+            self.reset();
+        }
     }
 
     /// Ctrl+N: the next message starts a fresh process (and conversation).

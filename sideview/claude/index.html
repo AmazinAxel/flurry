@@ -40,6 +40,7 @@
   hr { border: 0; border-top: 1px solid #4c566a; margin: 18px 0; }
   .katex-display { overflow-x: auto; overflow-y: hidden; margin: 12px 0; }
   #input { flex: none; padding: 8px 12px 12px; }
+  #mode { color: #5e81ac; font-size: 0.8em; font-weight: 400; padding: 0 0 4px; }
   /* 7px + the line's half-leading (~3px) matches the 10px sides */
   #field { background: #3b4252; padding: 7px 10px; }
   #files { display: flex; flex-wrap: wrap; gap: 6px; padding: 3px 0 6px; }
@@ -53,5 +54,5 @@
   #mirror { position: absolute; top: 0; left: 0; right: 0; visibility: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 <div id="log"></div>
-<div id="input"><div id="field"><div id="files"></div><div id="scroller"><textarea id="box" rows="1" autofocus></textarea><div id="mirror"></div></div></div></div>
+<div id="input"><div id="mode">Fast</div><div id="field"><div id="files"></div><div id="scroller"><textarea id="box" rows="1" autofocus></textarea><div id="mirror"></div></div></div></div>
 <script src="app.js"></script>

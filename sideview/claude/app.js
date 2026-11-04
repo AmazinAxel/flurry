@@ -142,6 +142,8 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
     var u = add('user');
     files.forEach(function (f) { var i = document.createElement('img'); i.src = f.url; u.appendChild(i); });
     if (t) u.appendChild(document.createTextNode(t));
+    if (t && hist[hist.length - 1] !== t) hist.push(t);
+    hi = hist.length; draft = '';
     box.value = ''; files = []; filesEl.innerHTML = ''; grow();
     reply = null; text = ''; think = ''; thinking = ''; stopped = false; busy = true; bottom();
     // images then text; the helper builds Claude Code's message from these
@@ -149,8 +151,30 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   }
 
   function reset() {
-    console.log('\u0001claude:new');
-    log.innerHTML = ''; texCache.clear(); reply = null; text = ''; think = ''; thinking = ''; busy = false; files = []; filesEl.innerHTML = ''; box.value = ''; grow();
+    console.log('\u0001claude:new'); // back to Fast
+    log.innerHTML = ''; texCache.clear(); reply = null; text = ''; think = ''; thinking = ''; busy = false;
+    fast = true; modeEl.style.display = '';
+  }
+
+  // Fast (Sonnet, low effort) or Opus: switched with Ctrl+M before the first question only
+  var fast = true, modeEl = document.getElementById('mode');
+  function toggleMode() {
+    if (log.firstChild || busy) return;
+    fast = !fast; modeEl.style.display = fast ? '' : 'none';
+    console.log('\u0001claude:' + (fast ? 'fast' : 'full'));
+  }
+
+  // sent messages, recalled with Up/Down while the caret is at the input's start or end
+  var hist = [], hi = 0, draft = '';
+  function recall(d) {
+    var i = hi + d;
+    if (i < 0 || i > hist.length) return false;
+    if (hi === hist.length) draft = box.value;
+    hi = i;
+    box.value = i === hist.length ? draft : hist[i];
+    box.selectionStart = box.selectionEnd = box.value.length;
+    grow(); reveal();
+    return true;
   }
 
   // last line of the thinking summary: "what Claude is doing now"
@@ -227,9 +251,12 @@ window.onerror = function (msg, src, line) { console.log("\u0001error: " + msg +
   if (document.fonts) document.fonts.ready.then(function () { var v = box.value; box.value = v + ' '; box.value = v; grow(); });
   box.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    else if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.shiftKey && !e.ctrlKey && !e.altKey && box.selectionStart === box.selectionEnd &&
+      (box.selectionEnd === 0 || box.selectionEnd === box.value.length) && recall(e.key === 'ArrowUp' ? -1 : 1)) e.preventDefault();
   });
   document.addEventListener('keydown', function (e) {
     if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) { e.preventDefault(); reset(); }
+    else if (e.ctrlKey && (e.key === 'm' || e.key === 'M')) { e.preventDefault(); toggleMode(); }
     // Esc drops the last attached image
     else if (e.key === 'Escape' && files.length) { e.preventDefault(); files.pop(); filesEl.removeChild(filesEl.lastChild); }
     // Ctrl+C stops the reply mid-stream (unless copying a selection); the conversation and partial answer stay
