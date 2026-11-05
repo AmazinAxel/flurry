@@ -525,7 +525,6 @@ pub fn clipboard() {
             hit
         })),
         entries: vec![EntryBinding { id: "entry", entry: e, on_activate: None, on_key: None }],
-        ..Default::default()
     });
     w.watch(&streaming_mode());
     // hidden: rows and thumbnails go, rebuilt on the next show

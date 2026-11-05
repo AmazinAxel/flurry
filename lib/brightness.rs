@@ -76,7 +76,8 @@ pub fn step(up: bool) {
     }
     fn show() {
         PENDING.set(None);
-        let v = actual() as f64 / max().max(1) as f64;
+        // the requested level: amdgpu's floor (actual) sits a few % above a request of 0
+        let v = read(&path()) as f64 / max().max(1) as f64;
         if brightness().peek() == v {
             brightness().notify();
         } else {
@@ -107,25 +108,25 @@ pub fn step(up: bool) {
 }
 
 /// The backlight core sysfs_notify()s actual_brightness on every change (keys, logind, other tools),
-/// so this wakes only for brightness changes, not for every kernel uevent.
+/// so this wakes only for brightness changes, not for every kernel uevent; shown is the requested
+/// level, as the keys and the slider set it.
 pub fn monitor() {
     let Ok(file) = std::fs::File::open(format!("{DIR}/{}/actual_brightness", screen())) else { return };
     // reading re-arms the notification; None once it fails (device gone)
     let fd = file.as_raw_fd();
     let rearm = move || {
         let mut b = [0u8; 16];
-        let n = file.read_at(&mut b, 0).ok()?;
-        Some(std::str::from_utf8(&b[..n]).ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0))
+        file.read_at(&mut b, 0).ok()
     };
     if rearm().is_none() {
         return;
     }
     runtime::watch_pri(fd, move || {
-        let Some(level) = rearm() else {
+        if rearm().is_none() {
             // an unread sysfs notification would wake poll() forever
             runtime::unwatch(fd);
             return;
-        };
-        brightness().set(level as f64 / max().max(1) as f64);
+        }
+        brightness().set(read(&path()) as f64 / max().max(1) as f64);
     });
 }

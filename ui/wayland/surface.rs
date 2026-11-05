@@ -39,6 +39,62 @@ pub(super) fn subsurface(c: &Ctx, parent: &wl_surface::WlSurface) -> (wl_surface
     (wl, sub)
 }
 
+/// A solid rectangle over its surface: a single-pixel buffer the viewport stretches, so moving or
+/// resizing it paints nothing (the screenshot selection).
+struct Solid {
+    wl: wl_surface::WlSurface,
+    sub: wl_subsurface::WlSubsurface,
+    viewport: wp_viewport::WpViewport,
+    buffer: wl_buffer::WlBuffer,
+    /// x, y, w, h shown (None: hidden)
+    at: Cell<Option<(i32, i32, i32, i32)>>,
+}
+
+impl Solid {
+    fn new(c: &Ctx, parent: &wl_surface::WlSurface, [r, g, b, a]: [f32; 4]) -> Solid {
+        let (wl, sub) = subsurface(c, parent);
+        // synced: every rect moves in the parent's commit, all in one frame
+        sub.set_sync();
+        let premul = |v: f32| (v * a * u32::MAX as f32) as u32;
+        let buffer = c.single_pixel.create_u32_rgba_buffer(premul(r), premul(g), premul(b), (a * u32::MAX as f32) as u32, &c.qh, ());
+        Solid { viewport: c.viewporter.get_viewport(&wl, &c.qh, ()), wl, sub, buffer, at: Cell::new(None) }
+    }
+
+    /// True when the parent needs a commit.
+    fn show(&self, r: Option<(i32, i32, i32, i32)>) -> bool {
+        let r = r.filter(|r| r.2 > 0 && r.3 > 0);
+        let old = self.at.replace(r);
+        if old == r {
+            return false;
+        }
+        match r {
+            None => self.wl.attach(None, 0, 0),
+            Some((x, y, w, h)) => {
+                if old.is_none_or(|o| (o.0, o.1) != (x, y)) {
+                    self.sub.set_position(x, y);
+                }
+                if old.is_some_and(|o| (o.2, o.3) == (w, h)) {
+                    return true; // moved only: parent state
+                }
+                self.viewport.set_destination(w, h);
+                if old.is_none() {
+                    self.wl.attach(Some(&self.buffer), 0, 0);
+                    self.wl.damage_buffer(0, 0, 1, 1);
+                }
+            }
+        }
+        self.wl.commit();
+        true
+    }
+
+    fn destroy(&self) {
+        self.viewport.destroy();
+        self.sub.destroy();
+        self.wl.destroy();
+        self.buffer.destroy();
+    }
+}
+
 fn no_input(c: &Ctx, wl: &wl_surface::WlSurface) {
     let region = c.compositor.create_region(&c.qh, ());
     wl.set_input_region(Some(&region));
@@ -108,6 +164,7 @@ pub struct Inner {
     requested: Cell<Option<(u32, u32)>>,
     /// gets every motion (crosshair cursor), not only scrolls
     pub(super) track_pointer: Cell<bool>,
+    solids: RefCell<Vec<Solid>>,
 }
 
 /// Buffer pixel rect: x, y, w, h.
@@ -307,6 +364,28 @@ impl Surface {
     pub fn track_pointer(&self) {
         self.0.track_pointer.set(true);
     }
+    /// Solid rects (color, logical x/y/w/h or None: hidden) over the surface, stacked in order; a
+    /// slot keeps the color it was first given. Applied in one commit, nothing repainted.
+    pub fn set_rects(&self, rects: &[([f32; 4], Option<(i32, i32, i32, i32)>)]) {
+        let s = &self.0;
+        if !s.alive() {
+            return;
+        }
+        let mut solids = s.solids.borrow_mut();
+        ctx(|c| {
+            for (color, _) in &rects[solids.len().min(rects.len())..] {
+                solids.push(Solid::new(c, &s.wl, *color));
+            }
+        });
+        let mut changed = false;
+        for (sol, (_, r)) in solids.iter().zip(rects) {
+            changed |= sol.show(*r);
+        }
+        // before the first configure the image's commit carries them
+        if changed && s.configured.get() {
+            s.wl.commit();
+        }
+    }
     /// Size in surface (logical) pixels, as last configured.
     pub fn size(&self) -> (u32, u32) {
         self.0.size.get()
@@ -445,6 +524,7 @@ impl Inner {
             prebuilt: RefCell::default(),
             requested: Cell::new(None),
             track_pointer: Cell::new(false),
+            solids: RefCell::default(),
         }
     }
 
@@ -497,6 +577,9 @@ impl Inner {
         }
         if let Some(g) = &self.gradient {
             g.destroy();
+        }
+        for s in self.solids.take() {
+            s.destroy();
         }
         if let Some(b) = self.dim_buffer.borrow_mut().take() {
             b.destroy();
