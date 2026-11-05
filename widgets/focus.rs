@@ -134,7 +134,7 @@ pub fn focus_task() -> Rc<Win> {
         // the bar overlays the card's bottom edge, so the card keeps its size
         Node::vbox(base.inherit(), 0.0, vec![Node::overlay(l, vec![
             Node::label(text, focus_text().peek()),
-            levelbar(&base, progress, blue3(), rgba(255, 255, 255, 0.12), 6.0).align(Align::Fill, Align::End).show(start.is_some()),
+            levelbar(&base, progress, blue3(), rgba(0, 0, 0, 0.0), 6.0).align(Align::Fill, Align::End).show(start.is_some()),
         ])])
     });
     let fw = Rc::downgrade(&w);
@@ -156,7 +156,7 @@ pub fn focus_task() -> Rc<Win> {
 }
 
 fn tick_bar(w: std::rc::Weak<Win>) {
-    let Some(win) = w.upgrade().filter(|_| active() && break_start().peek().is_some()) else {
+    let Some(win) = w.upgrade().filter(|_| break_start().peek().is_some()) else {
         return TICKING.with(|t| t.set(false));
     };
     win.redraw();

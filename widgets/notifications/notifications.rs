@@ -36,9 +36,9 @@ fn filtered(n: &Notification) -> bool {
     crate::settings::NOTIFICATION_FILTERS.iter().any(|f| n.body.starts_with(f))
 }
 
-/// Hidden while streaming or focusing; flurry's own notifications still show.
+/// Hidden while streaming or focusing; flurry's own and critical ones still show.
 fn hidden(n: &Notification) -> bool {
-    !n.local && (streaming_mode().peek() || focus())
+    !n.local && !n.critical && (streaming_mode().peek() || focus())
 }
 
 /// One arriving while hidden (streaming, focusing) is kept by notifd and shows once that ends.

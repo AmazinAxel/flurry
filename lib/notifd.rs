@@ -30,6 +30,8 @@ pub struct Notification {
     pub actions: Vec<(String, String)>,
     pub resident: bool,
     pub desktop_entry: String,
+    /// urgency hint 2
+    pub critical: bool,
     /// sent by flurry itself (send_local)
     pub local: bool,
     /// unique bus name of the D-Bus client that sent it ("" when local): only it may close it
@@ -155,9 +157,10 @@ fn sanitize_entry(s: &str) -> String {
 struct Hints {
     resident: bool,
     desktop_entry: String,
+    critical: bool,
 }
 
-/// Reads only `resident` and `desktop-entry` from an a{sv} hints argument; None if it isn't one.
+/// Reads only `resident`, `desktop-entry` and `urgency` from an a{sv} hints argument; None if it isn't one.
 fn read_hints(it: &mut Iter) -> Option<Hints> {
     if &*it.signature() != "a{sv}" {
         return None;
@@ -167,12 +170,13 @@ fn read_hints(it: &mut Iter) -> Option<Hints> {
     while a.arg_type() == ArgType::DictEntry {
         let mut e = a.recurse(ArgType::DictEntry)?;
         let k: &str = e.read().ok()?;
-        if k == "resident" || k == "desktop-entry" {
+        if k == "resident" || k == "desktop-entry" || k == "urgency" {
             let mut v = e.recurse(ArgType::Variant)?;
             match (k, v.arg_type()) {
                 ("desktop-entry", ArgType::String) => h.desktop_entry = sanitize_entry(v.get::<&str>()?),
                 ("resident", ArgType::Boolean) => h.resident = v.get::<bool>()?,
                 ("resident", _) => h.resident = v.get_refarg().and_then(|r| r.as_i64()).is_some_and(|v| v != 0),
+                ("urgency", _) => h.critical = v.get_refarg().and_then(|r| r.as_i64()) == Some(2),
                 _ => {}
             }
         }
@@ -243,6 +247,7 @@ fn add(app_name: &str, replaces_id: u32, summary: &str, body: &str, actions: Vec
         actions,
         resident: hints.resident,
         desktop_entry: hints.desktop_entry,
+        critical: hints.critical,
         local: sender.is_empty(),
         sender: sender.into(),
     };
