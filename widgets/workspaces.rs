@@ -13,7 +13,7 @@ use crate::ui::wayland::Anchor;
 use crate::ui::window::{Spec, Win};
 
 global_state! {
-    fn focused() -> i64 = 0;
+    pub fn focused() -> i64 = 0;
     fn occupied() -> BTreeSet<i64> = BTreeSet::new();
     fn scratchpad() -> usize = 0;
 }

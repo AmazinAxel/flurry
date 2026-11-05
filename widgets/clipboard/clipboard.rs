@@ -515,8 +515,15 @@ pub fn clipboard() {
             ctrl(Keysym::g, || with_file(None, |f, _| launch(&with_prefix(crate::settings::IMAGE_VIEWER, f)))),
             ctrl(Keysym::m, || with_file(Some(is_video), |f, id| open_compress(&f, id))),
             ctrl(Keysym::n, || with_file(None, |f, _| show_in_file_manager(&f))),
-            ctrl(Keysym::w, wipe),
         ],
+        // Shift too: plain Ctrl+W sits next to Ctrl+E (edit), a roll onto it wiped the history
+        on_key: Some(Rc::new(|ev| {
+            let hit = ev.ctrl && ev.shift && ev.lower() == Keysym::w;
+            if hit {
+                wipe();
+            }
+            hit
+        })),
         entries: vec![EntryBinding { id: "entry", entry: e, on_activate: None, on_key: None }],
         ..Default::default()
     });

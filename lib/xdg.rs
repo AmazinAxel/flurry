@@ -27,10 +27,6 @@ pub fn data_home() -> String {
 pub fn runtime_dir() -> Option<String> {
     std::env::var("XDG_RUNTIME_DIR").ok().filter(|v| v.starts_with('/'))
 }
-/// The request socket; also compiled into the client (std only here).
-pub fn socket_path() -> Option<String> {
-    runtime_dir().map(|d| format!("{d}/flurry.sock"))
-}
 
 /// tmp + fsync + rename: a crash never leaves a torn or empty file under the real name.
 pub fn write_atomic(path: &str, data: &[u8], mode: u32) -> std::io::Result<()> {

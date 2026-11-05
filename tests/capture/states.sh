@@ -1,6 +1,7 @@
 # Sourced by run.sh: drives flurry through every window/state and grabs a screenshot of each.
-req() { "$flurry" "$@"; sleep 0.3; }
-toggle() { "$flurry" toggle "$1"; sleep 0.3; }
+# requests are keybinds now: bind F24 to the request, then press it
+req() { swaymsg "bindsym --no-warn F24 nop flurry $*" >/dev/null; wtype -k F24; sleep 0.3; }
+toggle() { req toggle "$1"; }
 key() { wtype -s 150 "$@"; sleep 0.2; }
 shot() { sleep "${2:-0.4}"; date '+%F %H:%M' > "$out/$1.time"; grim -o HEADLESS-1 "$out/$1.png"; echo "  $1"; }
 

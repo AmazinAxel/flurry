@@ -51,13 +51,13 @@ fn map(w: u32, h: u32) -> Option<(OwnedFd, *mut u8, usize)> {
 }
 
 /// A wl_buffer over all of `fd` (sized by `map`).
-fn pool_buffer<U: Send + Sync + 'static>(fd: &OwnedFd, w: u32, h: u32, data: U) -> wl_buffer::WlBuffer
+fn pool_buffer<U: Send + Sync + 'static>(fd: &OwnedFd, w: u32, h: u32, format: wl_shm::Format, data: U) -> wl_buffer::WlBuffer
 where
     Wl: Dispatch<wl_buffer::WlBuffer, U>,
 {
     ctx(|c| {
         let pool = c.shm.create_pool(fd.as_fd(), (w * h * 4) as i32, &c.qh, ());
-        let b = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Abgr8888, &c.qh, data);
+        let b = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, format, &c.qh, data);
         pool.destroy();
         b
     })
@@ -67,7 +67,7 @@ where
 pub(super) fn new_buffer(w: u32, h: u32) -> Option<Buffer> {
     let (fd, ptr, len) = map(w, h)?;
     let busy = Arc::new(AtomicBool::new(false));
-    let wl = pool_buffer(&fd, w, h, busy.clone());
+    let wl = pool_buffer(&fd, w, h, wl_shm::Format::Abgr8888, busy.clone());
     Some(Buffer { wl, ptr, len, size: (w, h), busy, frame: Cell::new(0) })
 }
 
@@ -121,8 +121,19 @@ impl ShmImage {
         let fd = p.fd.take().expect("fresh pixels"); // the mapping now belongs to the ShmImage
         let (w, h) = (p.width, p.height);
         // Release ignored: the contents never change, so it's attachable again any time
-        let buffer = pool_buffer(&fd, w, h, ());
+        let buffer = pool_buffer(&fd, w, h, wl_shm::Format::Abgr8888, ());
         Rc::new(ShmImage { buffer, width: w, height: h, id: IMAGE_IDS.fetch_add(1, Relaxed), ptr: p.ptr as *mut u8, len: p.len })
+    }
+
+    /// An unfilled image in `format` (a 32-bit one), for the compositor to copy into (screencopy).
+    pub(super) fn blank(w: u32, h: u32, format: wl_shm::Format) -> Option<ShmImage> {
+        let (fd, ptr, len) = map(w, h)?;
+        let buffer = pool_buffer(&fd, w, h, format, ());
+        Some(ShmImage { buffer, width: w, height: h, id: IMAGE_IDS.fetch_add(1, Relaxed), ptr, len })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     pub fn pixmap(&self) -> tiny_skia::PixmapRef<'_> {

@@ -106,6 +106,8 @@ pub struct Inner {
     prebuilt: RefCell<Option<Node>>,
     /// the layer size last asked for (0: stretched/fixed axis); asked again only when it changes
     requested: Cell<Option<(u32, u32)>>,
+    /// gets every motion (crosshair cursor), not only scrolls
+    pub(super) track_pointer: Cell<bool>,
 }
 
 /// Buffer pixel rect: x, y, w, h.
@@ -301,6 +303,14 @@ impl Surface {
     pub fn on_pointer(&self, f: impl Fn(PointerEvent) + 'static) {
         *self.0.on_pointer.borrow_mut() = Some(Rc::new(f));
     }
+    /// Motion events too, under a crosshair cursor (region selection).
+    pub fn track_pointer(&self) {
+        self.0.track_pointer.set(true);
+    }
+    /// Size in surface (logical) pixels, as last configured.
+    pub fn size(&self) -> (u32, u32) {
+        self.0.size.get()
+    }
     /// Re-renders on every frame callback while `f` returns true (animations at display rate).
     pub fn animate(&self, f: Rc<dyn Fn() -> bool>) {
         *self.0.animation.borrow_mut() = Some(f);
@@ -434,6 +444,7 @@ impl Inner {
             output: None,
             prebuilt: RefCell::default(),
             requested: Cell::new(None),
+            track_pointer: Cell::new(false),
         }
     }
 

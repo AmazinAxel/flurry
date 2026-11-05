@@ -72,18 +72,28 @@ pub fn copy_sensitive(text: &str) {
     }
 }
 
+pub fn copy_png(png: Vec<u8>) {
+    set(offer(&["image/png"], &png));
+    record("image/png", png);
+}
+
 /// Copies a history entry back as what it was copied as.
 pub fn copy_entry(id: u64, mime: &str) {
     let (path, mime) = (entry_file(id, mime), mime.to_string());
     spawn(async move {
         let Some(data) = blocking(move || std::fs::read(path).ok()).await.flatten() else { return };
-        let mut mimes = if mime.starts_with("image/") { vec![mime.as_str()] } else { TEXT.to_vec() };
-        if mime == "text/uri-list" {
-            mimes.insert(0, mime.as_str()); // paste the ACTUAL file
-        }
-        set(offer(&mimes, &data));
+        set(stored_offer(&mime, &data));
         promote(id);
     });
+}
+
+/// What an entry stored as `mime` is offered as.
+fn stored_offer(mime: &str, data: &[u8]) -> Vec<(String, Arc<Secret>)> {
+    let mut mimes = if mime.starts_with("image/") { vec![mime] } else { TEXT.to_vec() };
+    if mime == "text/uri-list" {
+        mimes.insert(0, mime); // paste the ACTUAL file
+    }
+    offer(&mimes, data)
 }
 
 /// Moves the entry to the top under its own id (older entries' ids aren't the content hash).
@@ -115,6 +125,9 @@ pub struct Entry {
 }
 
 thread_local! {
+    /// the current selection from another app, as read for the history: re-offered when that app
+    /// exits (what wl-clip-persist did), only in the one recorded format
+    static LAST: Cell<Option<Vec<(String, Arc<Secret>)>>> = const { Cell::new(None) };
     /// newest first, read on first use. By design there is no expiry and no per-source exclusion:
     /// entries go only past CAP/BUDGET or on wipe, and only SECRET_HINT selections are skipped.
     static HISTORY: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };
@@ -295,6 +308,7 @@ fn record(mime: &str, data: Vec<u8>) {
 }
 
 pub fn wipe() {
+    LAST.set(None);
     WIPES.with(|w| w.set(w.get() + 1));
     PENDING.with(|p| p.borrow_mut().take());
     with_history(Vec::clear);
@@ -338,6 +352,14 @@ pub fn watch(on_change: impl Fn() + 'static) {
     ON_CHANGE.with(|c| *c.borrow_mut() = Some(Rc::new(on_change)));
     cleanup();
     wayland::on_selection(|mimes| {
+        // the app that copied it exited (or cleared it): flurry serves its last copy instead
+        let Some(mimes) = mimes else {
+            if let Some(o) = LAST.take() {
+                set(o);
+            }
+            return;
+        };
+        LAST.set(None);
         let has = |m: &str| mimes.iter().any(|x| x == m);
         // secrets aren't kept; flurry's own copies were recorded already
         if has(SECRET_HINT) || has(wayland::OWN_MIME) {
@@ -348,6 +370,7 @@ pub fn watch(on_change: impl Fn() + 'static) {
         let stored = if TEXT.contains(&mime) { "text/plain" } else { mime };
         wayland::read_selection(mime, MAX_BYTES, 5000, move |data| {
             if let Some(d) = data {
+                LAST.set(Some(stored_offer(stored, &d)));
                 record(stored, d);
             }
         });

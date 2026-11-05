@@ -2,14 +2,14 @@
 # Captures golden screenshots of flurry inside an isolated headless sway.
 # Isolation: fake HOME, own runtime dir, own session bus, mocked system bus (iwd/bluez/upower/logind),
 # fake backlight, no pipewire, no PAM configs, fake gpu-screen-recorder. Never touches the live session.
-# usage: tests/capture/run.sh [flurry-binary] [out-dir]
-# flurry-binary: the `flurry` client (result/bin/flurry, target/release/flurry); it starts the sibling flurry-shell
+# usage: tests/capture/run.sh [flurry-shell] [out-dir]
+# flurry-shell: the shell binary (result/bin/flurry-shell, target/release/flurry-shell)
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 
 if [[ ${1:-} != __inner ]]; then
-  flurry=$(realpath "$(command -v "${1:-flurry}")")
+  flurry=$(realpath "$(command -v "${1:-flurry-shell}")")
   out=$(realpath -m "${2:-$here/../golden}")
   mkdir -p "$out"
   tools='with import <nixpkgs> {}; buildEnv { name = "flurry-capture"; paths = [

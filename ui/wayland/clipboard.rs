@@ -172,7 +172,7 @@ struct DataControl {
 
 thread_local! {
     static DC: RefCell<DataControl> = RefCell::default();
-    static SELECTION_LISTENER: RefCell<Option<Rc<dyn Fn(Vec<String>)>>> = RefCell::default();
+    static SELECTION_LISTENER: RefCell<Option<Rc<dyn Fn(Option<Vec<String>>)>>> = RefCell::default();
     /// the one `read_selection` in flight: a newer selection's read replaces it
     static SELECTION_READ: RefCell<Option<Reading>> = const { RefCell::new(None) };
     /// `serve`s waiting on a full pipe
@@ -189,8 +189,8 @@ pub(super) fn bind(globals: &wayland_client::globals::GlobalList, qh: &QueueHand
 }
 
 /// Calls `f` with the mime types of every new selection (flurry's own too: they list `OWN_MIME`),
-/// after dispatch.
-pub fn on_selection(f: impl Fn(Vec<String>) + 'static) {
+/// or None once the clipboard is empty (its owner exited or cleared it), after dispatch.
+pub fn on_selection(f: impl Fn(Option<Vec<String>>) + 'static) {
     SELECTION_LISTENER.with(|l| *l.borrow_mut() = Some(Rc::new(f)));
 }
 
@@ -326,15 +326,13 @@ impl Dispatch<dc_device::ZwlrDataControlDeviceV1, ()> for Wl {
                     d.selection = id.map(|o| (o, mimes.clone()));
                     d.selection.is_some().then_some(mimes)
                 });
-                if let Some(m) = mimes {
-                    runtime::idle(move || {
-                        // a read of the one before is stale now
-                        cancel_selection_read();
-                        if let Some(f) = SELECTION_LISTENER.with(|l| l.borrow().clone()) {
-                            f(m);
-                        }
-                    });
-                }
+                runtime::idle(move || {
+                    // a read of the one before is stale now
+                    cancel_selection_read();
+                    if let Some(f) = SELECTION_LISTENER.with(|l| l.borrow().clone()) {
+                        f(mimes);
+                    }
+                });
             }
             dc_device::Event::Finished => DC.with(|d| {
                 let mut d = d.borrow_mut();

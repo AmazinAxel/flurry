@@ -7,6 +7,7 @@ pub mod osd;
 pub mod pass;
 pub mod powermenu;
 pub mod record;
+pub mod screenshot;
 pub mod sideview;
 pub mod status;
 pub mod workspaces;

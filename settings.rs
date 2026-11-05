@@ -16,6 +16,11 @@ pub const SYNC_COMMAND: &[&str] = &[];
 /// argv prefixes; the path is appended.
 pub const FILE_MANAGER: &[&str] = &["xdg-open"];
 pub const IMAGE_VIEWER: &[&str] = &["xdg-open"];
+/// `nop flurry terminal`: TERMINAL, or TERMINAL_FLOATING (if set) when the focused workspace has a
+/// window whose app_id starts with none of TERMINAL_TILED_WITH.
+pub const TERMINAL: &[&str] = &["xdg-terminal-exec"];
+pub const TERMINAL_FLOATING: &[&str] = &[];
+pub const TERMINAL_TILED_WITH: &[&str] = &[];
 /// Launcher app names (case-insensitive substrings) that start only after a focus break and run
 /// for at most 5 minutes.
 pub const FOCUS_BLOCKED: &[&str] = &["discord"];
@@ -25,6 +30,8 @@ pub const WALLPAPER_DIR: &str = "Wallpapers";
 pub const PASS_SYNC_COMMAND: &[&str] = &["pass-sync"];
 /// wl-gammarelay temperatures (dark scheme, light scheme) in kelvin; None leaves it alone.
 pub const NIGHT_LIGHT: Option<(u32, u32)> = Some((3500, 6500));
+/// `nop flurry theme`: (dark GTK theme, light GTK theme, themes dir, units signalled); None: off.
+pub const THEME: Option<(&str, &str, &str, &[&str])> = None;
 /// Notifications whose body starts with one of these are dropped.
 pub const NOTIFICATION_FILTERS: &[&str] = &[];
 /// Font fallback chains sorted by fontconfig at build time: (family, fontconfig weight, file, face

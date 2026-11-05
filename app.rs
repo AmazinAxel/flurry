@@ -8,16 +8,15 @@ mod widgets;
 
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixDatagram;
 
 use lib::{menuState, mediaPlayer, streamingMode::streaming_mode, xdg};
 use ui::{runtime, window};
 use widgets::{clipboard, focus, lockscreen::lockscreen, notifications::notifications as notifs, record::service, sideview, status};
 
-/// Requests from sway keybinds (`flurry <cmd> [arg]`).
+/// Requests from sway keybinds (`nop flurry <cmd> [arg]`).
 fn request(cmd: &str, arg: Option<&str>) {
     // locked: nothing may open behind (or over) the lock screen
-    if (lockscreen::locked().peek() || ui::wayland::is_locking()) && !matches!(cmd, "lock" | "media") {
+    if (lockscreen::locked().peek() || ui::wayland::is_locking()) && !matches!(cmd, "lock" | "media" | "mpris" | "brightness" | "volume" | "dim") {
         return;
     }
     match cmd {
@@ -51,6 +50,33 @@ fn request(cmd: &str, arg: Option<&str>) {
             "prevPlaylist" => mediaPlayer::chng_playlist(false),
             _ => {}
         },
+        "brightness" => lib::brightness::step(arg == Some("up")),
+        "volume" => {
+            let delta = match arg {
+                Some("up") => Some(0.05),
+                Some("down") => Some(-0.05),
+                Some("mute") => None,
+                _ => return,
+            };
+            if !lib::audio::step_volume(delta) {
+                widgets::osd::osd::show_volume();
+            }
+        }
+        "dim" => lib::colorScheme::toggle_dim(),
+        "theme" => lib::colorScheme::toggle_theme(),
+        "screenshot" => widgets::screenshot::screenshot(),
+        "terminal" => lib::sway::open_terminal(),
+        // + | - | move+ | move-
+        "workspace" => {
+            let a = arg.unwrap_or("");
+            lib::sway::step_workspace(widgets::workspaces::focused().peek(), a.ends_with('+'), a.starts_with("move"));
+        }
+        "mpris" => match arg {
+            Some("toggle") => status::modules::mpris::control("PlayPause"),
+            Some("next") => status::modules::mpris::control("Next"),
+            Some("prev") => status::modules::mpris::control("Previous"),
+            _ => {}
+        },
         "toggleStatus" => menuState::toggle_menu("status"),
         "toggleCalendar" => menuState::toggle_menu("calendar"),
         "toggleBluetooth" => menuState::toggle_menu("bluetooth"),
@@ -63,50 +89,36 @@ fn request(cmd: &str, arg: Option<&str>) {
     }
 }
 
-/// Binds the request socket; exits if another shell is already serving it.
-fn bind_socket() -> Option<UnixDatagram> {
+/// Exits if another shell already holds the lock (held for life).
+fn single_instance() {
     let Some(dir) = xdg::runtime_dir() else {
-        eprintln!("flurry: no XDG_RUNTIME_DIR: no request socket, no single-instance guard");
-        return None;
+        eprintln!("flurry: no XDG_RUNTIME_DIR: no single-instance guard");
+        return;
     };
-    // the lock, held for life, makes the stale-socket unlink and the bind one step
     let lock = std::fs::OpenOptions::new().write(true).create(true).mode(0o600).open(format!("{dir}/flurry.lock"));
     match lock {
         Ok(f) if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 => std::mem::forget(f),
         Ok(_) => std::process::exit(0),
         Err(e) => eprintln!("flurry: lock file: {e}"),
     }
-    let path = xdg::socket_path()?;
-    let _ = std::fs::remove_file(&path);
-    let sock = match UnixDatagram::bind(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("flurry: cannot bind {path}: {e}");
-            return None;
-        }
-    };
-    let _ = sock.set_nonblocking(true);
-    Some(sock)
 }
 
-fn serve(sock: UnixDatagram) {
-    let fd = sock.as_raw_fd();
-    runtime::watch(fd, move || {
-        let mut buf = [0u8; 512];
-        while let Ok(n) = sock.recv(&mut buf) {
-            let line = String::from_utf8_lossy(&buf[..n]);
-            let (cmd, arg) = parse_request(&line);
-            request(cmd, arg);
+/// Sway keybinds `nop flurry <cmd> [arg]` arrive as binding events: no process per keypress.
+fn serve_bindings() {
+    lib::sway::subscribe(&["binding"], |e| {
+        if let Some(line) = e.get("binding").get("command").str().and_then(parse_request) {
+            request(line.0, line.1);
         }
     });
 }
 
-/// `sideview plan` style: the command, then everything after it as one argument.
-fn parse_request(line: &str) -> (&str, Option<&str>) {
-    match line.trim().split_once(' ') {
+/// `nop flurry sideview plan b`: the command, then everything after it as one argument.
+fn parse_request(line: &str) -> Option<(&str, Option<&str>)> {
+    let rest = line.trim().strip_prefix("nop")?.trim_start().strip_prefix("flurry ")?.trim();
+    Some(match rest.split_once(' ') {
         Some((cmd, arg)) => (cmd, Some(arg.trim())),
-        None => (line.trim(), None),
-    }
+        None => (rest, None),
+    })
 }
 
 thread_local! {
@@ -191,7 +203,7 @@ fn main() {
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20); // blur buffers are ~3MB per card header
     }
-    let sock = bind_socket();
+    single_instance();
     if !ui::wayland::connect() {
         eprintln!("flurry: cannot connect to the Wayland display");
         std::process::exit(1);
@@ -217,9 +229,7 @@ fn main() {
     widgets::pass::pass::pass();
     widgets::pass::passSave::pass_save();
     window::set_visible("focusMenu", true);
-    if let Some(s) = sock {
-        serve(s);
-    }
+    serve_bindings();
 
     // services once the first frame has gone out: it never waits on them
     let start = || {
@@ -237,6 +247,7 @@ fn main() {
         status::bluetooth::start();
         status::network::start();
         status::modules::mpris::start();
+        lib::sway::watch_terminal();
         mediaPlayer::watch();
         lib::brightness::monitor();
         service::start();
@@ -264,7 +275,9 @@ mod tests {
 
     #[test]
     fn request_splits_at_first_space() {
-        assert_eq!(parse_request("launcher\n"), ("launcher", None));
-        assert_eq!(parse_request(" sideview  plan b \n"), ("sideview", Some("plan b")));
+        assert_eq!(parse_request("nop flurry launcher"), Some(("launcher", None)));
+        assert_eq!(parse_request("nop  flurry sideview  plan b "), Some(("sideview", Some("plan b"))));
+        assert_eq!(parse_request("nop other launcher"), None);
+        assert_eq!(parse_request("exec flurry launcher"), None);
     }
 }

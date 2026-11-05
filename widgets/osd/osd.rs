@@ -11,6 +11,16 @@ use crate::ui::window::{Spec, Win};
 
 thread_local! {
     static OSD: RefCell<(&'static str, f64)> = const { RefCell::new(("", 0.0)) };
+    static SHOW: RefCell<Option<Rc<dyn Fn(&'static str, f64)>>> = RefCell::new(None);
+}
+
+/// Volume keys: shows the default speaker even when the press changed nothing (at 0% or 100%).
+pub fn show_volume() {
+    if let Some(s) = audio::default_speaker().filter(audio::Sink::known)
+        && let Some(show) = SHOW.with(|f| f.borrow().clone())
+    {
+        show(s.volume_icon(), s.volume);
+    }
 }
 
 /// `.osd levelbar`: trough @blue2, filled block @blue2 inset 3px, empty @light3.
@@ -46,6 +56,7 @@ pub fn osd() {
         })
     };
 
+    SHOW.with(|f| *f.borrow_mut() = Some(show.clone()));
     let b = brightness();
     let s1 = show.clone();
     b.subscribe(move || s1("display-brightness-symbolic", brightness().peek()));

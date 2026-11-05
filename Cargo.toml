@@ -7,10 +7,6 @@ edition = "2024"
 name = "flurry-shell"
 path = "app.rs"
 
-[[bin]]
-name = "flurry"
-path = "client.rs"
-
 # the Servo helper's Claude Code protocol (std + libc only), tested here: CI can't build Servo
 [[test]]
 name = "sideview-claude"

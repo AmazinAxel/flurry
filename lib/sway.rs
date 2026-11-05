@@ -128,6 +128,75 @@ pub fn subscribe(events: &[&str], cb: impl Fn(&Json) + 'static) {
     });
 }
 
+/// Next/previous workspace from `cur` (the tracked focused one), clamped to 1-9; `take` moves the
+/// focused window along.
+pub fn step_workspace(cur: i64, forward: bool, take: bool) {
+    let t = (cur + if forward { 1 } else { -1 }).clamp(1, 9);
+    if t == cur {
+        return;
+    }
+    command(&if take { format!("move container to workspace number {t}, workspace number {t}") } else { format!("workspace number {t}") });
+}
+
+thread_local! {
+    /// the focused workspace holds windows other than TERMINAL_TILED_WITH: kept current from
+    /// events so a keypress needs no tree read
+    static TERMINAL_FLOATS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TERMINAL_QUEUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Opens the terminal setting, floating when the focused workspace holds other apps.
+pub fn open_terminal() {
+    use crate::settings::{TERMINAL, TERMINAL_FLOATING};
+    let float = TERMINAL_FLOATS.with(std::cell::Cell::get);
+    let argv: Vec<String> = (if float { TERMINAL_FLOATING } else { TERMINAL }).iter().map(|s| s.to_string()).collect();
+    crate::lib::apps::launch(&argv);
+}
+
+/// Re-reads the tree (once per burst, on idle) after workspace focus and window
+/// open/close/move: what decides whether the terminal floats.
+pub fn watch_terminal() {
+    if crate::settings::TERMINAL_FLOATING.is_empty() {
+        return;
+    }
+    refresh_terminal();
+    subscribe(&["workspace", "window"], |ev| {
+        let c = ev.get("change").str();
+        let window = ev.get("container").get("id").int().is_some();
+        let relevant = if window { matches!(c, Some("new" | "close" | "move")) } else { c == Some("focus") };
+        if relevant && !TERMINAL_QUEUED.with(|q| q.replace(true)) {
+            runtime::idle(|| {
+                TERMINAL_QUEUED.with(|q| q.set(false));
+                refresh_terminal();
+            });
+        }
+    });
+}
+
+fn refresh_terminal() {
+    use crate::settings::TERMINAL_TILED_WITH;
+    fn focused_ws(n: &Json) -> Option<&Json> {
+        if n.get("type").str() == Some("workspace") {
+            return has_focus(n).then_some(n);
+        }
+        n.get("nodes").arr().iter().find_map(focused_ws)
+    }
+    fn has_focus(n: &Json) -> bool {
+        n.get("focused").bool() == Some(true) || n.get("nodes").arr().iter().chain(n.get("floating_nodes").arr()).any(has_focus)
+    }
+    fn other(n: &Json) -> bool {
+        let kids: Vec<&Json> = n.get("nodes").arr().iter().chain(n.get("floating_nodes").arr()).collect();
+        if kids.is_empty() {
+            let id = n.get("app_id").str().unwrap_or("");
+            return n.get("type").str() != Some("workspace") && !TERMINAL_TILED_WITH.iter().any(|p| id.starts_with(p));
+        }
+        kids.into_iter().any(other)
+    }
+    if let Some(t) = tree() {
+        TERMINAL_FLOATS.with(|f| f.set(focused_ws(&t).is_some_and(other)));
+    }
+}
+
 pub fn focused_output() -> Option<String> {
     outputs()?.arr().iter().find(|o| o.get("focused").bool() == Some(true)).and_then(|o| o.get("name").str().map(String::from))
 }

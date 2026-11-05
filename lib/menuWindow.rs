@@ -115,7 +115,7 @@ pub fn menu_window() -> Rc<Win> {
         if network::key(&focus, ev) {
             return w.redraw();
         }
-        // hiding forgets the open menu, and also closes one opened with no menu (`flurry toggle menu`)
+        // hiding forgets the open menu, and also closes one opened with no menu (`nop flurry toggle menu`)
         if ev.sym == Keysym::Escape {
             return w.set_visible(false);
         }
@@ -160,7 +160,7 @@ pub fn menu_window() -> Rc<Win> {
     // quickstatus: the media block scrolls mpd's volume, the rest of the card the speaker's
     w.on_pointer(move |ev| {
         let Some(w) = ww.upgrade() else { return };
-        let PointerEvent::Scroll { x, y, dy, wheel } = ev;
+        let PointerEvent::Scroll { x, y, dy, wheel } = ev else { return };
         if current().peek() != Some("status") {
             return;
         }

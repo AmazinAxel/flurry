@@ -96,6 +96,19 @@ fn set(name: &str, owner: &str) {
     publish();
 }
 
+/// Keybinds: calls `member` (PlayPause, Next, Previous) on spotify, else the playing player, else any
+/// (playerctl's `--player=spotify,%any`), from the tracked players: no lookup per press.
+pub fn control(member: &'static str) {
+    let dest = PLAYERS.with(|p| {
+        let p = p.borrow();
+        let key = |(n, pl): (&String, &Player)| (!n.ends_with(".spotify"), !pl.playing);
+        p.iter().min_by(|a, b| key(*a).cmp(&key(*b)).then(a.0.cmp(b.0))).map(|(n, _)| n.clone())
+    });
+    if let (Some(dest), Some(bus)) = (dest, dbus::session()) {
+        bus.send(method(&dest, PATH, PLAYER, member));
+    }
+}
+
 pub fn start() {
     let Some(bus) = dbus::session() else { return };
     const DBUS: &str = "org.freedesktop.DBus";

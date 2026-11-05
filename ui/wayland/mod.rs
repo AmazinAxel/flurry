@@ -5,6 +5,7 @@
 
 mod clipboard;
 mod lock;
+mod screencopy;
 mod shm;
 mod surface;
 
@@ -31,6 +32,7 @@ use surface::Inner;
 
 pub use clipboard::{OWN_MIME, clear_selection, on_selection, paste, read_selection, set_selection};
 pub use lock::{is_locking, lock, lock_surface, unlock};
+pub use screencopy::{Capture, capture};
 pub use shm::{ShmImage, ShmPixels};
 pub use surface::{BuildFn, Surface};
 pub use zwlr_layer_shell_v1::Layer;
@@ -63,6 +65,7 @@ struct Ctx {
     viewporter: wp_viewporter::WpViewporter,
     single_pixel: wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
     cursor_shape: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    screencopy: Option<wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     cursor_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
@@ -114,6 +117,10 @@ impl KeyEvent {
 pub enum PointerEvent {
     /// dy in GDK scroll units; `wheel` true for discrete mouse wheel steps
     Scroll { x: f64, y: f64, dy: f64, wheel: bool },
+    /// only delivered to surfaces that `track_pointer`
+    Motion { x: f64, y: f64 },
+    /// left button (anything else: `left` false)
+    Button { x: f64, y: f64, left: bool, pressed: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -133,6 +140,7 @@ enum Ev {
     Outputs,
     OutputGone(wl_output::WlOutput),
     Lock(LockEvent),
+    Captured(ObjectId, bool),
 }
 
 fn push(ev: Ev) {
@@ -164,6 +172,7 @@ pub fn connect() -> bool {
         viewporter,
         single_pixel,
         cursor_shape: globals.bind(&qh, 1..=1, ()).ok(),
+        screencopy: globals.bind(&qh, 1..=3, ()).ok(),
         keyboard: None,
         pointer: None,
         cursor_device: None,
@@ -313,6 +322,7 @@ fn handle(ev: Ev) {
                 o.release();
             }
         }
+        Ev::Captured(id, ok) => screencopy::finish(&id, ok),
         Ev::Lock(e) => {
             // unlock() destroys the lock first, so Finished only ever comes from the compositor
             if e == LockEvent::Finished {
@@ -526,7 +536,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Wl {
     fn event(_: &mut Self, _: &wl_pointer::WlPointer, ev: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match ev {
             wl_pointer::Event::Enter { serial, surface: s, surface_x, surface_y } => {
-                let hidden = surface(&s.id()).is_some_and(|i| i.is_lock());
+                let inner = surface(&s.id());
+                let hidden = inner.as_ref().is_some_and(|i| i.is_lock());
+                let tracked = inner.as_ref().is_some_and(|i| i.track_pointer.get());
+                if tracked {
+                    push(Ev::Pointer(s.id(), PointerEvent::Motion { x: surface_x, y: surface_y }));
+                }
                 ctx(|c| {
                     if hidden {
                         // lockscreen hides the cursor
@@ -534,7 +549,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Wl {
                             p.set_cursor(serial, None, 0, 0);
                         }
                     } else if let Some(d) = &c.cursor_device {
-                        d.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
+                        d.set_shape(serial, if tracked { wp_cursor_shape_device_v1::Shape::Crosshair } else { wp_cursor_shape_device_v1::Shape::Default });
                     }
                 });
                 HOVER.with(|h| *h.borrow_mut() = Some((s.id(), surface_x, surface_y)));
@@ -542,11 +557,20 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Wl {
             wl_pointer::Event::Leave { .. } => HOVER.with(|h| *h.borrow_mut() = None),
             // only tracked for where a scroll lands
             wl_pointer::Event::Motion { surface_x, surface_y, .. } => HOVER.with(|h| {
-                if let Some((_, x, y)) = h.borrow_mut().as_mut() {
+                if let Some((id, x, y)) = h.borrow_mut().as_mut() {
                     *x = surface_x;
                     *y = surface_y;
+                    if surface(id).is_some_and(|i| i.track_pointer.get()) {
+                        push(Ev::Pointer(id.clone(), PointerEvent::Motion { x: surface_x, y: surface_y }));
+                    }
                 }
             }),
+            wl_pointer::Event::Button { button, state, .. } => {
+                if let Some((id, x, y)) = HOVER.with(|h| h.borrow().clone()) {
+                    let pressed = state == WEnum::Value(wl_pointer::ButtonState::Pressed);
+                    push(Ev::Pointer(id, PointerEvent::Button { x, y, left: button == 0x110, pressed }));
+                }
+            }
             wl_pointer::Event::Axis { axis: WEnum::Value(wl_pointer::Axis::VerticalScroll), value, .. } => {
                 AXIS.with(|a| a.borrow_mut().0 += value);
             }

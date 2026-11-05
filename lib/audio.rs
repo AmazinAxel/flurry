@@ -527,6 +527,24 @@ pub fn set_volume(sink: &Sink, volume: f64) {
     apply(sink, Some(channels), None);
 }
 
+/// Volume keys on the default speaker: `delta` steps (unmuting, clamped to 0-100%), or None toggles mute.
+/// False when nothing changed (no default, or already at the end).
+pub fn step_volume(delta: Option<f64>) -> bool {
+    let Some(s) = default_speaker().filter(Sink::known) else { return false };
+    let Some(d) = delta else {
+        set_mute(&s, !s.mute);
+        return true;
+    };
+    let v = (s.volume + d).clamp(0.0, 1.0);
+    if s.mute {
+        set_mute(&s, false);
+    }
+    if v != s.volume {
+        set_volume(&s, v);
+    }
+    s.mute || v != s.volume
+}
+
 pub fn set_mute(sink: &Sink, mute: bool) {
     apply(sink, None, Some(mute));
 }

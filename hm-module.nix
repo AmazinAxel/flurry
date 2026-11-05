@@ -60,6 +60,17 @@ in {
             default = null;
             description = "argv prefix opening an image (the path is appended).";
           };
+          terminal = lib.mkOption {
+            type = nullOr (submodule {
+              options = {
+                command = lib.mkOption { type = listOf str; description = "argv of `nop flurry terminal`."; };
+                floating = lib.mkOption { type = listOf str; default = []; description = "argv used instead when the focused workspace has other windows; empty never floats."; };
+                tiledWith = lib.mkOption { type = listOf str; default = []; description = "app_id prefixes that don't count as other windows (the terminal's own, a file manager)."; };
+              };
+            });
+            default = null;
+            description = "Terminal opened by `nop flurry terminal`, floating over workspaces holding other apps.";
+          };
           focusBlocked = lib.mkOption {
             type = nullOr (listOf str);
             default = null;
@@ -85,6 +96,18 @@ in {
             default = null;
             description = "wl-gammarelay temperatures following the color scheme; false leaves the temperature alone.";
           };
+          theme = lib.mkOption {
+            type = nullOr (either (enum [ false ]) (submodule {
+              options = {
+                dark = lib.mkOption { type = str; description = "GTK theme with the dark scheme."; };
+                light = lib.mkOption { type = str; description = "GTK theme with the light scheme."; };
+                dir = lib.mkOption { type = str; description = "Directory holding both themes (their gtk-4.0/gtk.css is linked to ~/.config/gtk-4.0/gtk.css)."; };
+                signalUnits = lib.mkOption { type = listOf str; default = []; description = "systemd user units sent SIGUSR1 on dark, SIGUSR2 on light (foot's theme switch)."; };
+              };
+            }));
+            default = null;
+            description = "`nop flurry theme` flips dark/light: color-scheme and gtk-theme in dconf, GTK 4's gtk.css, and the units' signal; false disables it.";
+          };
           notificationFilters = lib.mkOption {
             type = nullOr (listOf str);
             default = null;
@@ -105,8 +128,6 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages = [ cfg.package ]; # `flurry <cmd>` is also the request client
-
     systemd.user.services.flurry = {
       Unit = {
         PartOf = [ "graphical-session.target" ];
