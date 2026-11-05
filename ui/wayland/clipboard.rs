@@ -168,6 +168,8 @@ struct DataControl {
     /// the selection flurry owns, with its token
     source: Option<(dc_source::ZwlrDataControlSourceV1, u64)>,
     tokens: u64,
+    /// counts selection events: a listener call queued for an older one is skipped
+    generation: u64,
 }
 
 thread_local! {
@@ -314,8 +316,9 @@ impl Dispatch<dc_device::ZwlrDataControlDeviceV1, ()> for Wl {
                 d.borrow_mut().offers.insert(id.id(), (id, vec![]));
             }),
             dc_device::Event::Selection { id } => {
-                let mimes = DC.with(|d| {
+                let (mimes, generation) = DC.with(|d| {
                     let mut d = d.borrow_mut();
+                    d.generation += 1;
                     if let Some((old, _)) = d.selection.take() {
                         old.destroy();
                     }
@@ -324,11 +327,16 @@ impl Dispatch<dc_device::ZwlrDataControlDeviceV1, ()> for Wl {
                         o.destroy();
                     }
                     d.selection = id.map(|o| (o, mimes.clone()));
-                    d.selection.is_some().then_some(mimes)
+                    (d.selection.is_some().then_some(mimes), d.generation)
                 });
                 runtime::idle(move || {
                     // a read of the one before is stale now
                     cancel_selection_read();
+                    // superseded within the same dispatch (an app clearing before it copies): an
+                    // empty clipboard here would restore the last copy over the new one
+                    if DC.with(|d| d.borrow().generation) != generation {
+                        return;
+                    }
                     if let Some(f) = SELECTION_LISTENER.with(|l| l.borrow().clone()) {
                         f(mimes);
                     }

@@ -213,8 +213,8 @@ fn pointer(i: usize, ev: PointerEvent) {
     }
 }
 
-/// Unfreezes at once; once that's sent, crops output `i`'s frame to `region` (logical; None: all
-/// of it) and encodes off the loop, then copies.
+/// Unfreezes at once, then crops output `i`'s frame to `region` (logical; None: all of it) and
+/// encodes it off the loop, then copies.
 fn take(i: usize, region: Option<(i32, i32, i32, i32)>) {
     let shot = SHOTS.with(|s| {
         let mut s = s.borrow_mut();
@@ -222,30 +222,31 @@ fn take(i: usize, region: Option<(i32, i32, i32, i32)>) {
         Some((s.get_mut(i)?.cap.take()?, size))
     });
     close();
-    let Some((cap, (sw, sh))) = shot else { return };
-    runtime::after_flush(move || {
-        let Some((w, h, rgb)) = crop(&cap, (sw, sh), region) else { return };
-        drop(cap);
-        runtime::spawn(async move {
-            let png = runtime::blocking(move || {
-                let mut out = Vec::new();
-                let mut e = png::Encoder::new(&mut out, w, h);
-                e.set_color(png::ColorType::Rgb);
-                e.set_depth(png::BitDepth::Eight);
-                e.set_compression(png::Compression::Fast);
-                e.write_header().ok()?.write_image_data(&rgb).ok()?;
-                Some(out)
-            });
-            if let Some(png) = png.await.flatten() {
-                crate::lib::clipboard::copy_png(png);
-            }
+    let Some((Capture { image, bgr, y_invert }, size)) = shot else { return };
+    let dims = (image.width, image.height);
+    // the overlay is gone, so the frame is ours alone: its pixels go to the worker
+    let Ok(image) = Rc::try_unwrap(image) else { return };
+    let px = image.into_mapped();
+    runtime::spawn(async move {
+        let png = runtime::blocking(move || {
+            let (w, h, rgb) = crop(px.as_ref(), dims, bgr, y_invert, size, region)?;
+            drop(px);
+            let mut out = Vec::new();
+            let mut e = png::Encoder::new(&mut out, w, h);
+            e.set_color(png::ColorType::Rgb);
+            e.set_depth(png::BitDepth::Eight);
+            e.set_compression(png::Compression::Fast);
+            e.write_header().ok()?.write_image_data(&rgb).ok()?;
+            Some(out)
         });
+        if let Some(png) = png.await.flatten() {
+            crate::lib::clipboard::copy_png(png);
+        }
     });
 }
 
-/// `region` (logical, of a `sw`×`sh` surface) of the frame as packed RGB.
-fn crop(cap: &Capture, (sw, sh): (u32, u32), region: Option<(i32, i32, i32, i32)>) -> Option<(u32, u32, Vec<u8>)> {
-    let (iw, ih) = (cap.image.width, cap.image.height);
+/// `region` (logical, of a `sw`×`sh` surface) of an `iw`×`ih` 32-bit frame as packed RGB.
+fn crop(src: &[u8], (iw, ih): (u32, u32), bgr: bool, y_invert: bool, (sw, sh): (u32, u32), region: Option<(i32, i32, i32, i32)>) -> Option<(u32, u32, Vec<u8>)> {
     let (l, t, r, b) = match region {
         None => (0, 0, iw, ih),
         Some((x, y, w, h)) => {
@@ -254,15 +255,18 @@ fn crop(cap: &Capture, (sw, sh): (u32, u32), region: Option<(i32, i32, i32, i32)
             (px(x, fx, iw), px(y, fy, ih), px(x + w, fx, iw), px(y + h, fy, ih))
         }
     };
-    let (w, h) = (r.checked_sub(l).filter(|&w| w > 0)?, b.checked_sub(t).filter(|&h| h > 0)?);
-    let src = cap.image.bytes();
-    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    for y in t..b {
-        let row = if cap.y_invert { ih - 1 - y } else { y } as usize;
+    let (w, h) = (r.checked_sub(l).filter(|&w| w > 0)? as usize, b.checked_sub(t).filter(|&h| h > 0)?);
+    let mut rgb = vec![0; w * h as usize * 3];
+    for (y, out) in (t..b).zip(rgb.chunks_exact_mut(w * 3)) {
+        let row = if y_invert { ih - 1 - y } else { y } as usize;
         let start = (row * iw as usize + l as usize) * 4;
-        for p in src[start..start + w as usize * 4].as_chunks::<4>().0 {
-            rgb.extend_from_slice(&if cap.bgr { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] });
+        let px = out.as_chunks_mut::<3>().0.iter_mut().zip(src[start..start + w * 4].as_chunks::<4>().0);
+        // the order checked per row, not per pixel: the loops vectorize
+        if bgr {
+            px.for_each(|(o, p)| *o = [p[2], p[1], p[0]]);
+        } else {
+            px.for_each(|(o, p)| *o = [p[0], p[1], p[2]]);
         }
     }
-    Some((w, h, rgb))
+    Some((w as u32, h, rgb))
 }

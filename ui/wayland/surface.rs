@@ -588,6 +588,8 @@ impl Inner {
             v.destroy();
         }
         self.buffers.borrow_mut().clear();
+        // a handler may keep the inner state alive: the image goes now
+        self.image.take();
         self.wl.destroy();
         SURFACES.with(|m| m.borrow_mut().remove(&self.wl.id()));
     }

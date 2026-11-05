@@ -116,6 +116,24 @@ impl Drop for ShmPixels {
     }
 }
 
+/// A mapping detached from its destroyed buffer (`ShmImage::into_mapped`): unmapped on drop.
+pub struct Mapped {
+    ptr: usize,
+    len: usize,
+}
+
+impl AsRef<[u8]> for Mapped {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+    }
+}
+
 impl ShmImage {
     pub fn from_pixels(mut p: ShmPixels) -> Rc<ShmImage> {
         let fd = p.fd.take().expect("fresh pixels"); // the mapping now belongs to the ShmImage
@@ -132,8 +150,14 @@ impl ShmImage {
         Some(ShmImage { buffer, width: w, height: h, id: IMAGE_IDS.fetch_add(1, Relaxed), ptr, len })
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    /// Destroys the buffer and keeps its pixels, now readable on a worker thread. Only once no
+    /// surface shows it (the compositor holds no reference worth keeping).
+    pub fn into_mapped(self) -> Mapped {
+        let me = std::mem::ManuallyDrop::new(self);
+        // moved out once: ManuallyDrop never drops it again
+        let buffer = unsafe { std::ptr::read(&me.buffer) };
+        buffer.destroy();
+        Mapped { ptr: me.ptr as usize, len: me.len }
     }
 
     pub fn pixmap(&self) -> tiny_skia::PixmapRef<'_> {
