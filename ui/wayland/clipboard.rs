@@ -179,6 +179,8 @@ thread_local! {
     static SELECTION_READ: RefCell<Option<Reading>> = const { RefCell::new(None) };
     /// `serve`s waiting on a full pipe
     static SERVING: Cell<usize> = const { Cell::new(0) };
+    /// a selection emptied once pasted: its token, and the type that doesn't count as a paste
+    static ONCE: Cell<Option<(u64, &'static str)>> = const { Cell::new(None) };
 }
 
 pub(super) fn bind(globals: &wayland_client::globals::GlobalList, qh: &QueueHandle<Wl>, seat: &wl_seat::WlSeat) {
@@ -249,6 +251,11 @@ pub fn clear_selection(token: u64) {
             source.destroy();
         }
     });
+}
+
+/// Empties the clipboard after the first read of the selection `token` names in any type but `ignore`.
+pub fn clear_after_paste(token: u64, ignore: &'static str) {
+    ONCE.set(Some((token, ignore)));
 }
 
 /// Writes `data` to a reader without blocking the loop; a reader that takes nothing for 10 s is
@@ -376,6 +383,12 @@ impl Dispatch<dc_source::ZwlrDataControlSourceV1, Offers> for Wl {
             dc_source::Event::Send { mime_type, fd } => {
                 if let Some((_, data)) = offers.iter().find(|(m, _)| *m == mime_type) {
                     serve(fd, data.clone());
+                    let token = DC.with(|d| d.borrow().source.as_ref().filter(|x| x.0 == *s).map(|x| x.1));
+                    if let Some(t) = token
+                        && ONCE.get().is_some_and(|(once, ignore)| once == t && ignore != mime_type)
+                    {
+                        clear_selection(t);
+                    }
                 }
             }
             dc_source::Event::Cancelled => {

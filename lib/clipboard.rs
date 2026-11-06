@@ -63,12 +63,13 @@ pub fn copy_login(user: &str, password: &str) {
     copy_sensitive(password);
 }
 
-/// Never stored in the history; cleared after 45s if the clipboard still holds it.
+/// Never stored in the history; cleared once pasted, or after 15s.
 pub fn copy_sensitive(text: &str) {
     let mut offers = offer(&TEXT, text.as_bytes());
     offers.push((SECRET_HINT.into(), Arc::new(Secret::new(b"secret".to_vec()))));
     if let Some(token) = set(offers) {
-        let _ = crate::ui::runtime::timeout(45_000, move || wayland::clear_selection(token));
+        wayland::clear_after_paste(token, SECRET_HINT);
+        let _ = crate::ui::runtime::timeout(15_000, move || wayland::clear_selection(token));
     }
 }
 

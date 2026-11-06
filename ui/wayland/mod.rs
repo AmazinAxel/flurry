@@ -30,7 +30,7 @@ use xkbcommon::xkb::compose;
 use super::runtime;
 use surface::Inner;
 
-pub use clipboard::{OWN_MIME, clear_selection, on_selection, paste, read_selection, set_selection};
+pub use clipboard::{OWN_MIME, clear_after_paste, clear_selection, on_selection, paste, read_selection, set_selection};
 pub use lock::{is_locking, lock, lock_surface, unlock};
 pub use screencopy::{Capture, capture};
 pub use shm::{ShmImage, ShmPixels};
