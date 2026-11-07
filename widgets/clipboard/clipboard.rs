@@ -167,6 +167,24 @@ fn load_scaled(bytes: &[u8], k: f32) -> Option<Pixmap> {
     Pixmap::from_vec(px, tiny_skia::IntSize::from_wh(w, h)?)
 }
 
+/// ffmpeg's PAM: an `ENDHDR`-terminated text header, then opaque RGBA rows (opaque: already
+/// premultiplied).
+fn parse_pam(mut data: Vec<u8>) -> Option<Pixmap> {
+    const END: &[u8] = b"ENDHDR\n";
+    let at = data.windows(END.len()).position(|w| w == END)?;
+    let header = std::str::from_utf8(&data[..at]).ok()?;
+    let field = |k: &str| header.lines().find_map(|l| l.strip_prefix(k)?.trim().parse::<u32>().ok());
+    let (w, h) = (field("WIDTH ")?, field("HEIGHT ")?);
+    if field("DEPTH ")? != 4 || field("MAXVAL ")? != 255 || (w as u64).saturating_mul(h as u64) > image::THUMB_PIXELS {
+        return None;
+    }
+    data.drain(..at + END.len());
+    if data.len() != w as usize * h as usize * 4 || data.as_chunks::<4>().0.iter().any(|p| p[3] != 255) {
+        return None;
+    }
+    Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h)?)
+}
+
 /// Thumbnails are produced one at a time (PRODUCE), in memory: nothing lands in the runtime dir.
 fn request_thumb(item: &Item) {
     if THUMBS.with(|t| t.borrow().contains_key(&item.id)) {
@@ -185,15 +203,16 @@ fn request_thumb(item: &Item) {
             if !std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
                 return None;
             }
-            let bytes = if video {
-                let scale = format!("scale=w={}:h={}:force_original_aspect_ratio=decrease", MAX_W * k, MAX_H * k);
-                // local files only: a crafted video can't make ffmpeg fetch URLs
-                let argv = ["ffmpeg", "-v", "error", "-protocol_whitelist", "file", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"];
-                read_output(&argv, 5000)
+            if video {
+                let scale = format!("scale=w={}:h={}:force_original_aspect_ratio=decrease,format=rgba", MAX_W * k, MAX_H * k);
+                // local files only: a crafted video can't make ffmpeg fetch URLs. Raw RGBA (PAM),
+                // already at the thumbnail size: no PNG encode and decode in between. One decoder thread: frame
+                // threads hold the first frame back until several are queued (~50ms on one keyframe)
+                let argv = ["ffmpeg", "-v", "error", "-protocol_whitelist", "file", "-threads", "1", "-skip_frame", "nokey", "-i", &src, "-vf", &scale, "-frames:v", "1", "-f", "image2pipe", "-c:v", "pam", "-"];
+                parse_pam(read_output(&argv, 5000)?)
             } else {
-                std::fs::read(&src).ok()
-            };
-            load_scaled(&bytes?, k)
+                load_scaled(&std::fs::read(&src).ok()?, k)
+            }
         })
         .await
         .flatten();
@@ -206,13 +225,15 @@ fn request_thumb(item: &Item) {
     });
 }
 
-/// Lazily, while the dialog is up: the newest media rows get thumbnails; older ones show their
-/// description. Image rows hold their thumbnail's size while loading; video rows (size unknown)
-/// stay hidden (requesting from the row builder never fired: hidden rows are never built).
+/// Eagerly, as entries land (dialog up or not): the newest media rows get thumbnails, kept in
+/// memory across shows; older ones show their description. Thumbnails made at another output
+/// scale (e.g. before the outputs were known) are made again.
 fn request_thumbs() {
-    if streaming_mode().peek() || !window::get("clipboard").is_some_and(|w| w.visible()) {
+    if streaming_mode().peek() {
         return;
     }
+    let k = device_scale();
+    THUMBS.with(|t| t.borrow_mut().retain(|_, x| !matches!(x, Thumb::Ready(_, s) if *s != k)));
     for item in media().iter() {
         request_thumb(item);
     }
@@ -235,22 +256,9 @@ fn describe(item: &Item) -> String {
     }
 }
 
-/// An empty box of the image thumbnail's size, from the stored WxH.
-fn placeholder(base: &Style, item: &Item) -> Option<Node> {
-    let (w, h) = item.image.then_some(&item.content)?.split_once('x')?;
-    let (w, h): (f32, f32) = (w.parse().ok()?, h.parse().ok()?);
-    // past THUMB_PIXELS the decode is refused: no thumbnail to hold room for
-    if w < 1.0 || h < 1.0 || (w as u64).saturating_mul(h as u64) > image::THUMB_PIXELS {
-        return None;
-    }
-    let k = device_scale();
-    let (tw, th, _) = thumb_size(w, h, k);
-    Some(Node::vbox(base.inherit(), 0.0, vec![]).size(tw as f32 / k, th as f32 / k).align(Align::Center, Align::Center))
-}
-
 fn item_node(base: &Style, item: &Item, row: &Style) -> Node {
     if streaming_mode().peek() {
-        return Node::label(row.inherit(), describe(item)).xalign(0.0);
+        return Node::label(row.inherit(), describe(item)).xalign(0.0).wrap(1.0);
     }
     if item.image || item.video {
         return match THUMBS.with(|t| t.borrow().get(&item.id).cloned()) {
@@ -265,9 +273,8 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Node {
                 }
                 Node::overlay(s, kids).size(w, h).align(Align::Center, Align::Center)
             }
-            // images: an empty box of the thumbnail's size, so nothing moves when it lands
-            Some(Thumb::Loading) => placeholder(base, item).unwrap_or_else(|| Node::label(row.inherit(), describe(item)).xalign(0.0)),
-            Some(Thumb::Failed) | None => Node::label(row.inherit(), describe(item)).xalign(0.0),
+            // the description until the thumbnail lands
+            _ => Node::label(row.inherit(), describe(item)).xalign(0.0).wrap(1.0),
         };
     }
     let mut n = Node::label(row.inherit(), item.content.clone()).xalign(0.0);
@@ -278,23 +285,15 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Node {
     n
 }
 
-/// `f` gets the rows the query and loading state let through (borrowed: nothing is cloned). It
-/// must not change ITEMS or THUMBS (no hiding the dialog from inside).
+/// `f` gets the rows the query lets through (borrowed: nothing is cloned). It must not change
+/// ITEMS (no hiding the dialog from inside).
 fn with_visible_rows<R>(f: impl FnOnce(&[&Item]) -> R) -> R {
-    let streaming = streaming_mode().peek();
     QUERY.with(|q| {
         let q = q.borrow();
-        THUMBS.with(|t| {
-            let t = t.borrow();
-            ITEMS.with(|i| {
-                let items = i.borrow();
-                let rows: Vec<&Item> = items
-                    .iter()
-                    .filter(|i| streaming || !i.video || !matches!(t.get(&i.id), Some(Thumb::Loading)))
-                    .filter(|i| q.is_empty() || i.search.contains(q.as_str()))
-                    .collect();
-                f(&rows)
-            })
+        ITEMS.with(|i| {
+            let items = i.borrow();
+            let rows: Vec<&Item> = items.iter().filter(|i| q.is_empty() || i.search.contains(q.as_str())).collect();
+            f(&rows)
         })
     })
 }
@@ -488,9 +487,10 @@ pub fn clipboard() {
     };
     let ctrl = |k: Keysym, f: fn()| -> (Keysym, crate::lib::inputControl::Action) { (k, Rc::new(f)) };
     let w = input_control("clipboard", build, Opts {
+        // rows and thumbnails are already made (as entries land): nothing to wait for
         on_show: Some(Rc::new(|| {
-            refresh_items();
             select_top(false);
+            request_thumbs();
         })),
         focus: Some("entry"),
         actions: vec![
@@ -527,23 +527,14 @@ pub fn clipboard() {
         entries: vec![EntryBinding { id: "entry", entry: e, on_activate: None, on_key: None }],
     });
     w.watch(&streaming_mode());
-    // hidden: rows and thumbnails go, rebuilt on the next show
-    let v = w.visibility.clone();
-    w.visibility.subscribe(move || {
-        if !v.peek() {
-            ITEMS.with(|i| i.borrow_mut().clear());
-            THUMBS.with(|t| t.borrow_mut().clear());
-        }
-    });
     streaming_mode().subscribe(|| {
         request_thumbs(); // rows themselves just redraw (watched above): no refetch gap
     });
-    // rows are only built while the dialog is up: hidden, a copy just lands in the history
-    crate::lib::clipboard::watch(|| {
-        if window::get("clipboard").is_some_and(|w| w.visible()) {
-            refresh_items();
-        }
-    });
+    // rows (and thumbnails) follow the history as copies land, so a show only draws
+    crate::lib::clipboard::watch(refresh_items);
+    // outputs may be unknown this early: thumbnails at the wrong scale are made again on change
+    crate::ui::wayland::on_outputs(request_thumbs);
+    refresh_items();
 }
 
 #[cfg(test)]
@@ -558,6 +549,10 @@ mod tests {
         assert_eq!(e("text/plain", "/tmp/a b"), None);
         assert_eq!(e("text/plain", "hello"), None);
         assert!(is_video("/a/B.MKV"));
+        let pam = |hdr: &str, px: &[u8]| parse_pam([hdr.as_bytes(), px].concat()).map(|p| (p.width(), p.height()));
+        assert_eq!(pam("P7\nWIDTH 2\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", &[1, 2, 3, 255, 4, 5, 6, 255]), Some((2, 1)));
+        assert_eq!(pam("P7\nWIDTH 2\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nENDHDR\n", &[1, 2, 3, 255]), None);
+        assert_eq!(pam("P7\nWIDTH 1\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nENDHDR\n", &[1, 2, 3]), None);
         // multibyte after a broken escape: kept, never a panic
         assert_eq!(e("text/plain", "file:%aé").as_deref(), Some("/%aé"));
     }
