@@ -1,10 +1,10 @@
 // Quickstatus menu: clock, status icons and date, the media block, then the quicksettings sliders and outputs.
 
-use crate::lib::mediaPlayer::{is_playing, playlist, song};
+use crate::lib::mediaPlayer::{is_playing, playlist, song, volume as mpd_volume};
 use crate::lib::menuWindow::GAP;
 use crate::lib::style::*;
-use crate::ui::node::{Align, Node, Sides, Style};
-use crate::widgets::status::modules::{mpris::track, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
+use crate::ui::node::{Align, Node, Sides, Style, TRANSPARENT, levelbar};
+use crate::widgets::status::modules::{mpris::{self, track}, statusIcons::status, time::{self, DAY_INK, DIGIT_BEARING}};
 use crate::widgets::status::quicksettings::quicksettings::quick_settings;
 
 /// Ink height of the clock and date; the group is centered in the wallpaper's width.
@@ -25,6 +25,21 @@ fn playlist_color() -> tiny_skia::Color {
     }
 }
 
+/// What the media block shows, with its (title, artist); its volume is the one scrolled and drawn.
+pub enum MediaSource {
+    /// mpd plays (its song, if it has a title), or no MPRIS player has a track
+    Mpd(Option<(String, String)>),
+    /// mpd is not playing and an MPRIS player has a track
+    Mpris((String, String)),
+}
+
+pub fn media_source() -> MediaSource {
+    if is_playing().peek() {
+        return MediaSource::Mpd(Some(song().peek()).filter(|(t, _)| !t.is_empty()));
+    }
+    track().peek().map_or(MediaSource::Mpd(None), MediaSource::Mpris)
+}
+
 /// Play/pause on the left with the mpd song, or the MPRIS track while mpd is paused;
 /// just a centered button when there is neither. Always as tall as title plus artist.
 fn media(base: &Style, focus: Option<&str>) -> Node {
@@ -43,25 +58,28 @@ fn media(base: &Style, focus: Option<&str>) -> Node {
     };
     let playlist = playlist_color();
     let playing = is_playing().peek();
-    let bar = Style {
-        background: Some(playlist),
-        margin: Sides::vh(SPACE_M, 0.0),
-        min_height: info(" ".into(), " ".into()).measure_h(f32::MAX).1,
-        ..base.inherit()
-    }
-    .border(Sides::all(BORDER), lighter(playlist));
+    let mut bar = Style { background: Some(playlist), min_height: info(" ".into(), " ".into()).measure_h(f32::MAX).1, ..base.inherit() }
+        .border(Sides::all(BORDER), lighter(playlist));
+    // the bottom edge is the volume bar
+    bar.border_color[2] = TRANSPARENT;
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
     let mut btn_style = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
     if focus == Some("mediaBtn") {
         btn_style = focus_outline(btn_style);
     }
     let btn = Node::hbox(btn_style, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).focusable("mediaBtn");
-    let text = if playing { Some(song().peek()).filter(|(t, _)| !t.is_empty()) } else { track().peek() };
+    let (text, volume) = match media_source() {
+        MediaSource::Mpd(text) => (text, mpd_volume().peek()),
+        MediaSource::Mpris(text) => (Some(text), mpris::volume().peek()),
+    };
     let children = match text {
         Some((title, artist)) => vec![btn, info(title, artist)],
         None => vec![btn.expand(true, false).align(Align::Center, Align::Fill)],
     };
-    Node::hbox(bar, 0.0, children).id("media")
+    Node::overlay(Style { margin: Sides::vh(SPACE_M, 0.0), ..base.inherit() }, vec![
+        Node::hbox(bar, 0.0, children).id("media"),
+        levelbar(base, volume.unwrap_or(0.0), lighter(playlist), TRANSPARENT, BORDER).align(Align::Fill, Align::End),
+    ])
 }
 
 /// Wallpaper part (clock | icons | date on one GAP grid, as tall as each other) and the controls under it.

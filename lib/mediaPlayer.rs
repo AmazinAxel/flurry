@@ -26,6 +26,8 @@ global_state! {
     pub fn playlist_index() -> usize = 0;
     /// Current mpd song as (title, artist).
     pub fn song() -> (String, String) = Default::default();
+    /// mpd's volume, 0..1; None without a mixer.
+    pub fn volume() -> Option<f64> = None;
 }
 /// Current playlist as (name, style color name); None when no playlists are configured.
 pub fn playlist() -> Option<(&'static str, &'static str)> {
@@ -165,7 +167,7 @@ async fn cmd(cmd: &str) -> Option<Vec<String>> {
     r.map_err(|ack| eprintln!("flurry: mpd: {ack}")).ok()
 }
 
-/// Keeps `is_playing` and `song` in sync on a second connection parked in `idle player`.
+/// Keeps `is_playing`, `song` and `volume` in sync on a second connection parked in `idle player`.
 /// Started at launch and again by any command, so a restarted mpd is picked back up.
 pub fn watch() {
     if WATCHING.replace(true) {
@@ -178,13 +180,15 @@ pub fn watch() {
                 let title = Some(field(&lines, "Title: ")).filter(|t| !t.is_empty()).unwrap_or_else(|| file.rsplit('/').next().unwrap_or_default());
                 is_playing().set(field(&lines, "state: ") == "play");
                 song().set((title.to_string(), field(&lines, "Artist: ").to_string()));
-                if !matches!(exchange(&mut c, "idle player").await, Some(Ok(_))) {
+                volume().set(field(&lines, "volume: ").parse::<f64>().ok().filter(|v| *v >= 0.0).map(|v| v / 100.0));
+                if !matches!(exchange(&mut c, "idle player mixer").await, Some(Ok(_))) {
                     break;
                 }
             }
         }
         is_playing().set(false);
         song().set(Default::default());
+        volume().set(None);
         WATCHING.set(false);
     });
 }

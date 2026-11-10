@@ -83,8 +83,7 @@ fn visible_devices() -> Vec<Device> {
 }
 
 fn first_listed() -> Option<Device> {
-    let devices = bt_state().with(|b| b.devices.clone());
-    devices.iter().find(|d| d.connected && listed(d)).or_else(|| devices.iter().find(|d| listed(d))).cloned()
+    visible_devices().into_iter().find(listed)
 }
 
 fn focus_device() -> Option<Device> {
@@ -143,7 +142,15 @@ pub fn start() {
     bt_state().subscribe(reject_unseen);
     // power and connected/connecting changes move focus back onto the focused device
     let links = bt_state().map(|b| (b.powered(), b.devices.iter().map(|d| (d.path.clone(), d.connected, d.connecting)).collect::<Vec<_>>()));
-    links.subscribe(|| focus_menu("bluetooth", focus_target));
+    // powering on starts at the first row
+    let was_on = Cell::new(bt_state().with(|b| b.powered()));
+    links.subscribe(move || {
+        let on = bt_state().with(|b| b.powered());
+        if !was_on.replace(on) && on {
+            FOCUSED.with(FocusMemory::forget);
+        }
+        focus_menu("bluetooth", focus_target)
+    });
 }
 
 fn icon(d: &Device) -> &'static str {

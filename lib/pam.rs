@@ -82,7 +82,7 @@ extern "C" fn conv(n: c_int, msgs: *mut *const PamMessage, resp: *mut *mut PamRe
         let r = unsafe { &mut *out.add(i) };
         match m.style {
             PAM_PROMPT_ECHO_OFF if !d.answered => {
-                // the secret, or an empty answer when there is none (fprint skip)
+                // the secret, or an empty answer when it held a NUL
                 d.answered = true;
                 let s = d.password.as_deref().map(|p| p.as_ptr().cast()).unwrap_or(c"".as_ptr());
                 r.resp = unsafe { libc::strdup(s) };
@@ -131,7 +131,7 @@ fn c_password(p: Secret) -> Option<Secret> {
 }
 
 /// Runs PAM `service` for the current user; `on_event` receives conversation messages and the result.
-pub fn authenticate(service: &str, password: Option<Secret>, on_event: impl Fn(Event) + 'static) {
+pub fn authenticate(service: &str, password: Secret, on_event: impl Fn(Event) + 'static) {
     let mut fds = [0; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         on_event(Event::Done(-1));
@@ -139,7 +139,7 @@ pub fn authenticate(service: &str, password: Option<Secret>, on_event: impl Fn(E
     }
     let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let service = CString::new(service).unwrap_or_default();
-    let password = password.and_then(c_password);
+    let password = c_password(password);
     let user = USER.with(Clone::clone);
     let work = move || {
         let mut data = ConvData { password, answered: false, out: std::fs::File::from(wr) };

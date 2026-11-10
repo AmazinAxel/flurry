@@ -136,9 +136,10 @@ fn refresh() {
     connecting().set(if joining { current_net.clone() } else { pending });
     // current first, then strongest, then by name (case-insensitive first)
     next.sort_by_cached_key(|(p, n)| (*p != current_net, Reverse(n.level), n.ssid.to_lowercase(), n.ssid.clone()));
-    let reordered = nets().with(|old| old.len() != next.len() || old.iter().zip(&next).any(|(a, b)| a.0 != b.0));
+    let ids = || shown().into_iter().map(|(p, _)| p).collect::<Vec<_>>();
+    let before = ids();
     nets().set(next);
-    if reordered {
+    if ids() != before {
         let in_list = crate::ui::window::get("menu").and_then(|w| w.focused()).is_some_and(|f| f.starts_with("wifi:"));
         if !in_list {
             focus_menu("wifi", focus_target);
@@ -197,6 +198,13 @@ fn join(path: &str, passphrase: Option<Secret>) {
 
 pub fn start() {
     iwd::on_change(queue_refresh);
+    // powering on starts at the first row
+    iwd::powered().subscribe(|| {
+        if iwd::powered().peek() {
+            FOCUSED.with(FocusMemory::forget);
+            focus_menu("wifi", focus_target);
+        }
+    });
     current().subscribe(|| {
         iwd::show_networks(current().peek() == Some("wifi"));
         if current().peek() != Some("wifi") {

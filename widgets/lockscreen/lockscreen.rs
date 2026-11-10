@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use xkbcommon::xkb::Keysym;
 
 use crate::lib::battery::battery;
+use crate::lib::fprintd;
 use crate::lib::logind::{self, inhibit_sleep, release_sleep, sleeping};
 use crate::lib::pam;
 use crate::lib::style::*;
@@ -63,6 +64,8 @@ thread_local! {
 global_state! {
     pub fn locked() -> bool = false;
     fn auth_failed() -> Failed = Failed::None;
+    /// the reader is (or is about to be again) listening: false turns the clock white
+    fn fprint_ready() -> bool = true;
 }
 fn entry() -> EntryRef {
     ENTRY.with(Clone::clone)
@@ -142,7 +145,7 @@ fn check_login() {
     // wiped on drop once pam is done
     let password = entry().borrow_mut().take_secret();
     let generation = LOCK_GEN.with(Cell::get);
-    pam::authenticate("flurry-auth", Some(password), move |ev| {
+    pam::authenticate("flurry-auth", password, move |ev| {
         let pam::Event::Done(code) = ev else { return };
         if ATTEMPT.with(Cell::get) == attempt {
             BUSY.with(|b| b.set(false));
@@ -217,11 +220,16 @@ fn handle_keys(ev: &KeyEvent) {
     Entry::key(&entry(), ev);
 }
 
-fn clock_style(failed: Failed) -> Style {
+fn clock_style(failed: Failed, fprint_ready: bool) -> Style {
     let mut s = window();
     s.font = font(IOSEVKA, 192.0);
-    s.color = alpha(blue1(), 0.9);
-    s.text_shadow = Some(glow(32.0, alpha(blue2(), 0.8)));
+    if fprint_ready {
+        s.color = alpha(blue1(), 0.9);
+        s.text_shadow = Some(glow(32.0, alpha(blue2(), 0.8)));
+    } else {
+        s.color = alpha(light1(), 0.9);
+        s.text_shadow = Some(glow(32.0, alpha(light3(), 0.6)));
+    }
     match failed {
         Failed::Password => {
             s.color = red();
@@ -242,7 +250,7 @@ fn clock_style(failed: Failed) -> Style {
 fn build() -> Node {
     // wallpaper and the dark gradient (the hidden password entry) are the surface's backdrop
     let base = window();
-    let mut clock = Node::label(clock_style(auth_failed().peek()), format_now("%H\n%M")).align(Align::Center, Align::Center);
+    let mut clock = Node::label(clock_style(auth_failed().peek(), fprint_ready().peek()), format_now("%H\n%M")).align(Align::Center, Align::Center);
     if let Kind::Label(LabelSpec { line_height, .. }) = &mut clock.kind {
         *line_height = Some(0.75);
     }
@@ -285,10 +293,11 @@ fn on_lock_event(ev: LockEvent) {
             // move cursor up a pixel so that it updates and disappears
             sway::command("seat - cursor move 1 1, seat - cursor move -1 -1");
             if let Some(f) = FPRINT.with(|f| f.borrow().clone()) {
-                f.mismatches.set(0);
-                f.stop_waiting();
+                if f.mismatches.replace(0) >= MAX_FAILURES {
+                    fprint_ready().set(true);
+                }
                 f.backoff.set(FPRINT_BACKOFF_MIN);
-                f.retry();
+                f.sync();
             }
         }
         // refused (another locker) or ended by the compositor: never leave a half-locked state behind
@@ -312,7 +321,7 @@ fn end_lock() {
     DISPLAY_OFF.with(|d| d.set(false));
     sway::command("output * power on");
     if let Some(f) = FPRINT.with(|f| f.borrow().clone()) {
-        f.stop_waiting();
+        f.sync();
     }
     auth_failed().set(Failed::None);
     if let Some(w) = window::get("focusMenu") {
@@ -378,54 +387,78 @@ fn prepare_unlock() {
     wallpaper::random_wallpaper();
 }
 
-const FPRINT_BACKOFF_MIN: u64 = 2000;
+const FPRINT_BACKOFF_MIN: u64 = 250;
 const FPRINT_BACKOFF_MAX: u64 = 60_000;
 
 fn next_fprint_backoff(ms: u64) -> u64 {
     (ms * 2).min(FPRINT_BACKOFF_MAX)
 }
-/// an attempt that failed sooner than this never reached the reader (none, busy): back off;
-/// a longer one is pam_fprintd's idle verify timeout and retries at once
-const FPRINT_QUICK_FAIL: Duration = Duration::from_secs(5);
 
 struct Fprint {
-    /// attempts that ended on a mismatch (PAM_AUTH_ERR/PAM_MAXTRIES)
+    reader: Rc<fprintd::Verifier>,
+    /// verifies that ended on an unenrolled finger, this lock
     mismatches: Cell<u32>,
-    running: Cell<bool>,
-    /// when the running attempt started
-    started: Cell<Option<Instant>>,
     flash: RefCell<Option<Timer>>,
-    /// next delay after a non-mismatch failure (no reader, device busy, ...)
+    /// next delay after a failure (no reader, device busy or resuming, fprintd gone...)
     backoff: Cell<u64>,
     wait: RefCell<Option<Timer>>,
-    /// a backoff retry came due while the display was off: run it once it's back on
-    paused: Cell<bool>,
 }
 
 impl Fprint {
-    fn allowed(&self) -> bool {
-        is_locked() && self.mismatches.get() < MAX_FAILURES
+    /// verifying while locked and awake (a suspend cancels the verify), up to MAX_FAILURES mismatches
+    fn wanted(&self) -> bool {
+        is_locked() && !sleeping().peek() && self.mismatches.get() < MAX_FAILURES
     }
 
     fn stop_waiting(&self) {
-        self.paused.set(false);
         if let Some(t) = self.wait.borrow_mut().take() {
             t.cancel();
         }
     }
 
-    /// back off instead of spinning: 2s doubling to 60s, paused while the display is off
+    /// verifying from now if wanted, else the reader released
+    fn sync(&self) {
+        self.stop_waiting();
+        if self.wanted() { self.reader.start() } else { self.reader.stop() }
+    }
+
+    fn event(self: &Rc<Self>, ev: fprintd::Event) {
+        if !self.wanted() {
+            return;
+        }
+        match ev {
+            fprintd::Event::Listening => {
+                self.backoff.set(FPRINT_BACKOFF_MIN);
+                fprint_ready().set(true);
+            }
+            fprintd::Event::BadScan => self.flash(),
+            fprintd::Event::NoMatch => {
+                self.flash();
+                self.mismatches.set(self.mismatches.get() + 1);
+                if self.wanted() {
+                    self.reader.again();
+                } else {
+                    self.reader.stop();
+                    fprint_ready().set(false);
+                }
+            }
+            fprintd::Event::Match => unlock_screen(),
+            fprintd::Event::Failed => self.schedule(),
+        }
+    }
+
+    /// back off instead of spinning: 250ms doubling to 60s. Only a repeated failure turns the
+    /// clock white: a single one (a reader still resuming) is retried before it would show.
     fn schedule(self: &Rc<Self>) {
         let ms = self.backoff.get();
+        if ms > FPRINT_BACKOFF_MIN {
+            fprint_ready().set(false);
+        }
         self.backoff.set(next_fprint_backoff(ms));
         let me = self.clone();
         let t = runtime::timeout(ms, move || {
             me.wait.borrow_mut().take();
-            if DISPLAY_OFF.with(Cell::get) {
-                me.paused.set(true);
-            } else {
-                me.retry();
-            }
+            me.sync();
         });
         if let Some(old) = self.wait.borrow_mut().replace(t) {
             old.cancel();
@@ -434,68 +467,28 @@ impl Fprint {
 
     /// activity (a key, the display coming on): a waiting retry comes back at the shortest delay
     fn reset_backoff(self: &Rc<Self>) {
-        self.backoff.set(FPRINT_BACKOFF_MIN);
-        let waiting = self.wait.borrow().is_some();
-        if self.paused.replace(false) || waiting {
+        if self.wait.borrow().is_some() {
+            self.backoff.set(FPRINT_BACKOFF_MIN);
             self.schedule();
         }
     }
 
-    fn retry(self: &Rc<Self>) {
-        if self.running.get() || !self.allowed() {
+    fn flash(&self) {
+        // a wrong password's red stays until typing clears it
+        if !is_locked() || sleeping().peek() || auth_failed().peek() == Failed::Password {
             return;
         }
-        self.running.set(true);
-        self.started.set(Some(Instant::now()));
-        let generation = LOCK_GEN.with(Cell::get);
-        let me = self.clone();
-        pam::authenticate("flurry-fprint", None, move |ev| match ev {
-            // started under an earlier lock: counts for nothing, verify again for this one
-            pam::Event::Done(_) if generation != LOCK_GEN.with(Cell::get) => {
-                me.running.set(false);
-                me.retry();
-            }
-            pam::Event::Info => {}
-            pam::Event::Error => {
-                entry().borrow_mut().set_text("");
-                if let Some(t) = me.flash.borrow_mut().take() {
-                    t.cancel();
-                }
-                auth_failed().set(Failed::Fprint);
-                let t = runtime::timeout(400, || {
-                    if auth_failed().peek() == Failed::Fprint {
-                        auth_failed().set(Failed::None);
-                    }
-                });
-                *me.flash.borrow_mut() = Some(t);
-            }
-            pam::Event::Done(code) => {
-                me.running.set(false);
-                if code == 0 {
-                    if me.allowed() {
-                        unlock_screen();
-                    }
-                } else if matches!(code, pam::PAM_AUTH_ERR | pam::PAM_MAXTRIES) {
-                    me.mismatches.set(me.mismatches.get() + 1);
-                    if me.allowed() {
-                        me.retry();
-                    } else if is_locked() {
-                        auth_failed().set(Failed::Password);
-                    }
-                } else if is_locked() {
-                    if me.started.take().is_none_or(|t| t.elapsed() < FPRINT_QUICK_FAIL) {
-                        me.schedule();
-                    } else {
-                        me.backoff.set(FPRINT_BACKOFF_MIN);
-                        if DISPLAY_OFF.with(Cell::get) {
-                            me.paused.set(true);
-                        } else {
-                            me.retry();
-                        }
-                    }
-                }
+        entry().borrow_mut().set_text("");
+        if let Some(t) = self.flash.borrow_mut().take() {
+            t.cancel();
+        }
+        auth_failed().set(Failed::Fprint);
+        let t = runtime::timeout(400, || {
+            if auth_failed().peek() == Failed::Fprint {
+                auth_failed().set(Failed::None);
             }
         });
+        *self.flash.borrow_mut() = Some(t);
     }
 }
 
@@ -506,18 +499,29 @@ pub fn start() {
         crate::lib::notifySend::notify_send("Lock", "PAM service flurry-auth is missing", "Unlocking will fail: set security.pam.services.flurry-auth", Vec::new());
     }
     logind::on_lock(lock_screen);
-    if std::path::Path::new("/etc/pam.d/flurry-fprint").exists() {
-        FPRINT.with(|f| *f.borrow_mut() = Some(Rc::new(Fprint {
+    fprintd::available(|yes| {
+        if !yes {
+            return;
+        }
+        let reader = fprintd::Verifier::new(|ev| {
+            if let Some(f) = FPRINT.with(|f| f.borrow().clone()) {
+                f.event(ev);
+            }
+        });
+        let Some(reader) = reader else { return };
+        let f = Rc::new(Fprint {
+            reader,
             mismatches: Cell::new(0),
-            running: Cell::new(false),
-            started: Cell::new(None),
             flash: RefCell::default(),
             backoff: Cell::new(FPRINT_BACKOFF_MIN),
             wait: RefCell::default(),
-            paused: Cell::new(false),
-        })));
-    }
+        });
+        FPRINT.with(|s| *s.borrow_mut() = Some(f.clone()));
+        // locked before fprintd answered (a restarted shell relocking)
+        f.sync();
+    });
     auth_failed().subscribe(redraw);
+    fprint_ready().subscribe(redraw);
     now().subscribe(|| {
         if locked().peek() {
             redraw();
@@ -547,6 +551,10 @@ pub fn start() {
     // every PrepareForSleep(true) notifies, even a repeated one: lock now, or let sleep go if locked
     sleeping().subscribe(|| {
         auth_failed().set(Failed::None); // never sleep or wake on a stale red/orange clock
+        // released before the suspend cancels the verify, verifying again on wake
+        if let Some(f) = FPRINT.with(|f| f.borrow().clone()) {
+            f.sync();
+        }
         if !sleeping().peek() {
             inhibit_sleep(REASON);
         } else if is_locked() {
@@ -582,10 +590,10 @@ mod tests {
     fn fprint_backoff_doubles_to_max() {
         let mut ms = FPRINT_BACKOFF_MIN;
         let mut seen = vec![];
-        for _ in 0..7 {
+        for _ in 0..10 {
             seen.push(ms);
             ms = next_fprint_backoff(ms);
         }
-        assert_eq!(seen, [2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+        assert_eq!(seen, [250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]);
     }
 }

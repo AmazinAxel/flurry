@@ -16,8 +16,9 @@ use crate::lib::{audio, mediaPlayer};
 use crate::lib::scrollStep::scroll_step;
 use crate::ui::state::State;
 use crate::widgets::status::quicksettings::quicksettings as qs;
-use crate::widgets::status::status::quickstatus;
+use crate::widgets::status::status::{MediaSource, media_source, quickstatus};
 use crate::widgets::status::{bluetooth, calendar, network};
+use crate::widgets::status::modules::mpris;
 
 /// Spacing unit inside the cards; also the wallpaper's inner padding.
 pub const GAP: f32 = SPACE_L;
@@ -101,6 +102,8 @@ pub fn menu_window() -> Rc<Win> {
     watch_in(&w, &mediaPlayer::is_playing(), STATUS);
     watch_in(&w, &mediaPlayer::song(), STATUS);
     watch_in(&w, &mediaPlayer::playlist_index(), STATUS);
+    watch_in(&w, &mediaPlayer::volume(), STATUS);
+    watch_in(&w, &mpris::volume(), STATUS);
     watch_in(&w, &crate::lib::battery::battery(), STATUS);
     watch_in(&w, &crate::lib::streamingMode::streaming_mode(), &["status", "wifi"]);
     watch_in(&w, &crate::lib::iwd::state(), STATUS);
@@ -157,7 +160,7 @@ pub fn menu_window() -> Rc<Win> {
     });
 
     let ww = Rc::downgrade(&w);
-    // quickstatus: the media block scrolls mpd's volume, the rest of the card the speaker's
+    // quickstatus: the media block scrolls the shown player's volume, the rest of the card the speaker's
     w.on_pointer(move |ev| {
         let Some(w) = ww.upgrade() else { return };
         let PointerEvent::Scroll { x, y, dy, wheel } = ev else { return };
@@ -167,7 +170,10 @@ pub fn menu_window() -> Rc<Win> {
         let (x, y) = (x as f32, y as f32);
         let inside = |id: &str| w.rect_of(id).is_some_and(|r| x >= r.left() && x < r.right() && y >= r.top() && y < r.bottom());
         if inside("media") {
-            mediaPlayer::media_scroll(dy, wheel);
+            match media_source() {
+                MediaSource::Mpd(_) => mediaPlayer::media_scroll(dy, wheel),
+                MediaSource::Mpris(_) => mpris::step_volume(-scroll_step(dy, wheel, 0.05, 0.006)),
+            }
         } else if (inside("card") || inside("cardRest"))
             && let Some(s) = audio::default_speaker()
         {

@@ -76,6 +76,9 @@ impl FocusMemory {
             *self.last.borrow_mut() = Some(k.to_string());
         }
     }
+    pub fn forget(&self) {
+        *self.last.borrow_mut() = None;
+    }
     pub fn last(&self) -> Option<String> {
         self.last.borrow().clone()
     }

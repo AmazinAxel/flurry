@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::lib::dbus::{self, PropMap, RefArg, SignalFilter, get_all, method, prop_str};
+use crate::lib::dbus::{self, PropMap, RefArg, SignalFilter, get_all, method, prop_f64, prop_str};
 use crate::ui::state::global_state;
 
 const PATH: &str = "/org/mpris/MediaPlayer2";
@@ -19,24 +19,78 @@ struct Player {
     playing: bool,
     title: String,
     artist: String,
+    /// as the player reports it (1 is full, some go above); None when it has no Volume property
+    volume: Option<f64>,
+}
+
+/// Scroll steps on one player's volume until the player has read it back.
+struct Steps {
+    name: String,
+    /// where the steps add up to: the base for further steps
+    target: f64,
+    /// a Set is on the bus; the target goes out when it returns
+    busy: bool,
 }
 
 thread_local! {
     static PLAYERS: RefCell<HashMap<String, Player>> = RefCell::default();
+    /// bus name of the player `track` shows
+    static SHOWN: RefCell<Option<String>> = const { RefCell::new(None) };
+    static STEPS: RefCell<Option<Steps>> = const { RefCell::new(None) };
 }
 
 global_state! {
     /// (title, artist) of the playing player, else of any player with a track loaded.
     pub fn track() -> Option<(String, String)> = None;
+    /// Volume of that player.
+    pub fn volume() -> Option<f64> = None;
 }
 
 fn publish() {
-    let t = PLAYERS.with(|p| {
+    let best = PLAYERS.with(|p| {
         let p = p.borrow();
         let best = p.iter().filter(|(_, pl)| !pl.title.is_empty()).min_by(|a, b| b.1.playing.cmp(&a.1.playing).then(a.0.cmp(b.0)));
-        best.map(|(_, pl)| (pl.title.clone(), pl.artist.clone()))
+        best.map(|(n, pl)| (n.clone(), (pl.title.clone(), pl.artist.clone()), pl.volume))
     });
-    track().set(t);
+    volume().set(best.as_ref().and_then(|b| b.2));
+    track().set(best.as_ref().map(|b| b.1.clone()));
+    SHOWN.with(|s| *s.borrow_mut() = best.map(|b| b.0));
+}
+
+/// Steps the shown player's volume by `delta`. Steps add up on a local target, so fast scrolls are
+/// not lost; one Set at a time is on the bus, and `volume` shows only what the player reads back.
+pub fn step_volume(delta: f64) {
+    let Some(name) = SHOWN.with(|s| s.borrow().clone()) else { return };
+    let ours = STEPS.with(|s| s.borrow().as_ref().filter(|s| s.name == name).map(|s| (s.target, s.busy)));
+    let Some(base) = ours.map(|o| o.0).or_else(|| PLAYERS.with(|p| p.borrow().get(&name)?.volume)) else { return };
+    // never pulls a player that goes above full down to it
+    let target = (base + delta).clamp(0.0, base.max(1.0));
+    let busy = ours.is_some_and(|o| o.1);
+    STEPS.with(|s| *s.borrow_mut() = Some(Steps { name: name.clone(), target, busy: true }));
+    if !busy {
+        send_volume(name, target);
+    }
+}
+
+/// Sets `v`, then the newer target if the steps moved on meanwhile, else reads the volume back
+/// (accepted or not).
+fn send_volume(name: String, v: f64) {
+    let Some(bus) = dbus::session() else {
+        STEPS.with(|s| s.borrow_mut().take());
+        return;
+    };
+    bus.call_cb(dbus::set_prop(&name, PATH, PLAYER, "Volume", v), move |_| {
+        let next = STEPS.with(|s| {
+            let mut s = s.borrow_mut();
+            let st = s.as_mut().filter(|st| st.name == name)?;
+            st.busy = st.target != v;
+            st.busy.then_some(st.target)
+        });
+        match next {
+            Some(t) => send_volume(name, t),
+            None => refresh(name, Some(v)),
+        }
+    });
 }
 
 /// First string inside a (possibly variant- or array-wrapped) value, truncated.
@@ -48,6 +102,9 @@ fn first_str(v: &dyn RefArg) -> Option<String> {
 fn apply(pl: &mut Player, props: &PropMap) {
     if let Some(s) = prop_str(props, "PlaybackStatus") {
         pl.playing = s == "Playing";
+    }
+    if let Some(v) = prop_f64(props, "Volume") {
+        pl.volume = Some(v.max(0.0));
     }
     if let Some(mut it) = props.get("Metadata").and_then(|m| m.0.as_iter()) {
         (pl.title, pl.artist) = (String::new(), String::new());
@@ -63,9 +120,18 @@ fn apply(pl: &mut Player, props: &PropMap) {
 
 /// GetAll for `name`. The bus keeps one sender's messages in order, so the reply is newer than
 /// every signal before it and older than every signal after it.
-fn refresh(name: String) {
+/// `sent`: the Volume set just before; its steps end here (even on error) unless more followed.
+fn refresh(name: String, sent: Option<f64>) {
     let Some(bus) = dbus::session() else { return };
     bus.call_cb(get_all(&name, PATH, PLAYER), move |r| {
+        if let Some(v) = sent {
+            STEPS.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.as_ref().is_some_and(|st| st.name == name && !st.busy && st.target == v) {
+                    *s = None;
+                }
+            });
+        }
         let Ok(m) = r else { return };
         let Ok(props) = m.read1::<PropMap>() else { return };
         PLAYERS.with(|p| {
@@ -91,7 +157,7 @@ fn set(name: &str, owner: &str) {
         }
     });
     if !owner.is_empty() {
-        refresh(name.into());
+        refresh(name.into(), None);
     }
     publish();
 }
@@ -136,12 +202,12 @@ pub fn start() {
                     .filter(|(_, pl)| pl.owner == *sender)
                     .filter_map(|(name, pl)| {
                         apply(pl, &changed);
-                        invalidated.iter().any(|k| k == "PlaybackStatus" || k == "Metadata").then(|| name.clone())
+                        invalidated.iter().any(|k| k == "PlaybackStatus" || k == "Metadata" || k == "Volume").then(|| name.clone())
                     })
                     .collect()
             });
             for name in stale {
-                refresh(name);
+                refresh(name, None);
             }
             publish();
         },
