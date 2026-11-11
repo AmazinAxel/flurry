@@ -58,10 +58,9 @@ fn media(base: &Style, focus: Option<&str>) -> Node {
     };
     let playlist = playlist_color();
     let playing = is_playing().peek();
-    let mut bar = Style { background: Some(playlist), min_height: info(" ".into(), " ".into()).measure_h(f32::MAX).1, ..base.inherit() }
-        .border(Sides::all(BORDER), lighter(playlist));
-    // the bottom edge is the volume bar
-    bar.border_color[2] = TRANSPARENT;
+    let bar = Style { min_height: info(" ".into(), " ".into()).measure_h(f32::MAX).1, ..base.inherit() };
+    // the volume bar overlays the card's bottom edge, above its border, so the card keeps its size
+    let card = Style { background: Some(playlist), margin: Sides::vh(SPACE_M, 0.0), ..base.inherit() }.border(Sides::all(BORDER), lighter(playlist));
     let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
     let mut btn_style = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
     if focus == Some("mediaBtn") {
@@ -76,10 +75,7 @@ fn media(base: &Style, focus: Option<&str>) -> Node {
         Some((title, artist)) => vec![btn, info(title, artist)],
         None => vec![btn.expand(true, false).align(Align::Center, Align::Fill)],
     };
-    Node::overlay(Style { margin: Sides::vh(SPACE_M, 0.0), ..base.inherit() }, vec![
-        Node::hbox(bar, 0.0, children).id("media"),
-        levelbar(base, volume.unwrap_or(0.0), lighter(playlist), TRANSPARENT, BORDER).align(Align::Fill, Align::End),
-    ])
+    Node::bottom_bar(card, Node::hbox(bar, 0.0, children), levelbar(base, volume.unwrap_or(0.0), lighter(playlist), TRANSPARENT, BORDER)).id("media")
 }
 
 /// Wallpaper part (clock | icons | date on one GAP grid, as tall as each other) and the controls under it.

@@ -10,7 +10,7 @@ use crate::lib::clipboard::copy_uri;
 use crate::lib::inputControl::{Opts, input_control};
 use crate::lib::process::{exec, spawn_lines};
 use crate::lib::style::*;
-use crate::ui::node::{Align, Node, Style, TRANSPARENT, levelbar};
+use crate::ui::node::{Align, Node, TRANSPARENT, levelbar};
 use crate::ui::wayland::Anchor;
 use crate::ui::window::{self, Spec, Win};
 use crate::ui::runtime;
@@ -163,7 +163,7 @@ pub fn compress_progress() -> Rc<Win> {
     let spec = Spec { name: "compressProgress", anchor: Anchor::Bottom | Anchor::Left | Anchor::Right, input: false, per_monitor: true, ..Default::default() };
     let w = Win::new(spec, |_| {
         let base = window();
-        levelbar(&Style { ..base.inherit() }, progress().peek().max(0.0), green(), TRANSPARENT, 4.0)
+        levelbar(&base, progress().peek().max(0.0), green(), TRANSPARENT, 4.0)
     });
     let ww = Rc::downgrade(&w);
     let last = Cell::new(false);
@@ -173,8 +173,9 @@ pub fn compress_progress() -> Rc<Win> {
         let show = (0.0..0.99).contains(&p);
         if last.replace(show) != show {
             w.set_visible(show);
+        } else if w.visible() {
+            w.redraw();
         }
-        w.redraw();
     });
     w
 }

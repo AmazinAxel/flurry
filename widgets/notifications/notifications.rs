@@ -103,8 +103,7 @@ pub fn notifications() {
     });
     let ww = w;
     shown().subscribe(move || {
-        ww.set_visible(!shown().with(Vec::is_empty));
-        ww.redraw();
+        ww.show_redraw(!shown().with(Vec::is_empty));
     });
     sway::subscribe(&["window"], |ev| match ev.get("change").str() {
         Some("urgent") if ev.get("container").get("urgent").bool() == Some(true) && AWAIT_URGENT.with(|a| a.take()) => {

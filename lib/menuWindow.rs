@@ -86,8 +86,7 @@ pub fn menu_window() -> Rc<Win> {
             Some("bluetooth") => bluetooth::focus_target(),
             _ => None,
         };
-        w.set_visible(open.is_some());
-        w.redraw();
+        w.show_redraw(open.is_some());
     });
     // each state redraws only the menus showing it
     const STATUS: &[&str] = &["status"];

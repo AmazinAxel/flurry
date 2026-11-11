@@ -313,6 +313,16 @@ impl Win {
         }
     }
 
+    /// `set_visible`, redrawing a window that stays shown: showing builds a fresh tree itself, so a
+    /// redraw on top would throw that one away and build again, and a hidden one has nothing to draw.
+    pub fn show_redraw(self: &Rc<Self>, v: bool) {
+        if self.visible() != v {
+            self.set_visible(v);
+        } else if v {
+            self.redraw();
+        }
+    }
+
     pub fn redraw(&self) {
         for (_, s) in self.surfaces.borrow().iter() {
             s.redraw();

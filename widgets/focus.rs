@@ -10,7 +10,7 @@ use crate::lib::process;
 use crate::lib::searchDialog::search_entry;
 use crate::lib::style::*;
 use crate::ui::entry;
-use crate::ui::node::{Align, Node, Sides, Style, levelbar, rgba};
+use crate::ui::node::{Node, Sides, Style, TRANSPARENT, levelbar};
 use crate::ui::runtime::{self, Timer};
 use crate::ui::state::global_state;
 use crate::ui::wayland::{Anchor, Layer};
@@ -132,16 +132,16 @@ pub fn focus_task() -> Rc<Win> {
         let start = break_start().peek();
         let progress = start.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0 / WAIT_MS as f64);
         // the bar overlays the card's bottom edge, so the card keeps its size
-        Node::vbox(base.inherit(), 0.0, vec![Node::overlay(l, vec![
+        Node::vbox(base.inherit(), 0.0, vec![Node::bottom_bar(
+            l,
             Node::label(text, focus_text().peek()),
-            levelbar(&base, progress, blue3(), rgba(0, 0, 0, 0.0), 6.0).align(Align::Fill, Align::End).show(start.is_some()),
-        ])])
+            levelbar(&base, progress, blue3(), TRANSPARENT, 6.0).show(start.is_some()),
+        )])
     });
     let fw = Rc::downgrade(&w);
     focus_text().subscribe(move || {
         if let Some(w) = fw.upgrade() {
-            w.set_visible(focus());
-            w.redraw();
+            w.show_redraw(focus());
         }
     });
     w.watch(&break_start());

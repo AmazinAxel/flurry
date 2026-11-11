@@ -228,6 +228,10 @@ impl Node {
     pub fn overlay(style: Style, children: Vec<Node>) -> Self {
         Self { children, ..Self::new(Kind::Overlay, style) }
     }
+    /// `content` with `bar` over its bottom edge, inside `style`'s border, so the box keeps its size.
+    pub fn bottom_bar(style: Style, content: Node, bar: Node) -> Self {
+        Self::overlay(style, vec![content, bar.align(Align::Fill, Align::End)])
+    }
     pub fn label(style: Style, text: impl Into<String>) -> Self {
         let spec = LabelSpec {
             text: text.into(),
@@ -932,9 +936,13 @@ pub fn fill_rect(pm: &mut PixmapMut, r: Rect, c: Color, ts: Transform) {
 /// GTK levelbar progress (continuous mode): trough with the filled block over it.
 pub fn levelbar(base: &Style, value: f64, filled: Color, empty: Color, height: f32) -> Node {
     let paint = Rc::new(move |pm: &mut PixmapMut, r: Rect, ts: Transform| {
-        fill_rect(pm, r, empty, ts);
-        if let Some(f) = Rect::from_xywh(r.x(), r.y(), r.width() * value.clamp(0.0, 1.0) as f32, r.height()) {
+        // filled block and the rest of the trough side by side, so no pixel is painted twice
+        let w = r.width() * value.clamp(0.0, 1.0) as f32;
+        if let Some(f) = Rect::from_xywh(r.x(), r.y(), w, r.height()) {
             fill_rect(pm, f, filled, ts);
+        }
+        if let Some(e) = Rect::from_xywh(r.x() + w, r.y(), r.width() - w, r.height()) {
+            fill_rect(pm, e, empty, ts);
         }
     });
     let key = Some(hash(&(value.to_bits(), [filled, empty].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits)))));
