@@ -119,12 +119,17 @@ thread_local! {
     static ROUTE_READS: RefCell<Vec<(spa::utils::result::AsyncSeq, u32)>> = const { RefCell::new(Vec::new()) };
     /// a reconnect is queued: one per lost connection, however many errors it reports
     static RECONNECT: Cell<bool> = const { Cell::new(false) };
+    /// `default.configured.audio.sink`: the user's choice WirePlumber restores
+    static CONFIGURED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 global_state! {
     pub fn speakers() -> Vec<Sink> = vec![];
     pub fn default_name() -> Option<String> = None;
     pub fn ready() -> bool = false;
+    /// default changes are the user's: WirePlumber has restored the configured default (at login
+    /// it falls back to whatever exists first, e.g. a null sink), or the user set something
+    pub fn settled() -> bool = false;
 }
 
 pub fn default_speaker() -> Option<Sink> {
@@ -145,6 +150,15 @@ fn update_sink(id: u32, f: impl FnOnce(&mut Sink)) {
             *s != old
         })
     });
+    try_settle();
+}
+
+/// Called after the update that may settle has been notified: subscribers see it unsettled, so
+/// the OSD takes the restored default as its baseline instead of showing it as a switch.
+fn try_settle() {
+    if !settled().peek() && default_speaker().is_some_and(|s| s.known && CONFIGURED.with(|c| c.borrow().as_deref() == Some(&*s.name))) {
+        settled().set(true);
+    }
 }
 
 /// Connects to PipeWire, or waits for its socket to appear and connects then.
@@ -279,6 +293,8 @@ fn connect() -> bool {
                     ROUTE_READS.with(|r| r.borrow_mut().clear());
                     speakers().set(vec![]);
                     default_name().set(None);
+                    CONFIGURED.with(|c| c.borrow_mut().take());
+                    settled().set(false);
                     ready().set(false);
                     start();
                 });
@@ -419,6 +435,7 @@ fn bind_device(reg: &pw::registry::Registry, g: &Global) {
                 }
                 changed
             });
+            try_settle();
         })
         .register();
     dev.subscribe_params(&[spa::param::ParamType::Route]);
@@ -430,10 +447,13 @@ fn bind_metadata(reg: &pw::registry::Registry, g: &Global) {
     let listener = md
         .add_listener_local()
         .property(|subject, key, _, value| {
-            if subject == 0 && key == Some("default.audio.sink") {
-                let name = value.and_then(crate::lib::json::parse).and_then(|j| j.get("name").str().map(String::from));
-                default_name().set(name);
+            let name = || value.and_then(crate::lib::json::parse).and_then(|j| j.get("name").str().map(String::from));
+            match key {
+                Some("default.audio.sink") if subject == 0 => default_name().set(name()),
+                Some("default.configured.audio.sink") if subject == 0 => CONFIGURED.with(|c| *c.borrow_mut() = name()),
+                _ => return 0,
             }
+            try_settle();
             0
         })
         .register();
@@ -474,6 +494,7 @@ fn props_object(channels: Option<Vec<f32>>, mute: Option<bool>) -> Object {
 
 /// Writes volume/mute like WirePlumber's mixer-api: through the device Route if present, else node Props.
 fn apply(sink: &Sink, channels: Option<Vec<f32>>, mute: Option<bool>) {
+    settled().set(true);
     let props = props_object(channels, mute);
     with(|p| {
         let route = sink.device.zip(sink.profile_device).and_then(|(dev, pd)| {
@@ -551,6 +572,7 @@ pub fn set_mute(sink: &Sink, mute: bool) {
 
 /// `isDefault = true`: what `wpctl set-default` writes.
 pub fn set_default(sink: &Sink) {
+    settled().set(true);
     let value = format!("{{\"name\":{}}}", crate::lib::json::quote(&sink.name));
     with(|p| {
         if let Some((_, md)) = &p.metadata {

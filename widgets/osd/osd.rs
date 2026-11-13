@@ -73,7 +73,8 @@ pub fn osd() {
         // not before its volume arrived: 0 -> actual would flash the OSD at startup
         let Some(s) = audio::default_speaker().filter(audio::Sink::known) else { return };
         let cur = (s.id, s.volume.to_bits(), s.mute);
-        if l.replace(Some(cur)).is_some_and(|prev| prev != cur) {
+        // unsettled: WirePlumber still restoring, only the baseline moves
+        if l.replace(Some(cur)).is_some_and(|prev| prev != cur) && audio::settled().peek() {
             s2(s.volume_icon(), s.volume);
         }
     };

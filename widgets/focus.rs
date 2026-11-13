@@ -144,6 +144,8 @@ pub fn focus_task() -> Rc<Win> {
             w.show_redraw(focus());
         }
     });
+    grayscale(false);
+    focus_text().subscribe(|| grayscale(focus()));
     w.watch(&break_start());
     // the break bar steps at ~15Hz while it runs, not on every frame
     let fw = Rc::downgrade(&w);
@@ -153,6 +155,68 @@ pub fn focus_task() -> Rc<Win> {
         }
     });
     w
+}
+
+/// Grays every output through a sway ICC profile (Vulkan renderer only); off restores sway's
+/// default gamma22. Reset at start so a crash mid-focus never leaves the screen gray.
+fn grayscale(on: bool) {
+    let path = crate::lib::xdg::runtime_dir().map(|d| format!("{d}/flurry-gray.icc"));
+    match path {
+        Some(p) if on && std::fs::write(&p, gray_icc()).is_ok() => {
+            crate::lib::sway::command(&format!("output * color_profile icc {p}"))
+        }
+        _ => crate::lib::sway::command("output * color_profile gamma22"),
+    }
+}
+
+/// A v2 display profile whose only output table (B2A0, Lab PCS) maps L* to a neutral gray:
+/// 2-point CLUT copying L to all channels, then output curves L -> Y -> gamma 2.2.
+/// A matrix/shaper profile can't do this: lcms inverts the matrix, and a gray one is singular.
+fn gray_icc() -> Vec<u8> {
+    const N: usize = 4096;
+    let be32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_be_bytes());
+    let be16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_be_bytes());
+    let d50 = [0xF6D6, 0x1_0000, 0xD32D];
+    let mut wtpt = b"XYZ \0\0\0\0".to_vec();
+    d50.iter().for_each(|&x| be32(&mut wtpt, x));
+    let mut lut = b"mft2\0\0\0\0\x03\x03\x02\0".to_vec();
+    (0..9).for_each(|i| be32(&mut lut, if i % 4 == 0 { 0x1_0000 } else { 0 }));
+    be16(&mut lut, 2);
+    be16(&mut lut, N as u16);
+    (0..3).for_each(|_| [0, 0xFFFF].iter().for_each(|&x| be16(&mut lut, x)));
+    // grid order: L varies slowest, so the first 4 points are L=0
+    (0..8).for_each(|i| (0..3).for_each(|_| be16(&mut lut, if i < 4 { 0 } else { 0xFFFF })));
+    for _ in 0..3 {
+        for t in 0..N {
+            // v2 Lab: L 100 is 0xFF00
+            let l = t as f64 / (N - 1) as f64 * 65535.0 / 65280.0 * 100.0;
+            let y = if l > 8.0 { ((l + 16.0) / 116.0).powi(3) } else { l / 903.3 };
+            be16(&mut lut, (y.min(1.0).powf(1.0 / 2.2) * 65535.0).round() as u16);
+        }
+    }
+    let tags = [(b"wtpt", wtpt), (b"B2A0", lut)];
+    let mut off = 128 + 4 + 12 * tags.len();
+    let mut p = vec![0u8; 128];
+    be32(&mut p, tags.len() as u32);
+    for (sig, data) in &tags {
+        p.extend_from_slice(*sig);
+        be32(&mut p, off as u32);
+        be32(&mut p, data.len() as u32);
+        off += data.len().next_multiple_of(4);
+    }
+    for (_, data) in &tags {
+        p.extend_from_slice(data);
+        p.resize(p.len().next_multiple_of(4), 0);
+    }
+    let len = p.len() as u32;
+    p[0..4].copy_from_slice(&len.to_be_bytes());
+    p[8..12].copy_from_slice(&0x0210_0000u32.to_be_bytes());
+    p[12..24].copy_from_slice(b"mntrRGB Lab ");
+    p[36..40].copy_from_slice(b"acsp");
+    for (i, x) in d50.iter().enumerate() {
+        p[68 + 4 * i..72 + 4 * i].copy_from_slice(&x.to_be_bytes());
+    }
+    p
 }
 
 fn tick_bar(w: std::rc::Weak<Win>) {
