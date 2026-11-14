@@ -66,6 +66,17 @@ impl Bt {
 thread_local! {
     /// (accept, reject) replies to the agent call awaiting the user's answer
     static PENDING: RefCell<Option<(Message, Message)>> = const { RefCell::new(None) };
+    /// Per-device connect attempt counter: a cancelled attempt's late reply is ignored.
+    static CONNECTS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+}
+
+fn next_connect(path: &str) -> u64 {
+    CONNECTS.with(|c| {
+        let mut c = c.borrow_mut();
+        let g = c.entry(path.to_string()).or_default();
+        *g += 1;
+        *g
+    })
 }
 
 global_state! {
@@ -247,15 +258,22 @@ fn set_flag(path: &str, f: impl FnOnce(&mut Device)) {
 }
 
 pub fn connect(path: &str, done: impl FnOnce(bool) + 'static) {
+    let attempt = next_connect(path);
     set_flag(path, |d| d.connecting = true);
     let p = path.to_string();
     call(path, "org.bluez.Device1", "Connect", move |ok| {
+        if CONNECTS.with(|c| c.borrow().get(&p) != Some(&attempt)) {
+            return;
+        }
         set_flag(&p, |d| d.connecting = false);
         done(ok);
     });
 }
 
+/// Also aborts a connect in flight (bluez fails it), so the device can retry at once.
 pub fn disconnect(path: &str) {
+    next_connect(path);
+    set_flag(path, |d| d.connecting = false);
     call(path, "org.bluez.Device1", "Disconnect", |_| {});
 }
 

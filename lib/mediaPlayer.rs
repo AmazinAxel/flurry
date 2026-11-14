@@ -218,9 +218,9 @@ async fn load_playlist(len: usize, play: bool) -> Option<()> {
     cmd(&list(&cmds)).await.map(drop)
 }
 
-/// The first command after launch sets crossfade, and loads the playlist only into an empty
-/// queue (a shell restart must not replace what's playing) unless the caller loads its own.
-/// Returns mpd's status.
+/// The first command after launch sets crossfade, and replaces the queue with the current
+/// (default) playlist so it matches the shown color, unless something is playing (a shell
+/// restart must not replace it) or the caller loads its own. Returns mpd's status.
 async fn start(load: bool) -> Option<Vec<String>> {
     let status = cmd("status").await?;
     if STARTED.get() {
@@ -229,8 +229,8 @@ async fn start(load: bool) -> Option<Vec<String>> {
     if MPD_CROSSFADE != 0 {
         cmd(&format!("crossfade {MPD_CROSSFADE}")).await?;
     }
-    if load && field(&status, "playlistlength: ") == "0" && playlist().is_some() {
-        load_playlist(0, false).await?;
+    if load && field(&status, "state: ") != "play" && playlist().is_some() {
+        load_playlist(field(&status, "playlistlength: ").parse().unwrap_or(0), false).await?;
     }
     STARTED.set(true);
     Some(status)

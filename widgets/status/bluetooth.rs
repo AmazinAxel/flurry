@@ -242,10 +242,10 @@ pub fn activate(id: &str) -> bool {
                 bt::answer(true);
                 return true;
             }
-            if d.connecting || d.pairing {
+            if d.pairing {
                 return true;
             }
-            if d.connected {
+            if d.connected || d.connecting {
                 bt::disconnect(&d.path);
                 stop_pending();
                 return true;
