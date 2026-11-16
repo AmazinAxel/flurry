@@ -72,6 +72,7 @@ fn entry() -> EntryRef {
 }
 
 fn set_display(on: bool) {
+    entry().borrow_mut().set_text(""); // keys typed around a display toggle are no attempt
     DISPLAY_OFF.with(|d| d.set(!on));
     sway::command(&format!("output * power {}", if on { "on" } else { "off" }));
     if on {
@@ -551,6 +552,7 @@ pub fn start() {
     // every PrepareForSleep(true) notifies, even a repeated one: lock now, or let sleep go if locked
     sleeping().subscribe(|| {
         auth_failed().set(Failed::None); // never sleep or wake on a stale red/orange clock
+        entry().borrow_mut().set_text(""); // nor with stray keys typed before
         // released before the suspend cancels the verify, verifying again on wake
         if let Some(f) = FPRINT.with(|f| f.borrow().clone()) {
             f.sync();
