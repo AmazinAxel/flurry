@@ -51,6 +51,7 @@ pub fn osd() {
     let show = {
         let (flash, w) = (flash, w);
         Rc::new(move |icon: &'static str, value: f64| {
+            eprintln!("DIAG osd show {icon} {value}");
             OSD.with(|o| *o.borrow_mut() = (icon, value));
             flash.show(&w);
         })
@@ -58,6 +59,7 @@ pub fn osd() {
 
     SHOW.with(|f| *f.borrow_mut() = Some(show.clone()));
     let b = brightness();
+    eprintln!("DIAG brightness initial {}", b.peek());
     let s1 = show.clone();
     b.subscribe(move || s1("display-brightness-symbolic", brightness().peek()));
 
@@ -73,6 +75,7 @@ pub fn osd() {
         // not before its volume arrived: 0 -> actual would flash the OSD at startup
         let Some(s) = audio::default_speaker().filter(audio::Sink::known) else { return };
         let cur = (s.id, s.volume.to_bits(), s.mute);
+        eprintln!("DIAG osd audio {} id={} vol={} mute={} prev={:?} settled={}", s.name, s.id, s.volume, s.mute, l.borrow().map(|p| (p.0, f64::from_bits(p.1), p.2)), audio::settled().peek());
         // unsettled: WirePlumber still restoring, only the baseline moves
         if l.replace(Some(cur)).is_some_and(|prev| prev != cur) && audio::settled().peek() {
             s2(s.volume_icon(), s.volume);
