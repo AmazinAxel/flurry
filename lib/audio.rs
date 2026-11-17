@@ -572,7 +572,6 @@ pub fn set_mute(sink: &Sink, mute: bool) {
 
 /// `isDefault = true`: what `wpctl set-default` writes.
 pub fn set_default(sink: &Sink) {
-    settled().set(true);
     let value = format!("{{\"name\":{}}}", crate::lib::json::quote(&sink.name));
     with(|p| {
         if let Some((_, md)) = &p.metadata {

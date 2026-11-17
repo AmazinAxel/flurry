@@ -13,8 +13,6 @@ pub struct Shape {
 pub enum Seg {
     M(f32, f32),
     L(f32, f32),
-    #[allow(dead_code)] // build.rs emits it for quadratic curves; no vendored icon has one yet
-    Q(f32, f32, f32, f32),
     C(f32, f32, f32, f32, f32, f32),
     Z,
 }
@@ -50,7 +48,6 @@ fn build(i: usize) -> Paths {
                 match *s {
                     M(x, y) => pb.move_to(x, y),
                     L(x, y) => pb.line_to(x, y),
-                    Q(a, b, x, y) => pb.quad_to(a, b, x, y),
                     C(a, b, c, d, x, y) => pb.cubic_to(a, b, c, d, x, y),
                     Z => pb.close(),
                 }

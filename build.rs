@@ -38,7 +38,7 @@ fn push_shape(path: &usvg::tiny_skia_path::Path, opacity: f32, even_odd: bool, o
         match seg {
             MoveTo(p) => write!(s, "M({:?},{:?}),", p.x, p.y),
             LineTo(p) => write!(s, "L({:?},{:?}),", p.x, p.y),
-            QuadTo(a, p) => write!(s, "Q({:?},{:?},{:?},{:?}),", a.x, a.y, p.x, p.y),
+            QuadTo(..) => panic!("icons: quadratic curves are not baked"),
             CubicTo(a, b, p) => write!(s, "C({:?},{:?},{:?},{:?},{:?},{:?}),", a.x, a.y, b.x, b.y, p.x, p.y),
             Close => write!(s, "Z,"),
         }

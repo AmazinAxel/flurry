@@ -127,7 +127,6 @@ pub fn monitor() {
             runtime::unwatch(fd);
             return;
         }
-        eprintln!("DIAG brightness wake requested={} actual={} state={}", read(&path()), actual(), brightness().peek());
         brightness().set(read(&path()) as f64 / max().max(1) as f64);
     });
 }
