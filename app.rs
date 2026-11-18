@@ -243,6 +243,7 @@ fn main() {
         lib::bluetooth::start();
         lib::audio::start();
         lib::iwd::start();
+        lib::wired::start();
         status::quicksettings::sound::start();
         status::bluetooth::start();
         status::network::start();

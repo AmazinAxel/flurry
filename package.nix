@@ -20,6 +20,7 @@
     nightLight = { dark = 3500; light = 6500; };
     theme = false;
     notificationFilters = [];
+    wiredWifiOff = true;
     fonts = [ nerd-fonts.iosevka noto-fonts-color-emoji dejavu_fonts ];
   } // settings;
   # fontconfig runs here, not in the shell: it sorts each family's fallback chain over Sora (vendored
@@ -137,6 +138,7 @@
     pub const NIGHT_LIGHT: Option<(u32, u32)> = ${nightLight};
     pub const THEME: Option<(&str, &str, &str, &[&str])> = ${theme};
     pub const NOTIFICATION_FILTERS: &[&str] = ${list str s.notificationFilters};
+    pub const WIRED_WIFI_OFF: bool = ${lib.boolToString (assert lib.assertMsg (builtins.isBool s.wiredWifiOff) "flurry settings: wiredWifiOff must be a bool"; s.wiredWifiOff)};
   '';
 in rustPlatform.buildRustPackage {
   pname = "flurry";

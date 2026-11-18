@@ -34,6 +34,9 @@ pub const NIGHT_LIGHT: Option<(u32, u32)> = Some((3500, 6500));
 pub const THEME: Option<(&str, &str, &str, &[&str])> = None;
 /// Notifications whose body starts with one of these are dropped.
 pub const NOTIFICATION_FILTERS: &[&str] = &[];
+/// Power Wi-Fi off when a wired link (Ethernet, USB tethering) gets a default route; it stays off
+/// after.
+pub const WIRED_WIFI_OFF: bool = true;
 /// Font fallback chains sorted by fontconfig at build time: (family, fontconfig weight, file, face
 /// index, embolden). Empty here: dev builds read the dev shell's FLURRY_FONTS instead.
 pub const FONTS: &[(&str, i32, &str, u32, bool)] = &[];

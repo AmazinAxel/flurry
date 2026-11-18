@@ -16,6 +16,7 @@ pub mod sway;
 pub mod time;
 pub mod bluetooth;
 pub mod iwd;
+pub mod wired;
 pub mod notifd;
 pub mod apps;
 pub mod pam;

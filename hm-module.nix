@@ -113,6 +113,11 @@ in {
             default = null;
             description = "Notifications whose body starts with one of these are dropped.";
           };
+          wiredWifiOff = lib.mkOption {
+            type = nullOr bool;
+            default = null;
+            description = "Power Wi-Fi off when Ethernet or USB tethering gets a default route; it stays off after.";
+          };
           fonts = lib.mkOption {
             type = nullOr (listOf package);
             default = null;
