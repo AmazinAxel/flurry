@@ -136,7 +136,8 @@ fn on_link(ty: u16, body: &[u8]) {
             return;
         }
         match (l.get_mut(&index), name) {
-            (Some(link), n) if n.as_ref().is_none_or(|n| *n == link.name) => link.up = up,
+            (Some(link), None) => link.up = up,
+            (Some(link), Some(n)) if n == link.name => link.up = up,
             // new or renamed
             (_, Some(n)) => {
                 let wired = is_wired(&n);
