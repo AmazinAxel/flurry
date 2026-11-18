@@ -14,14 +14,6 @@ fn icon_for(state: &str) -> &'static str {
     }
 }
 
-/// Icon for the online wired link (tethering first), if any: it carries the traffic over Wi-Fi.
-pub fn wired_icon() -> Option<&'static str> {
-    let links = wired::links().peek();
-    let online: Vec<_> = links.iter().filter(|w| w.online).collect();
-    online.first()?;
-    Some(if online.iter().any(|w| w.tether) { "phone-symbolic" } else { "network-wired-symbolic" })
-}
-
 fn img(base: &Style, name: &'static str) -> Node {
     let mut s = base.inherit();
     s.color = light1();
@@ -51,7 +43,8 @@ pub fn status(base: &Style) -> Node {
     Node::vbox(base.inherit(), SPACE_M, vec![
         Node::icon(rec, "media-record-symbolic", 36.0).show(crate::widgets::record::service::is_rec().peek()),
         battery_percent(base),
-        img(base, wired_icon().unwrap_or_else(|| iwd::state().with(|s| icon_for(s)))),
+        // a wired link carries the traffic over Wi-Fi
+        img(base, if wired::online().peek() { wired::WIRED_ICON } else { iwd::state().with(|s| icon_for(s)) }),
         img(base, "bluetooth-active-symbolic").show(bt().with(|b| b.powered())),
         img(base, "notifications-disabled-symbolic").show(streaming_mode().peek()),
     ])

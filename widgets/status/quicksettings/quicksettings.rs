@@ -134,6 +134,8 @@ pub fn key(id: &str, ev: &KeyEvent) -> bool {
     true
 }
 
+/// The first unselected sink, else the first.
 pub fn first_sink() -> Option<String> {
-    sound::listed().first().map(|s| format!("sink:{}", s.name))
+    let (list, sel) = (sound::listed(), selected().peek());
+    list.iter().find(|s| !sel.contains(&s.name)).or(list.first()).map(|s| format!("sink:{}", s.name))
 }

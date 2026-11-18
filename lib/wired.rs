@@ -1,6 +1,6 @@
-// Wired links over rtnetlink: Ethernet ports and adapters, and USB tethering (a phone showing up as
-// a USB network card). Link and route changes arrive on a netlink socket in the poll loop; a link
-// counts as online once it carries a default route.
+// Whether a wired link (an Ethernet port or adapter, or USB tethering: a phone showing up as a USB
+// network card) carries a default route. Link and route changes arrive on an rtnetlink socket in
+// the poll loop.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -10,23 +10,11 @@ use std::path::Path;
 use crate::ui::runtime;
 use crate::ui::state::global_state;
 
-#[derive(Clone, PartialEq)]
-pub struct Wired {
-    pub name: String,
-    /// USB tethering rather than an Ethernet port or adapter
-    pub tether: bool,
-    /// carries a default route; false while it is still getting an address
-    pub online: bool,
-}
+pub const WIRED_ICON: &str = "network-wired-symbolic";
 
 global_state! {
-    /// Physical wired links that are up, by name.
-    pub fn links() -> Vec<Wired> = vec![];
-}
-
-/// Whether a wired link carries a default route.
-pub fn online() -> bool {
-    links().with(|l| l.iter().any(|w| w.online))
+    /// A wired link is up and carries a default route (false while it is still getting an address).
+    pub fn online() -> bool = false;
 }
 
 const NLM_F_REQUEST: u16 = 1;
@@ -47,8 +35,8 @@ const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_UP: u8 = 6;
 const IFF_LOWER_UP: u32 = 0x10000;
 const ARPHRD_ETHER: u16 = 1;
-const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
 const RTA_PRIORITY: u16 = 6;
 const RTA_TABLE: u16 = 15;
 const RT_TABLE_MAIN: u32 = 254;
@@ -56,14 +44,11 @@ const RTN_UNICAST: u8 = 1;
 const SEQ_LINKS: u32 = 1;
 const SEQ_ROUTES: u32 = 2;
 
-/// USB network drivers phones use for tethering (Android: RNDIS or NCM, iPhone: ipheth).
-const TETHER_DRIVERS: &[&str] = &["rndis_host", "cdc_ncm", "cdc_ether", "cdc_eem", "ipheth"];
-
 struct Link {
     name: String,
     up: bool,
-    /// tether; None for wireless and virtual links
-    kind: Option<bool>,
+    /// backed by a device and not wireless (not Wi-Fi, a bridge, veth or tunnel)
+    wired: bool,
 }
 
 /// A default route: (family, output link, metric, gateway).
@@ -71,21 +56,15 @@ type Route = (u8, u32, u32, Vec<u8>);
 
 thread_local! {
     static FD: Cell<RawFd> = const { Cell::new(-1) };
+    /// Ethernet-type links by index
     static LINKS: RefCell<HashMap<u32, Link>> = RefCell::default();
     static ROUTES: RefCell<HashSet<Route>> = RefCell::default();
 }
 
-/// Whether `name` is USB tethering, from sysfs; wireless and virtual links (no backing device) are
-/// None.
-fn classify(name: &str) -> Option<bool> {
+/// Whether `name` is a physical wired link, from sysfs (both are there once the link is announced).
+fn is_wired(name: &str) -> bool {
     let base = Path::new("/sys/class/net").join(name);
-    if base.join("wireless").exists() || base.join("phy80211").exists() {
-        return None;
-    }
-    let dev = base.join("device");
-    let leaf = |p: &Path| p.read_link().ok().and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()));
-    let driver = leaf(&dev.join("driver"))?;
-    Some(leaf(&dev.join("subsystem")).as_deref() == Some("usb") && TETHER_DRIVERS.contains(&driver.as_str()))
+    base.join("device").exists() && !base.join("wireless").exists() && !base.join("phy80211").exists()
 }
 
 fn request(ty: u16, seq: u32, body: &[u8]) {
@@ -136,11 +115,8 @@ fn on_link(ty: u16, body: &[u8]) {
         return;
     }
     let (kind, index, flags) = (u16_at(body, 2), u32_at(body, 4), u32_at(body, 8));
-    if ty == RTM_DELLINK || kind != ARPHRD_ETHER {
-        LINKS.with(|l| l.borrow_mut().remove(&index));
-        return;
-    }
-    let (mut name, mut oper) = (None, IF_OPER_UNKNOWN);
+    let mut name = None;
+    let mut oper = IF_OPER_UNKNOWN;
     for (t, d) in attrs(&body[16..]) {
         match t {
             IFLA_IFNAME => name = std::ffi::CStr::from_bytes_until_nul(d).ok().map(|s| s.to_string_lossy().into_owned()),
@@ -148,20 +124,23 @@ fn on_link(ty: u16, body: &[u8]) {
             _ => {}
         }
     }
-    let up = oper == IF_OPER_UP || (oper == IF_OPER_UNKNOWN && flags & IFF_LOWER_UP != 0);
+    let up = ty == RTM_NEWLINK && kind == ARPHRD_ETHER && (oper == IF_OPER_UP || (oper == IF_OPER_UNKNOWN && flags & IFF_LOWER_UP != 0));
+    if !up {
+        // the kernel flushes IPv4 routes of a downed link without a DELROUTE
+        ROUTES.with(|r| r.borrow_mut().retain(|(_, oif, _, _)| *oif != index));
+    }
     LINKS.with(|l| {
         let mut l = l.borrow_mut();
+        if ty == RTM_DELLINK || kind != ARPHRD_ETHER {
+            l.remove(&index);
+            return;
+        }
         match (l.get_mut(&index), name) {
-            (Some(link), n) if n.as_ref().is_none_or(|n| *n == link.name) => {
-                link.up = up;
-                // a hotplugged link is announced before its driver binds: classified again once up
-                if up && link.kind.is_none() {
-                    link.kind = classify(&link.name);
-                }
-            }
+            (Some(link), n) if n.as_ref().is_none_or(|n| *n == link.name) => link.up = up,
+            // new or renamed
             (_, Some(n)) => {
-                let kind = classify(&n);
-                l.insert(index, Link { name: n, up, kind });
+                let wired = is_wired(&n);
+                l.insert(index, Link { name: n, up, wired });
             }
             (None, None) => {}
         }
@@ -196,23 +175,6 @@ fn on_route(ty: u16, body: &[u8]) {
     });
 }
 
-fn publish() {
-    let mut list: Vec<Wired> = LINKS.with(|l| {
-        ROUTES.with(|r| {
-            let r = r.borrow();
-            l.borrow()
-                .iter()
-                .filter(|(_, link)| link.up)
-                .filter_map(|(i, link)| {
-                    Some(Wired { name: link.name.clone(), tether: link.kind?, online: r.iter().any(|(_, oif, _, _)| oif == i) })
-                })
-                .collect()
-        })
-    });
-    list.sort_by(|a, b| a.name.cmp(&b.name));
-    links().set(list);
-}
-
 fn read() {
     let fd = FD.with(Cell::get);
     // dump parts are at most 32 KiB
@@ -245,7 +207,8 @@ fn read() {
             off += (len + 3) & !3;
         }
     }
-    publish();
+    let now = LINKS.with(|l| ROUTES.with(|r| r.borrow().iter().any(|(_, oif, _, _)| l.borrow().get(oif).is_some_and(|k| k.up && k.wired))));
+    online().set(now);
 }
 
 /// Called once at launch.

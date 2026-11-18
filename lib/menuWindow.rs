@@ -106,7 +106,7 @@ pub fn menu_window() -> Rc<Win> {
     watch_in(&w, &crate::lib::battery::battery(), STATUS);
     watch_in(&w, &crate::lib::streamingMode::streaming_mode(), &["status", "wifi"]);
     watch_in(&w, &crate::lib::iwd::state(), STATUS);
-    watch_in(&w, &crate::lib::wired::links(), STATUS);
+    watch_in(&w, &crate::lib::wired::online(), STATUS);
     watch_in(&w, &crate::widgets::status::modules::mpris::track(), STATUS);
     watch_in(&w, &crate::widgets::record::service::is_rec(), STATUS);
     network::watch(&w);

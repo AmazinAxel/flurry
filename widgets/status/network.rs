@@ -1,6 +1,6 @@
 // Wi-Fi menu over iwd. The password popover is an inline entry under the row.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::cmp::Reverse;
 
 use xkbcommon::xkb::Keysym;
@@ -11,9 +11,8 @@ use crate::lib::dbus::{Path, prop_str};
 use crate::lib::deviceMenu::{DeviceMenu, FocusMemory, Trailing, aside_row, device_menu, device_row};
 use crate::lib::iwd::{self, DEVICE, NETWORK, STATION};
 use crate::lib::searchDialog::plain_entry;
-use crate::lib::style::{SPACE_M, SPACE_S};
-use crate::lib::wired;
-use crate::widgets::status::modules::statusIcons::wired_icon;
+use crate::lib::style::SPACE_S;
+use crate::lib::wired::{self, WIRED_ICON};
 use crate::lib::streamingMode::streaming_mode;
 use crate::lib::notifySend::notify_send;
 use crate::ui::entry::{self, Entry, EntryRef, Secret};
@@ -43,8 +42,6 @@ thread_local! {
     static FOCUSED: FocusMemory = const { FocusMemory::new("wifi:") };
     /// network path with the open password entry
     static PASSWORD: RefCell<Option<(String, EntryRef)>> = const { RefCell::new(None) };
-    /// a wired link was online at the last change
-    static WIRED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Redraws the menu window on Wi-Fi changes while the Wi-Fi menu is open.
@@ -56,7 +53,7 @@ pub fn watch(w: &std::rc::Rc<crate::ui::window::Win>) {
     watch_in(w, &show_all(), WIFI);
     watch_in(w, &iwd::scanning(), WIFI);
     watch_in(w, &iwd::powered(), WIFI);
-    watch_in(w, &wired::links(), WIFI);
+    watch_in(w, &wired::online(), WIFI);
 }
 
 global_state! {
@@ -84,7 +81,7 @@ fn row_id(path: &str) -> String {
 }
 
 pub fn focus_target() -> Option<String> {
-    if streaming_mode().peek() || wired::online() {
+    if streaming_mode().peek() || wired::online().peek() {
         return None;
     }
     if !iwd::powered().peek() {
@@ -178,8 +175,7 @@ async fn toggle_wifi() {
 
 /// A wired link coming online powers Wi-Fi off; it stays off once that goes.
 fn on_wired() {
-    let online = wired::online();
-    if WIRED.with(|w| w.replace(online)) == online || !online {
+    if !wired::online().peek() {
         return;
     }
     // the menu shows only the wired link now
@@ -229,7 +225,7 @@ fn join(path: &str, passphrase: Option<Secret>) {
 
 pub fn start() {
     iwd::on_change(queue_refresh);
-    wired::links().subscribe(on_wired);
+    wired::online().subscribe(on_wired);
     // powering on starts at the first row
     iwd::powered().subscribe(|| {
         if iwd::powered().peek() {
@@ -258,11 +254,8 @@ pub fn start() {
 
 pub fn menu(base: &Style, focus: Option<&str>) -> Node {
     // a wired link carries the traffic: only that is shown, streaming mode or not
-    if let Some(icon) = wired_icon() {
-        let text = if icon == "phone-symbolic" { "USB Tethered" } else { "Ethernet Connected" };
-        return Node::hbox(base.inherit(), SPACE_M, vec![Node::icon(base.inherit(), icon, 16.0), Node::label(base.inherit(), text)])
-            .align(Align::Center, Align::Center)
-            .expand(true, false);
+    if wired::online().peek() {
+        return Node::icon(base.inherit(), WIRED_ICON, 48.0).align(Align::Center, Align::Center).expand(true, false);
     }
     if streaming_mode().peek() {
         return Node::label(base.inherit(), "Streaming mode enabled").align(Align::Center, Align::Fill).expand(true, false);
@@ -312,7 +305,7 @@ fn submit() -> bool {
 
 /// Enter on a focused item; returns the id to focus next, if any.
 pub fn activate(id: &str) -> Option<Option<String>> {
-    if streaming_mode().peek() || wired::online() {
+    if streaming_mode().peek() || wired::online().peek() {
         return None;
     }
     match id {
@@ -357,7 +350,7 @@ pub fn activate(id: &str) -> Option<Option<String>> {
 
 /// Keys for the inline password entry (Escape closes it, others edit).
 pub fn key(id: &str, ev: &KeyEvent) -> bool {
-    if id != "wifi-password" || streaming_mode().peek() || wired::online() {
+    if id != "wifi-password" || streaming_mode().peek() || wired::online().peek() {
         return false;
     }
     if ev.sym == Keysym::Escape {
