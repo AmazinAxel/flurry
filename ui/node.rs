@@ -163,7 +163,40 @@ pub enum Kind {
     Custom { width: f32, height: f32, key: Option<u64>, paint: Rc<dyn Fn(&mut PixmapMut, Rect, Transform)> },
     /// Clips its child to `max_height`, keeping the child's `center`th child centered in the view
     /// as far as the content's ends allow
-    Scroll { max_height: f32, center: Option<usize> },
+    /// `offset`: how far layout moved the child (logical px, filled in by layout)
+    Scroll { max_height: f32, center: Option<usize>, offset: f32 },
+}
+
+/// One node's own paint, for damage tracking.
+#[derive(Clone, Copy)]
+pub struct Item {
+    /// device rect painted (clipped by its scrolls)
+    pub rect: Rect,
+    /// the same unclipped
+    pub full: Rect,
+    /// how it paints; inside a scroll, independent of how far that scrolled
+    pub hash: u64,
+    /// enclosing outermost scroll, 1-based index into `Items::scrolls` (0: none)
+    pub scroll: u32,
+    /// see `flat_rows`
+    pub flat: Option<(f32, f32)>,
+}
+
+/// An outermost scroll as painted: device clip, offset and horizontal extent of its content.
+#[derive(Clone, Copy)]
+pub struct ScrollItem {
+    pub clip: Rect,
+    pub offset: f32,
+    pub left: f32,
+    pub right: f32,
+    /// holds another scroll (never shifted)
+    pub nested: bool,
+}
+
+#[derive(Default)]
+pub struct Items {
+    pub list: Vec<Item>,
+    pub scrolls: Vec<ScrollItem>,
 }
 
 pub struct Node {
@@ -223,7 +256,7 @@ impl Node {
         Self { children, ..Self::new(Kind::Box { vertical: false, spacing }, style) }
     }
     pub fn scroll(style: Style, max_height: f32, center: Option<usize>, child: Node) -> Self {
-        Self { children: vec![child], ..Self::new(Kind::Scroll { max_height, center }, style) }
+        Self { children: vec![child], ..Self::new(Kind::Scroll { max_height, center, offset: 0.0 }, style) }
     }
     pub fn overlay(style: Style, children: Vec<Node>) -> Self {
         Self { children, ..Self::new(Kind::Overlay, style) }
@@ -594,14 +627,19 @@ impl Node {
             }
             Kind::Scroll { center, .. } => {
                 let center = *center;
+                let mut dy = 0.0;
                 if let Some(c) = self.children.first_mut() {
                     let (_, nat) = c.outer_h(cw);
                     c.allocate(cx, cy, cw, nat);
                     let row = center.and_then(|i| c.children.get(i)).map(|r| r.rect);
                     if let Some(row) = row {
                         let mid = row.y() + row.height() / 2.0 - cy;
-                        c.shift_y(-(mid - ch / 2.0).clamp(0.0, (nat - ch).max(0.0)).round());
+                        dy = -(mid - ch / 2.0).clamp(0.0, (nat - ch).max(0.0)).round();
+                        c.shift_y(dy);
                     }
+                }
+                if let Kind::Scroll { offset, .. } = &mut self.kind {
+                    *offset = dy;
                 }
             }
             _ => {}
@@ -692,33 +730,59 @@ impl Node {
         Some(out)
     }
 
-    /// Everything the tree paints as (device rect, hash of how), node by node. Two frames' lists
-    /// differ exactly where their pixels can, so the difference is the damage.
-    pub fn paint_items(&self, ts: Transform, salt: u64, clip: Option<Rect>, out: &mut Vec<(Rect, u64)>) {
+    /// Everything the tree paints, node by node. Two frames' lists differ exactly where their
+    /// pixels can, so the difference is the damage.
+    pub fn paint_items(&self, ts: Transform, out: &mut Items) {
+        self.items_in(ts, 0, None, 0, 0.0, out);
+    }
+
+    /// `scroll`/`dy`: the enclosing outermost scroll (1-based) and its offset, left out of hashes.
+    fn items_in(&self, ts: Transform, salt: u64, clip: Option<Rect>, scroll: u32, dy: f32, out: &mut Items) {
         if !self.visible {
             return;
         }
         let s = &self.style;
         let salt = if s.opacity < 1.0 { hash(&(salt, s.opacity.to_bits())) } else { salt };
-        if let Some(b) = self.self_bounds().and_then(|b| b.transform(ts))
-            && let Some(b) = clip.map_or(Some(b), |c| vclip(b, c))
+        if let Some(full) = self.self_bounds().and_then(|b| b.transform(ts))
+            && let Some(rect) = clip.map_or(Some(full), |c| vclip(full, c))
         {
-            out.push((b, self.paint_hash(ts, salt)));
+            out.list.push(Item { rect, full, hash: self.paint_hash(ts, salt, dy), scroll, flat: self.flat_rows(ts) });
         }
         let ts = ts.pre_translate(0.0, s.translate_y);
-        let clip = match self.kind {
-            Kind::Scroll { .. } => self.content_rect().transform(ts).and_then(|c| clip.map_or(Some(c), |o| vclip(c, o))),
-            _ => clip,
+        let (clip, scroll, dy) = match self.kind {
+            Kind::Scroll { offset, .. } => {
+                let Some(c) = self.content_rect().transform(ts).and_then(|c| clip.map_or(Some(c), |o| vclip(c, o))) else { return };
+                if scroll == 0 {
+                    let kids = self.children.iter().filter_map(Node::painted_bounds).reduce(union).and_then(|k| k.transform(ts));
+                    let (left, right) = kids.map_or((0.0, 0.0), |k| (k.left(), k.right()));
+                    out.scrolls.push(ScrollItem { clip: c, offset: offset * ts.sy, left, right, nested: false });
+                    (Some(c), out.scrolls.len() as u32, offset)
+                } else {
+                    // a scroll in a scroll: its own offset isn't tracked, so the outer one never shifts pixels
+                    out.scrolls[scroll as usize - 1].nested = true;
+                    (Some(c), scroll, dy)
+                }
+            }
+            _ => (clip, scroll, dy),
         };
-        if matches!(self.kind, Kind::Scroll { .. }) && clip.is_none() {
-            return;
-        }
         for c in &self.children {
-            c.paint_items(ts, salt, clip, out);
+            c.items_in(ts, salt, clip, scroll, dy, out);
         }
     }
 
-    fn paint_hash(&self, ts: Transform, salt: u64) -> u64 {
+    /// Device rows over which each of its columns is one color: a plain box inside its border
+    /// (background, side borders and outline are uniform down a column there).
+    fn flat_rows(&self, ts: Transform) -> Option<(f32, f32)> {
+        let s = &self.style;
+        if !matches!(self.kind, Kind::Box { .. } | Kind::Overlay | Kind::Scroll { .. }) || s.box_shadow.is_some() || ts.kx != 0.0 || ts.ky != 0.0 {
+            return None;
+        }
+        let top = self.rect.top() + s.translate_y + s.border.top;
+        let bottom = self.rect.bottom() + s.translate_y - s.border.bottom;
+        Some((top * ts.sy + ts.ty, bottom * ts.sy + ts.ty))
+    }
+
+    fn paint_hash(&self, ts: Transform, salt: u64, dy: f32) -> u64 {
         use std::hash::{Hash, Hasher};
         thread_local! {
             static CUSTOM: Cell<u64> = const { Cell::new(0) };
@@ -737,7 +801,7 @@ impl Node {
         };
         salt.hash(&mut h);
         f(&mut h, &[ts.sx, ts.sy, ts.kx, ts.ky, ts.tx, ts.ty, s.translate_y]);
-        f(&mut h, &[self.rect.left(), self.rect.top(), self.rect.width(), self.rect.height()]);
+        f(&mut h, &[self.rect.left(), self.rect.top() - dy, self.rect.width(), self.rect.height()]);
         for b in [s.border, s.padding] {
             f(&mut h, &[b.top, b.right, b.bottom, b.left]);
         }
@@ -841,21 +905,18 @@ impl Node {
 
         let clip = matches!(self.kind, Kind::Scroll { .. });
         if clip {
-            // clipped vertically only (the scrolling axis): rows' focus outlines may overhang the sides
-            let kids = self.children.iter().filter_map(Node::painted_bounds).reduce(union);
-            // only the part inside the target (partial repaints)
-            let target = Rect::from_xywh(0.0, 0.0, pm.width() as f32, pm.height() as f32);
-            let visible = kids.and_then(|k| vclip(k, c)).and_then(|r| r.transform(ts)).map(|d| {
-                Rect::from_ltrb(d.left().round(), d.top().round(), d.right().round(), d.bottom().round()).and_then(|d| target.and_then(|t| d.intersect(&t)))
-            });
-            if let Some(Some(d)) = visible
-                && let Some(mut layer) = Pixmap::new(d.width() as u32, d.height() as u32)
-            {
-                let (ox, oy) = (d.left(), d.top());
-                for ch in &self.children {
-                    ch.paint(&mut layer.as_mut(), ts.post_translate(-ox, -oy));
+            // clipped vertically only (the scrolling axis): rows' focus outlines may overhang the sides.
+            // Whole rows of the target are contiguous, so they are a pixmap of their own: the
+            // children paint straight into it, no layer to allocate and composite.
+            if let Some(d) = c.transform(ts) {
+                let (w, h) = (pm.width(), pm.height() as f32);
+                let (y0, y1) = (d.top().round().clamp(0.0, h) as u32, d.bottom().round().clamp(0.0, h) as u32);
+                let rows = &mut pm.data_mut()[(y0 * w * 4) as usize..(y1.max(y0) * w * 4) as usize];
+                if let Some(mut view) = PixmapMut::from_bytes(rows, w, y1.saturating_sub(y0)) {
+                    for ch in &self.children {
+                        ch.paint(&mut view, ts.post_translate(0.0, -(y0 as f32)));
+                    }
                 }
-                blit(pm, layer.as_ref(), ox as i32, oy as i32, 1.0);
             }
         } else {
             for ch in &self.children {
@@ -914,20 +975,18 @@ pub fn fill_rect(pm: &mut PixmapMut, r: Rect, c: Color, ts: Transform) {
     let y1 = ((d.bottom() - 0.5).ceil() as i32).clamp(y0, ph);
     let p = c.premultiply().to_color_u8();
     let src = [p.red(), p.green(), p.blue(), p.alpha()];
-    let inv = 255 - src[3] as u32;
     if src[3] == 0 {
         return;
     }
+    let packed = u32::from_le_bytes(src);
     let data = pm.data_mut();
     for y in y0..y1 {
         let row = &mut data[(y * pw + x0) as usize * 4..(y * pw + x1) as usize * 4];
-        if inv == 0 {
+        if src[3] == 255 {
             row.as_chunks_mut::<4>().0.iter_mut().for_each(|px| *px = src);
         } else {
             for px in row.as_chunks_mut::<4>().0 {
-                for i in 0..4 {
-                    px[i] = (src[i] as u32 + (px[i] as u32 * inv + 127) / 255) as u8;
-                }
+                *px = over(u32::from_le_bytes(*px), packed).to_le_bytes();
             }
         }
     }
@@ -971,7 +1030,7 @@ fn paint_border(pm: &mut PixmapMut, r: Rect, b: Sides, c: [Color; 4], ts: Transf
 /// Finished shadow layers by what they depend on, least recently used dropped past a byte budget
 /// (changing text like the clock would otherwise grow it forever).
 struct LayerCache {
-    map: std::collections::HashMap<u64, (Rc<Pixmap>, u64)>,
+    map: crate::ui::fxhash::FxHashMap<u64, (Rc<Pixmap>, u64)>,
     bytes: usize,
     tick: u64,
     budget: usize,
@@ -1113,26 +1172,39 @@ fn blit_part(pm: &mut PixmapMut, src: tiny_skia::PixmapRef, x: i32, y: i32, (l, 
     }
     let s = src.data();
     let d = pm.data_mut();
-    for row in t..b {
-        let srow = &s[(row * sw + l) as usize * 4..(row * sw + r) as usize * 4];
-        let drow = &mut d[((row + y) * pw + l + x) as usize * 4..((row + y) * pw + r + x) as usize * 4];
-        for (sp, dp) in srow.as_chunks::<4>().0.iter().zip(drow.as_chunks_mut::<4>().0) {
-            let a = sp[3] as u32 * opacity / 255;
-            if a == 0 {
-                continue;
-            }
-            if a == 255 {
-                dp.copy_from_slice(sp);
-                continue;
-            }
-            // premultiplied source-over
-            let inv = 255 - a;
-            for c in 0..4 {
-                let sc = sp[c] as u32 * opacity / 255;
-                dp[c] = (sc + (dp[c] as u32 * inv + 127) / 255) as u8;
+    // branchless per pixel so the loop vectorizes; the opacity test hoisted out of it
+    #[inline(always)]
+    fn rows(s: &[u8], d: &mut [u8], (sw, pw): (i32, i32), (x, y, l, t, r, b): (i32, i32, i32, i32, i32, i32), f: impl Fn(u32) -> u32) {
+        for row in t..b {
+            let srow = &s[(row * sw + l) as usize * 4..(row * sw + r) as usize * 4];
+            let drow = &mut d[((row + y) * pw + l + x) as usize * 4..((row + y) * pw + r + x) as usize * 4];
+            for (sp, dp) in srow.as_chunks::<4>().0.iter().zip(drow.as_chunks_mut::<4>().0) {
+                *dp = over(u32::from_le_bytes(*dp), f(u32::from_le_bytes(*sp))).to_le_bytes();
             }
         }
     }
+    let geo = (x, y, l, t, r, b);
+    if opacity >= 255 {
+        rows(s, d, (sw, pw), geo, |p| p);
+    } else {
+        rows(s, d, (sw, pw), geo, |p| mul_div255(p, opacity));
+    }
+}
+
+/// Each byte of the packed pixel `p` times `k`/255, rounded (two channels per multiply).
+#[inline(always)]
+pub(crate) fn mul_div255(p: u32, k: u32) -> u32 {
+    let rb = (p & 0x00ff_00ff) * k + 0x0080_0080;
+    let rb = ((rb + ((rb >> 8) & 0x00ff_00ff)) >> 8) & 0x00ff_00ff;
+    let ag = ((p >> 8) & 0x00ff_00ff) * k + 0x0080_0080;
+    let ag = (ag + ((ag >> 8) & 0x00ff_00ff)) & 0xff00_ff00;
+    rb | ag
+}
+
+/// Premultiplied source-over of packed RGBA (little-endian: alpha in the top byte).
+#[inline(always)]
+pub(crate) fn over(dst: u32, src: u32) -> u32 {
+    src + mul_div255(dst, 255 - (src >> 24))
 }
 
 pub(crate) fn paint_text_shadow(pm: &mut PixmapMut, layout: &Layout, x: f32, y: f32, s: &Shadow, ts: Transform) {
@@ -1384,3 +1456,25 @@ impl Img {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{mul_div255, over};
+
+    #[test]
+    fn packed_math_matches_per_channel() {
+        for k in 0..=255u32 {
+            for v in 0..=255u32 {
+                let p = v | (255 - v) << 8 | v << 16 | (255 - v) << 24;
+                let want = |c: u32| (c * k + 127) / 255;
+                let got = mul_div255(p, k);
+                for (i, c) in [v, 255 - v, v, 255 - v].into_iter().enumerate() {
+                    assert!((((got >> (8 * i)) & 255) as i32 - want(c) as i32).abs() <= 1);
+                }
+            }
+        }
+        // opaque source replaces, transparent keeps
+        assert_eq!(over(0x1234_5678, 0xff10_2030), 0xff10_2030);
+        assert_eq!(over(0x1234_5678, 0), 0x1234_5678);
+    }
+}

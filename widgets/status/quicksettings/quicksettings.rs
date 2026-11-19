@@ -60,7 +60,10 @@ pub fn slider(base: &Style, id: &str, value: f64, focused: bool) -> Node {
     if focused {
         s = focus_outline(s);
     }
-    Node::new(Kind::Custom { width: 0.0, height: 5.0, key: None, paint }, s).expand(true, false).focusable(id)
+    // what the paint depends on besides its box: repainted only when one changes
+    let colors = [blue2(), light1(), dark1()].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits));
+    let key = Some(hash(&(value.to_bits(), colors)));
+    Node::new(Kind::Custom { width: 0.0, height: 5.0, key, paint }, s).expand(true, false).focusable(id)
 }
 
 pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {

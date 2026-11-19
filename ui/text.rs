@@ -4,6 +4,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+
+use crate::ui::fxhash::FxHashMap;
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::rc::Rc;
 
@@ -110,7 +112,7 @@ struct Face {
     /// has a wght axis (or others): opened once more per weight
     variable: bool,
     /// bounded, dropped by trim_caches
-    outlines: RefCell<HashMap<u32, Option<Rc<Path>>>>,
+    outlines: RefCell<FxHashMap<u32, Option<Rc<Path>>>>,
 }
 
 impl Face {
@@ -439,7 +441,7 @@ thread_local! {
     /// Shaped layouts by a hash of their inputs (the text is kept to rule out collisions): a label is
     /// measured and painted several times per render, and most text is unchanged between renders.
     /// Bounded: when full, entries unused since the previous trim (generation) go.
-    static LAYOUTS: RefCell<HashMap<u64, (String, Rc<Layout>, Cell<u32>)>> = RefCell::default();
+    static LAYOUTS: RefCell<FxHashMap<u64, (String, Rc<Layout>, Cell<u32>)>> = RefCell::default();
     static LAYOUT_GEN: Cell<u32> = const { Cell::new(0) };
     static CHAR_WIDTHS: RefCell<HashMap<(&'static str, u16, u32), f32>> = RefCell::default();
 }
@@ -449,10 +451,10 @@ const LAYOUT_CACHE: usize = 512;
 /// Drops every cached layout, outline, glyph mask and color glyph (nothing on screen needs them
 /// right now).
 pub fn trim_caches() {
-    LAYOUTS.with(|c| *c.borrow_mut() = HashMap::new());
-    FILES.with(|m| m.borrow().values().flatten().for_each(|f| *f.outlines.borrow_mut() = HashMap::new()));
-    GLYPHS.with(|c| *c.borrow_mut() = (HashMap::new(), 0));
-    EMOJI.with(|c| *c.borrow_mut() = HashMap::new());
+    LAYOUTS.with(|c| *c.borrow_mut() = FxHashMap::default());
+    FILES.with(|m| m.borrow().values().flatten().for_each(|f| *f.outlines.borrow_mut() = FxHashMap::default()));
+    GLYPHS.with(|c| *c.borrow_mut() = (FxHashMap::default(), 0));
+    EMOJI.with(|c| *c.borrow_mut() = FxHashMap::default());
 }
 
 /// Lays out `text`; `max_width` triggers wrapping (Wrap::Word) or ellipsizing (`ellipsize`).
@@ -641,7 +643,7 @@ fn ellipsize_line(fam: &Family, font: &Font, line: &mut Line, max: f32) {
 
 thread_local! {
     /// (face, glyph, device px per font unit) -> color bitmap at that size and its offset from the pen
-    static EMOJI: RefCell<HashMap<(usize, u32, u32), Option<Rc<(tiny_skia::Pixmap, f32, f32)>>>> = RefCell::default();
+    static EMOJI: RefCell<FxHashMap<(usize, u32, u32), Option<Rc<(tiny_skia::Pixmap, f32, f32)>>>> = RefCell::default();
 }
 
 /// Draws `layout` with its first baseline at (x, y + ascent), in `color`.
@@ -730,7 +732,7 @@ type GlyphKey = (usize, u32, u32, bool, u8, u8);
 
 thread_local! {
     /// (face, glyph, device scale, embolden, quarter-pixel phase x/y) -> coverage, and the masks' bytes
-    static GLYPHS: RefCell<(HashMap<GlyphKey, Option<Rc<Coverage>>>, usize)> = RefCell::default();
+    static GLYPHS: RefCell<(FxHashMap<GlyphKey, Option<Rc<Coverage>>>, usize)> = RefCell::default();
 }
 
 /// Mask bytes kept before the glyph cache starts over (a few windows' worth of text).
@@ -763,7 +765,7 @@ fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, embold
     let (mw, mh) = (m.mask.width() as i32, m.mask.height() as i32);
     let alpha = m.mask.data();
     let c = color.premultiply().to_color_u8();
-    let (cr, cg, cb, ca) = (c.red() as u32, c.green() as u32, c.blue() as u32, c.alpha() as u32);
+    let packed = u32::from_le_bytes([c.red(), c.green(), c.blue(), c.alpha()]);
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
     let (ox, oy) = (px as i32 + m.x, py as i32 + m.y);
     let (x0, x1) = (ox.max(0), (ox + mw).min(pw));
@@ -772,22 +774,13 @@ fn blit_glyph(pm: &mut tiny_skia::PixmapMut, face: &Rc<Face>, glyph: u32, embold
         return;
     }
     let data = pm.data_mut();
+    use crate::ui::node::{mul_div255, over};
     for y in y0..y1 {
-        let src = &alpha[((y - oy) * mw) as usize..];
-        let row = &mut data[(y * pw) as usize * 4..];
-        for x in x0..x1 {
-            let a = src[(x - ox) as usize] as u32;
-            if a == 0 {
-                continue;
-            }
-            // source-over of premultiplied color * coverage
-            let d = &mut row[x as usize * 4..x as usize * 4 + 4];
-            let sa = ca * a / 255;
-            let inv = 255 - sa;
-            d[0] = ((cr * a / 255) + (d[0] as u32 * inv + 127) / 255) as u8;
-            d[1] = ((cg * a / 255) + (d[1] as u32 * inv + 127) / 255) as u8;
-            d[2] = ((cb * a / 255) + (d[2] as u32 * inv + 127) / 255) as u8;
-            d[3] = (sa + (d[3] as u32 * inv + 127) / 255) as u8;
+        let src = &alpha[((y - oy) * mw + x0 - ox) as usize..((y - oy) * mw + x1 - ox) as usize];
+        let row = &mut data[(y * pw + x0) as usize * 4..(y * pw + x1) as usize * 4];
+        // source-over of premultiplied color * coverage, branchless so it vectorizes
+        for (&a, d) in src.iter().zip(row.as_chunks_mut::<4>().0) {
+            *d = over(u32::from_le_bytes(*d), mul_div255(packed, a as u32)).to_le_bytes();
         }
     }
 }

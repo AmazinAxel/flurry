@@ -1,4 +1,5 @@
 pub mod entry;
+pub mod fxhash;
 pub mod icons;
 pub mod image;
 pub mod node;

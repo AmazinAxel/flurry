@@ -14,7 +14,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use super::shm::{Buffer, ShmImage, new_buffer};
 use super::{Anchor, Ctx, Ev, KeyEvent, Keymode, PointerEvent, SURFACES, Wl, ctx, push, runtime, surface};
-use crate::ui::node::Node;
+use crate::ui::node::{Item, Items, Node, ScrollItem};
 use crate::ui::window::Spec;
 
 thread_local! {
@@ -173,36 +173,169 @@ type PxRect = (u32, u32, u32, u32);
 /// What the last frames painted and where they differed, so a frame repaints only what changed.
 #[derive(Default)]
 struct Damage {
-    items: Vec<(tiny_skia::Rect, u64)>,
+    items: Vec<Item>,
+    scrolls: Vec<ScrollItem>,
     size: (u32, u32),
     frame: u64,
     /// recent frames' damage (None: everything), newest last
     history: std::collections::VecDeque<(u64, Option<Vec<PxRect>>)>,
 }
 
+/// A scrolled region (buffer px) whose pixels move `dy` px down instead of being repainted.
+#[derive(Clone, Copy, Debug)]
+struct Shift {
+    region: PxRect,
+    dy: i32,
+}
+
+/// How a frame differs from the last one: regions to move, then rects to repaint.
+#[derive(Debug)]
+struct Plan {
+    shifts: Vec<Shift>,
+    paint: Vec<PxRect>,
+}
+
+impl Plan {
+    /// Every pixel that changes on screen.
+    fn changed(&self) -> Vec<PxRect> {
+        merge(self.paint.iter().copied().chain(self.shifts.iter().map(|s| s.region)).collect())
+    }
+}
+
+/// `r` grown by `pad` in whole buffer px, inside the buffer.
+fn px_rect(r: tiny_skia::Rect, pad: f32, size: (u32, u32)) -> Option<PxRect> {
+    let x0 = (r.left() - pad).floor().max(0.0) as u32;
+    let y0 = (r.top() - pad).floor().max(0.0) as u32;
+    let x1 = ((r.right() + pad).ceil().max(0.0) as u32).min(size.0);
+    let y1 = ((r.bottom() + pad).ceil().max(0.0) as u32).min(size.1);
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+}
+
+fn intersect(a: PxRect, b: PxRect) -> Option<PxRect> {
+    let (x0, y0) = (a.0.max(b.0), a.1.max(b.1));
+    let (x1, y1) = ((a.0 + a.2).min(b.0 + b.2), (a.1 + a.3).min(b.1 + b.3));
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+}
+
+fn moved(r: tiny_skia::Rect, dy: f32) -> tiny_skia::Rect {
+    tiny_skia::Rect::from_ltrb(r.left(), r.top() + dy, r.right(), r.bottom() + dy).unwrap_or(r)
+}
+
+/// Copies rect `r` of a `pw`-wide frame.
+fn copy_rect(src: &[u8], dst: &mut [u8], pw: u32, (x, y, w, h): PxRect) {
+    let n = w as usize * 4;
+    for row in y..y + h {
+        let at = (row as usize * pw as usize + x as usize) * 4;
+        dst[at..at + n].copy_from_slice(&src[at..at + n]);
+    }
+}
+
+/// Moves the pixels of `s.region` down by `s.dy` (up if negative) within it.
+fn shift(px: &mut [u8], pw: u32, s: &Shift) {
+    let (x, y, w, h) = s.region;
+    let n = w as usize * 4;
+    let at = |row: u32| (row as usize * pw as usize + x as usize) * 4;
+    let d = s.dy.unsigned_abs();
+    if s.dy > 0 {
+        for row in (y + d..y + h).rev() {
+            px.copy_within(at(row - d)..at(row - d) + n, at(row));
+        }
+    } else {
+        for row in y..y + h - d {
+            px.copy_within(at(row + d)..at(row + d) + n, at(row));
+        }
+    }
+}
+
+/// Brings `dst`, holding frame `held`, up to the last frame (copied from `newest`, the buffer
+/// holding that, else repainted) and moves its scrolled regions; returns the rects left to paint
+/// (None: all of it).
+fn prepare(plan: Plan, damage: &Damage, held: u64, newest: Option<&[u8]>, dst: &mut [u8], pw: u32) -> Option<Vec<PxRect>> {
+    let Plan { mut shifts, mut paint } = plan;
+    if held != damage.frame {
+        let stale = damage.since(held);
+        match newest {
+            Some(src) => match stale {
+                Some(rects) => rects.into_iter().for_each(|r| copy_rect(src, dst, pw, r)),
+                None => dst.copy_from_slice(&src[..dst.len()]),
+            },
+            None => {
+                // stale pixels must not be moved: the scrolled regions get repainted too
+                paint.extend(stale?);
+                paint.extend(shifts.drain(..).map(|s| s.region));
+                paint = merge(paint);
+            }
+        }
+    }
+    shifts.iter().for_each(|s| shift(dst, pw, s));
+    Some(paint)
+}
+
 impl Damage {
-    /// Where `items` paints differently from the last frame (None: everything).
-    fn changed(&self, items: &[(tiny_skia::Rect, u64)], size: (u32, u32), scale: i32) -> Option<Vec<PxRect>> {
+    /// How `items` paints differently from the last frame (None: everything). A scroll that only
+    /// moved by whole pixels gets its pixels moved: just what it brings in, and whatever changed
+    /// besides, is repainted.
+    fn plan(&self, items: &Items, size: (u32, u32), scale: i32) -> Option<Plan> {
         if self.frame == 0 || self.size != size {
             return None;
         }
-        let key = |(r, h): &(tiny_skia::Rect, u64)| (r.left().to_bits(), r.top().to_bits(), r.right().to_bits(), r.bottom().to_bits(), *h);
-        let old: std::collections::HashSet<_> = self.items.iter().map(key).collect();
-        let new: std::collections::HashSet<_> = items.iter().map(key).collect();
         // antialiasing and glyph overhang reach slightly past the boxes
         let pad = 2.0 * scale as f32;
-        let mut rects: Vec<PxRect> = vec![];
-        let moved = items.iter().filter(|i| !old.contains(&key(i))).chain(self.items.iter().filter(|i| !new.contains(&key(i))));
-        for (r, _) in moved {
-            let x0 = (r.left() - pad).floor().max(0.0) as u32;
-            let y0 = (r.top() - pad).floor().max(0.0) as u32;
-            let x1 = ((r.right() + pad).ceil().max(0.0) as u32).min(size.0);
-            let y1 = ((r.bottom() + pad).ceil().max(0.0) as u32).min(size.1);
-            if x1 > x0 && y1 > y0 {
-                rects.push((x0, y0, x1 - x0, y1 - y0));
+        let bits = |r: tiny_skia::Rect| [r.left(), r.top(), r.right(), r.bottom()].map(f32::to_bits);
+        let mut shifts: Vec<(u32, Shift)> = vec![];
+        for (i, (new, old)) in items.scrolls.iter().zip(&self.scrolls).enumerate() {
+            let dy = new.offset - old.offset;
+            if new.nested || old.nested || dy == 0.0 || dy.fract() != 0.0 || bits(new.clip) != bits(old.clip) {
+                continue;
+            }
+            // the rows its content layer covers (see Node::paint), the columns either frame's content reached
+            let x0 = new.left.min(old.left).floor().max(0.0) as u32;
+            let x1 = (new.right.max(old.right).ceil().max(0.0) as u32).min(size.0);
+            let y0 = new.clip.top().round().max(0.0) as u32;
+            let y1 = (new.clip.bottom().round().max(0.0) as u32).min(size.1);
+            if x1 <= x0 || y1 <= y0 || dy.abs() as u32 >= y1 - y0 {
+                continue;
+            }
+            let region = (x0, y0, x1 - x0, y1 - y0);
+            if shifts.iter().all(|(_, s)| intersect(s.region, region).is_none()) {
+                shifts.push((i as u32 + 1, Shift { region, dy: dy as i32 }));
             }
         }
-        Some(merge(rects))
+        let shift_of = |scroll: u32| shifts.iter().find(|(k, _)| scroll != 0 && *k == scroll).map(|(_, s)| *s);
+        // in a moving scroll an item is matched where it lands (old ones moved along), by its
+        // unclipped rect (its clipped part changes, the moved pixels carry that); elsewhere as painted
+        let q = |v: f32| (v * 64.0).round() as i32;
+        let key = |it: &Item, dy: f32| match shift_of(it.scroll) {
+            Some(_) => (it.scroll, [q(it.full.left()), q(it.full.top() + dy), q(it.full.right()), q(it.full.bottom() + dy)].map(|v| v as u32), [0; 4], it.hash),
+            None => (0, bits(it.rect), bits(it.full), it.hash),
+        };
+        let old_dy = |it: &Item| shift_of(it.scroll).map_or(0.0, |s| s.dy as f32);
+        let old: crate::ui::fxhash::FxHashSet<_> = self.items.iter().map(|it| key(it, old_dy(it))).collect();
+        let new: crate::ui::fxhash::FxHashSet<_> = items.list.iter().map(|it| key(it, 0.0)).collect();
+        let mut rects: Vec<PxRect> = items.list.iter().filter(|it| !old.contains(&key(it, 0.0))).filter_map(|it| px_rect(it.rect, pad, size)).collect();
+        for it in self.items.iter().filter(|it| !new.contains(&key(it, old_dy(it)))) {
+            rects.extend(match shift_of(it.scroll) {
+                Some(s) => px_rect(moved(it.rect, s.dy as f32), pad, size).and_then(|r| intersect(r, s.region)),
+                None => px_rect(it.rect, pad, size),
+            });
+        }
+        for (k, s) in &shifts {
+            let (x, y, w, h) = s.region;
+            let d = s.dy.unsigned_abs();
+            // the rows moved in from outside the region
+            rects.push(if s.dy > 0 { (x, y, w, d) } else { (x, y + h - d, w, d) });
+            // whatever else paints there moved along: only plain boxes look the same a step away
+            let (top, bottom) = (y as f32, (y + h) as f32);
+            for it in items.list.iter().chain(&self.items).filter(|it| it.scroll != *k) {
+                if it.flat.is_some_and(|(a, b)| a <= top && bottom <= b) {
+                    continue;
+                }
+                for r in [it.rect, moved(it.rect, s.dy as f32)] {
+                    rects.extend(px_rect(r, pad, size).and_then(|r| intersect(r, s.region)));
+                }
+            }
+        }
+        Some(Plan { shifts: shifts.into_iter().map(|(_, s)| s).collect(), paint: merge(rects) })
     }
 
     /// Damage of every frame after `held` (None: unknown, repaint everything).
@@ -225,9 +358,10 @@ impl Damage {
         (next == self.frame + 1).then_some(out)
     }
 
-    fn commit(&mut self, number: u64, items: Vec<(tiny_skia::Rect, u64)>, size: (u32, u32), changed: Option<Vec<PxRect>>) {
+    fn commit(&mut self, number: u64, items: Items, size: (u32, u32), changed: Option<Vec<PxRect>>) {
         self.frame = number;
-        self.items = items;
+        self.items = items.list;
+        self.scrolls = items.scrolls;
         self.size = size;
         self.history.push_back((number, changed));
         while self.history.len() > 4 {
@@ -721,9 +855,10 @@ impl Inner {
 
         let (Some(pw), Some(ph)) = (bw.checked_mul(scale as u32), bh.checked_mul(scale as u32)) else { return };
         let ts = Transform::from_scale(scale as f32, scale as f32).pre_translate(-ox, -oy);
-        let mut items = vec![];
-        node.paint_items(ts, 0, None, &mut items);
-        let changed = self.damage.borrow().changed(&items, (pw, ph), scale);
+        let mut items = Items::default();
+        node.paint_items(ts, &mut items);
+        let plan = self.damage.borrow().plan(&items, (pw, ph), scale);
+        let changed = plan.as_ref().map(Plan::changed);
         if let Some(cb) = self.after_render.borrow().clone() {
             cb(&node);
         }
@@ -749,16 +884,15 @@ impl Inner {
         self.remapped.set(false);
         // ABGR8888 is tiny-skia's premultiplied RGBA byte order: paint straight into the shm buffer
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.0, buf.1) };
-        // the buffer holds frame buf.3: bring it up to date with everything damaged since
-        let repaint = changed.as_ref().and_then(|c| {
-            damage.since(buf.3).map(|mut old| {
-                old.extend(c);
-                merge(old)
-            })
-        });
-        // repainting most of it piecewise costs more (and a scratch that big) than painting it all
+        // the buffer holds frame buf.3: brought up to the last frame (copied from the buffer holding
+        // that, else repainted), scrolled regions moved, then what changed painted
+        let newest = self.buffers.borrow().iter().find(|b| b.frame.get() == damage.frame && b.size == (pw, ph) && b.ptr != buf.0).map(|b| (b.ptr, b.len));
+        // a different mapping, only read: the compositor may still be reading it too
+        let newest = newest.map(|(ptr, len)| unsafe { std::slice::from_raw_parts(ptr as *const u8, len) });
+        let repaint = plan.and_then(|plan| prepare(plan, &damage, buf.3, newest, dst, pw));
+        // painting nearly all of it piecewise costs more (and a scratch that big) than painting it all
         let area = |r: &Vec<PxRect>| r.iter().map(|&(_, _, w, h)| w as u64 * h as u64).sum::<u64>();
-        let repaint = repaint.filter(|r| area(r) * 2 <= pw as u64 * ph as u64);
+        let repaint = repaint.filter(|r| area(r) * 10 <= pw as u64 * ph as u64 * 9);
         match &repaint {
             None => {
                 let Some(mut pm) = PixmapMut::from_bytes(dst, pw, ph) else {
@@ -975,18 +1109,29 @@ mod tests {
     fn partial_repaint_matches_full() {
         let (w, h) = (500, 800);
         let ts = Transform::from_scale(2.0, 2.0);
-        let frames = [(0, None, "a"), (1, None, "a"), (1, None, "b"), (5, Some(5), "b"), (5, Some(5), "b"), (2, Some(5), "c")];
+        // selection moves, scrolls (centered, then clamped at the ends), text changes
+        let frames = [(0, None, "a"), (1, None, "a"), (1, None, "b"), (5, Some(5), "b"), (5, Some(5), "b"), (2, Some(5), "c"), (6, Some(6), "c"), (7, Some(7), "c"), (8, Some(8), "c"), (11, Some(11), "c"), (4, Some(4), "c"), (3, Some(3), "d"), (0, Some(0), "d")];
         let mut damage = Damage::default();
-        let mut buf: Option<tiny_skia::Pixmap> = None;
+        // double buffered like the surface: each frame paints the buffer not shown
+        let mut bufs: [(tiny_skia::Pixmap, u64); 2] = std::array::from_fn(|_| (tiny_skia::Pixmap::new(w, h).unwrap(), 0));
+        let mut shifted = 0;
         for (n, &(sel, center, text)) in frames.iter().enumerate() {
             let mut node = tree(sel, center, text);
             let want = full(&mut node, ts, w, h);
-            let mut items = vec![];
-            node.paint_items(ts, 0, None, &mut items);
-            let changed = damage.changed(&items, (w, h), 2);
-            let mut got = buf.take().unwrap_or_else(|| tiny_skia::Pixmap::new(w, h).unwrap());
-            match &changed {
-                None => got = want.clone(),
+            let mut items = Items::default();
+            node.paint_items(ts, &mut items);
+            let plan = damage.plan(&items, (w, h), 2);
+            let changed = plan.as_ref().map(Plan::changed);
+            if n == 4 {
+                assert_eq!(changed.as_deref(), Some(&[][..]), "unchanged frame has no damage");
+            }
+            shifted += plan.as_ref().map_or(0, |p| p.shifts.len());
+            let [a, b] = &mut bufs;
+            let ((got, held), newest) = if n % 2 == 0 { (a, &*b) } else { (b, &*a) };
+            let newest = (newest.1 == damage.frame).then(|| newest.0.data());
+            let repaint = plan.and_then(|p| prepare(p, &damage, *held, newest, got.data_mut(), w));
+            match &repaint {
+                None => *got = want.clone(),
                 Some(rects) => {
                     for &(x, y, rw, rh) in rects {
                         let mut layer = tiny_skia::Pixmap::new(rw, rh).unwrap();
@@ -999,15 +1144,13 @@ mod tests {
                     }
                 }
             }
-            if n == 4 {
-                assert_eq!(changed.as_deref(), Some(&[][..]), "unchanged frame has no damage");
-            }
             if let Some(i) = got.data().iter().zip(want.data()).position(|(a, b)| a != b) {
-                panic!("frame {n} differs at px {} ({}, {}) got {:?} want {:?} (damage {changed:?})", i / 4, (i / 4) % w as usize, (i / 4) / w as usize, &got.data()[i / 4 * 4..i / 4 * 4 + 4], &want.data()[i / 4 * 4..i / 4 * 4 + 4]);
+                panic!("frame {n} differs at px {} ({}, {}) got {:?} want {:?} (repaint {repaint:?})", i / 4, (i / 4) % w as usize, (i / 4) / w as usize, &got.data()[i / 4 * 4..i / 4 * 4 + 4], &want.data()[i / 4 * 4..i / 4 * 4 + 4]);
             }
+            *held = n as u64 + 1;
             damage.commit(n as u64 + 1, items, (w, h), changed);
-            buf = Some(got);
         }
+        assert!(shifted >= 4, "scrolling moves pixels ({shifted} shifts)");
     }
 
     #[test]
