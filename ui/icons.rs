@@ -8,8 +8,6 @@ use std::sync::OnceLock;
 use tiny_skia::{BlendMode, Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, PathSegment, Pixmap, PixmapMut, PixmapPaint, Point, Stroke, Transform};
 
 const GRID: f32 = 16.0;
-/// Opacity of the unlit parts (signal bands, volume waves), as Adwaita dims them.
-const DIM: f32 = 0.35;
 
 /// One piece of a shape, in grid units. A shape is its fills united, minus its cuts.
 #[derive(Clone, Copy)]
@@ -28,16 +26,11 @@ enum Part {
 use Part::*;
 
 struct Shape {
-    alpha: f32,
     parts: &'static [Part],
 }
 
 const fn lit(parts: &'static [Part]) -> Shape {
-    Shape { alpha: 1.0, parts }
-}
-
-const fn dim(parts: &'static [Part]) -> Shape {
-    Shape { alpha: DIM, parts }
+    Shape { parts }
 }
 
 // Wi-Fi: a dot and two bands fanning up from (8, 13) between 45deg rays, chamfered where arcs would round.
@@ -67,7 +60,7 @@ const BELL: [Part; 3] = [R(7, 1, 2, 2), P(&[(5, 3), (11, 3), (12, 10), (14, 12),
 //   the full 16 width
 // - lines, frames and bars are 2 thick; parts are 1 apart, holes and slits at least 2
 // - diagonals run at 45deg; corners are square, chamfered (never rounded) where a curve would be
-// - unlit parts are DIM; "off" is SLASH over a SLASH_GAP cut
+// - unlit parts are not drawn; "off" is SLASH over a SLASH_GAP cut
 const ICON_COUNT: usize = 29;
 /// Sorted by name: looked up with a binary search.
 static ICONS: [(&str, &[Shape]); ICON_COUNT] = [
@@ -108,11 +101,17 @@ static ICONS: [(&str, &[Shape]); ICON_COUNT] = [
     ("pause", &[lit(&[R(3, 1, 4, 14), R(9, 1, 4, 14)])]),
     ("phone", &[lit(&[R(4, 1, 8, 14), H(6, 3, 4, 8)])]),
     ("play", &[lit(&[P(&[(4, 1), (14, 8), (4, 15)])])]),
-    // a square loop open at the top right, its arrowhead 8 wide pointing up into the opening
-    ("refresh", &[lit(&[L(&[(7, 2), (2, 2), (2, 14), (11, 14), (11, 9)]), P(&[(7, 9), (11, 5), (15, 9)])])]),
+    // a square loop in two halves, each ending in a 6 tall arrowhead along the top or bottom edge
+    // pointing at the start of the other half
+    ("refresh", &[lit(&[
+        L(&[(3, 10), (3, 3), (9, 3)]),
+        P(&[(9, 0), (12, 3), (9, 6)]),
+        L(&[(13, 6), (13, 13), (7, 13)]),
+        P(&[(7, 10), (4, 13), (7, 16)]),
+    ])]),
     ("volume-high", &[lit(&[SPEAKER, WAVE1, WAVE2, WAVE3])]),
-    ("volume-low", &[lit(&[SPEAKER, WAVE1]), dim(&[WAVE2, WAVE3])]),
-    ("volume-medium", &[lit(&[SPEAKER, WAVE1, WAVE2]), dim(&[WAVE3])]),
+    ("volume-low", &[lit(&[SPEAKER, WAVE1])]),
+    ("volume-medium", &[lit(&[SPEAKER, WAVE1, WAVE2])]),
     ("volume-muted", &[lit(&[SPEAKER, L(&[(8, 5), (14, 11)]), L(&[(8, 11), (14, 5)])])]),
     ("volume-over", &[lit(&[
         SPEAKER,
@@ -120,13 +119,13 @@ static ICONS: [(&str, &[Shape]); ICON_COUNT] = [
         L(&[(9, 2), (11, 4), (11, 12), (9, 14)]),
         L(&[(12, 1), (14, 3), (14, 13), (12, 15)]),
     ])]),
-    ("wifi-0", &[dim(&[DOT, BAND1, BAND2])]),
-    ("wifi-1", &[lit(&[DOT]), dim(&[BAND1, BAND2])]),
-    ("wifi-2", &[lit(&[DOT, BAND1]), dim(&[BAND2])]),
+    ("wifi-0", &[]),
+    ("wifi-1", &[lit(&[DOT])]),
+    ("wifi-2", &[lit(&[DOT, BAND1])]),
     ("wifi-3", &[lit(&[DOT, BAND1, BAND2])]),
     // scanning: the ends lit, the middle dim (the levels always light up from the dot)
-    ("wifi-connecting", &[lit(&[DOT, BAND2]), dim(&[BAND1])]),
-    ("wifi-off", &[dim(&[DOT, BAND1, BAND2, SLASH_GAP]), SLASH]),
+    ("wifi-connecting", &[lit(&[DOT, BAND2])]),
+    ("wifi-off", &[SLASH]),
     ("wired", &[lit(&[R(5, 1, 6, 4), R(7, 5, 2, 2), R(3, 7, 10, 2), R(3, 9, 2, 2), R(11, 9, 2, 2), R(1, 11, 6, 4), R(9, 11, 6, 4)])]),
 ];
 
@@ -208,12 +207,10 @@ fn stroke(p: &[(i8, i8)]) -> Contours {
 pub fn draw(pm: &mut PixmapMut, name: &str, size: f32, x: f32, y: f32, color: Color, ts: Transform) {
     let Some(i) = index(name) else { return };
     let t = grid_transform(size, x, y, ts);
-    for (shape, (fills, cuts)) in ICONS[i].1.iter().zip(contours(i)) {
+    for (fills, cuts) in contours(i) {
         let Some(path) = device_path(fills, t) else { continue };
         let mut paint = Paint::default();
-        let mut c = color;
-        c.apply_opacity(shape.alpha);
-        paint.set_color(c);
+        paint.set_color(color);
         paint.anti_alias = true;
         if cuts.is_empty() {
             pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
