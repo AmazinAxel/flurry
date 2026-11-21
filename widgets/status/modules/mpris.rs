@@ -40,7 +40,7 @@ thread_local! {
 }
 
 global_state! {
-    /// (title, artist) of the playing player, else of any player with a track loaded.
+    /// (title, artist) of the playing player (spotify first), else of any player with a track loaded.
     pub fn track() -> Option<(String, String)> = None;
     /// Volume of that player.
     pub fn volume() -> Option<f64> = None;
@@ -49,7 +49,9 @@ global_state! {
 fn publish() {
     let best = PLAYERS.with(|p| {
         let p = p.borrow();
-        let best = p.iter().filter(|(_, pl)| !pl.title.is_empty()).min_by(|a, b| b.1.playing.cmp(&a.1.playing).then(a.0.cmp(b.0)));
+        // playing first, spotify first among equals (so its volume stays under the scroll)
+        let key = |(n, pl): (&String, &Player)| (!pl.playing, !n.ends_with(".spotify"));
+        let best = p.iter().filter(|(_, pl)| !pl.title.is_empty()).min_by(|a, b| key(*a).cmp(&key(*b)).then(a.0.cmp(b.0)));
         best.map(|(n, pl)| (n.clone(), (pl.title.clone(), pl.artist.clone()), pl.volume))
     });
     volume().set(best.as_ref().and_then(|b| b.2));
