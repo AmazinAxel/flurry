@@ -49,11 +49,12 @@ const BAND2: Part = P(&[(0, 5), (3, 2), (13, 2), (16, 5), (14, 7), (12, 5), (4, 
 const SLASH: Shape = lit(&[L(&[(2, 2), (14, 14)])]);
 const SLASH_GAP: Part = Q(&[(-1, 2), (2, -1), (17, 14), (14, 17)]);
 
-// Volume: speaker and three waves, each wave as tall as the one before plus 4.
+// Volume: speaker and three arcs, each chamfered back toward the speaker at 45deg, each as tall as
+// the one before plus 4.
 const SPEAKER: Part = P(&[(1, 5), (3, 5), (6, 2), (6, 14), (3, 11), (1, 11)]);
-const WAVE1: Part = R(7, 6, 2, 4);
-const WAVE2: Part = R(10, 4, 2, 8);
-const WAVE3: Part = R(13, 2, 2, 12);
+const WAVE1: Part = P(&[(7, 5), (8, 5), (9, 6), (9, 10), (8, 11), (7, 11)]);
+const WAVE2: Part = L(&[(9, 3), (11, 5), (11, 11), (9, 13)]);
+const WAVE3: Part = L(&[(12, 2), (14, 4), (14, 12), (12, 14)]);
 
 // Bluetooth rune.
 const RUNE: Part = L(&[(5, 5), (11, 11), (8, 14), (8, 2), (11, 5), (5, 11)]);
@@ -107,12 +108,18 @@ static ICONS: [(&str, &[Shape]); ICON_COUNT] = [
     ("pause", &[lit(&[R(3, 1, 4, 14), R(9, 1, 4, 14)])]),
     ("phone", &[lit(&[R(4, 1, 8, 14), H(6, 3, 4, 8)])]),
     ("play", &[lit(&[P(&[(4, 1), (14, 8), (4, 15)])])]),
-    ("refresh", &[lit(&[L(&[(7, 2), (5, 2), (2, 5), (2, 11), (5, 14), (9, 14), (12, 11), (12, 8)]), P(&[(9, 8), (12, 5), (15, 8)])])]),
+    // a square loop open at the top right, its arrowhead 8 wide pointing up into the opening
+    ("refresh", &[lit(&[L(&[(7, 2), (2, 2), (2, 14), (11, 14), (11, 9)]), P(&[(7, 9), (11, 5), (15, 9)])])]),
     ("volume-high", &[lit(&[SPEAKER, WAVE1, WAVE2, WAVE3])]),
     ("volume-low", &[lit(&[SPEAKER, WAVE1]), dim(&[WAVE2, WAVE3])]),
     ("volume-medium", &[lit(&[SPEAKER, WAVE1, WAVE2]), dim(&[WAVE3])]),
     ("volume-muted", &[lit(&[SPEAKER, L(&[(8, 5), (14, 11)]), L(&[(8, 11), (14, 5)])])]),
-    ("volume-over", &[lit(&[SPEAKER, R(7, 5, 2, 6), R(10, 3, 2, 10), R(13, 1, 2, 14)])]),
+    ("volume-over", &[lit(&[
+        SPEAKER,
+        P(&[(7, 4), (8, 4), (9, 5), (9, 11), (8, 12), (7, 12)]),
+        L(&[(9, 2), (11, 4), (11, 12), (9, 14)]),
+        L(&[(12, 1), (14, 3), (14, 13), (12, 15)]),
+    ])]),
     ("wifi-0", &[dim(&[DOT, BAND1, BAND2])]),
     ("wifi-1", &[lit(&[DOT]), dim(&[BAND1, BAND2])]),
     ("wifi-2", &[lit(&[DOT, BAND1]), dim(&[BAND2])]),

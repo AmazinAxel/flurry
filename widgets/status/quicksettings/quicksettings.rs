@@ -69,12 +69,12 @@ pub fn slider(base: &Style, id: &str, value: f64, focused: bool) -> Node {
 pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
     let vol = audio::default_speaker().map(|s| s.volume).unwrap_or(0.0);
     let mut rows = vec![Node::hbox(base.inherit(), 0.0, vec![
-        Node::icon(base.inherit(), volume_icon(), 22.0).align(Align::Fill, Align::Center),
+        Node::icon(base.inherit(), volume_icon(), 32.0).align(Align::Fill, Align::Center),
         slider(base, "volume", vol, focus == Some("volume")),
     ])];
     if brightness::available() {
         rows.push(Node::hbox(base.inherit(), 0.0, vec![
-            Node::icon(base.inherit(), "brightness", 22.0).align(Align::Fill, Align::Center),
+            Node::icon(base.inherit(), "brightness", 32.0).align(Align::Fill, Align::Center),
             slider(base, "brightness", brightness().peek(), focus == Some("brightness")),
         ]));
     }
@@ -91,7 +91,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             let mut check = s.inherit();
             check.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
             Node::hbox(s.clone(), 0.0, vec![
-                Node::icon(check, "check", 19.0).show(is_sel),
+                Node::icon(check, "check", 32.0).show(is_sel),
                 Node::label(s.inherit(), name_substitute(&sp.description)).xalign(0.0).expand(true, false).ellipsize(),
             ])
             .focusable(id)
