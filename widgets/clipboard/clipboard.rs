@@ -269,7 +269,7 @@ fn item_node(base: &Style, item: &Item, row: &Style) -> Node {
                 let mut kids = vec![pic];
                 if item.video {
                     let ps = Style { background: Some(rgba(0, 0, 0, 0.5)), padding: Sides::all(SPACE_M), color: tiny_skia::Color::WHITE, ..base.inherit() };
-                    kids.push(Node::icon(ps, "media-playback-start-symbolic", 42.0).align(Align::Center, Align::Center));
+                    kids.push(Node::icon(ps, "play", 42.0).align(Align::Center, Align::Center));
                 }
                 Node::overlay(s, kids).size(w, h).align(Align::Center, Align::Center)
             }

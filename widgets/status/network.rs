@@ -21,13 +21,7 @@ use crate::ui::runtime;
 use crate::ui::state::global_state;
 use crate::ui::wayland::KeyEvent;
 
-const LEVEL_ICONS: [&str; 5] = [
-    "network-wireless-signal-none-symbolic",
-    "network-wireless-signal-weak-symbolic",
-    "network-wireless-signal-ok-symbolic",
-    "network-wireless-signal-good-symbolic",
-    "network-wireless-signal-excellent-symbolic",
-];
+const LEVEL_ICONS: [&str; 4] = ["wifi-0", "wifi-1", "wifi-2", "wifi-3"];
 
 #[derive(Clone, PartialEq)]
 struct WifiNet {
@@ -73,7 +67,7 @@ fn shown() -> Vec<(String, WifiNet)> {
 
 /// Signal is in 100*dBm units from iwd
 fn sig_level(mbm: i64) -> usize {
-    [-5000, -6500, -7500, -8500].iter().position(|t| mbm >= *t).map_or(0, |i| 4 - i)
+    [-6000, -7500, -8500].iter().position(|t| mbm >= *t).map_or(0, |i| 3 - i)
 }
 
 fn row_id(path: &str) -> String {
@@ -267,7 +261,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
     for (path, net) in shown() {
         let id = row_id(&path);
         let s = aside_row(base, path == conn && path != joining, path == joining, focus == Some(id.as_str()));
-        let lock = if net.security != "open" { Trailing::Icon("network-wireless-encrypted-symbolic") } else { Trailing::None };
+        let lock = if net.security != "open" { Trailing::Icon("lock") } else { Trailing::None };
         rows.push(device_row(s, id, LEVEL_ICONS[net.level], net.ssid, lock));
         if let Some((p, e)) = &pw
             && *p == path
@@ -277,7 +271,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
             rows.push(entry);
         }
     }
-    let icon = if on { "network-wireless-symbolic" } else { "network-wireless-offline-symbolic" };
+    let icon = if on { "wifi-3" } else { "wifi-off" };
     device_menu(DeviceMenu { base, powered: on, power_icon: icon, scanning: iwd::scanning().peek(), focus, rows })
 }
 
@@ -369,9 +363,9 @@ pub fn key(id: &str, ev: &KeyEvent) -> bool {
 mod tests {
     #[test]
     fn signal_levels() {
-        assert_eq!(super::sig_level(-4000), 4);
-        assert_eq!(super::sig_level(-5000), 4);
+        assert_eq!(super::sig_level(-4000), 3);
         assert_eq!(super::sig_level(-6000), 3);
+        assert_eq!(super::sig_level(-7000), 2);
         assert_eq!(super::sig_level(-7500), 2);
         assert_eq!(super::sig_level(-8000), 1);
         assert_eq!(super::sig_level(-9000), 0);

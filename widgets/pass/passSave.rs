@@ -146,7 +146,7 @@ pub fn pass_save() {
                 plain_entry(&base, &user, "user"),
                 Node::hbox(base.inherit(), SPACE_S, vec![
                     plain_entry(&base, &pass, "pass"),
-                    Node::icon(icon, "dialog-password-symbolic", 16.0).align(Align::Fill, Align::Center),
+                    Node::icon(icon, "key", 16.0).align(Align::Fill, Align::Center),
                 ]),
             ]);
             let header = Node::label(header_style(&base), "Password");

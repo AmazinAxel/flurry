@@ -24,9 +24,6 @@ pipewire = { version = "0.8", default-features = false }
 zune-jpeg = { version = "0.4", default-features = false, features = ["std"] }
 png = "0.17"
 
-[build-dependencies]
-usvg = { version = "0.45", default-features = false }
-
 [profile.release]
 lto = true
 codegen-units = 1

@@ -59,7 +59,7 @@ pub fn osd() {
     SHOW.with(|f| *f.borrow_mut() = Some(show.clone()));
     let b = brightness();
     let s1 = show.clone();
-    b.subscribe(move || s1("display-brightness-symbolic", brightness().peek()));
+    b.subscribe(move || s1("brightness", brightness().peek()));
 
     // volume/mute changes and default speaker switches, after the first sync; a default that is
     // briefly unknown (new sink not bound yet) keeps the last one so the switch still shows

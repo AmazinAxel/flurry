@@ -20,7 +20,7 @@ const CAP: f32 = 10.0;
 const STEP: f64 = 0.05;
 
 fn volume_icon() -> &'static str {
-    audio::default_speaker().map(|s| s.volume_icon()).unwrap_or("audio-volume-muted-symbolic")
+    audio::default_speaker().map(|s| s.volume_icon()).unwrap_or("volume-muted")
 }
 
 /// `window scale` look: trough @light1 5px with the 10px end caps as shadows, @blue2 highlight,
@@ -74,7 +74,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
     ])];
     if brightness::available() {
         rows.push(Node::hbox(base.inherit(), 0.0, vec![
-            Node::icon(base.inherit(), "display-brightness-symbolic", 22.0).align(Align::Fill, Align::Center),
+            Node::icon(base.inherit(), "brightness", 22.0).align(Align::Fill, Align::Center),
             slider(base, "brightness", brightness().peek(), focus == Some("brightness")),
         ]));
     }
@@ -91,7 +91,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             let mut check = s.inherit();
             check.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
             Node::hbox(s.clone(), 0.0, vec![
-                Node::icon(check, "emblem-default-symbolic", 19.0).show(is_sel),
+                Node::icon(check, "check", 19.0).show(is_sel),
                 Node::label(s.inherit(), name_substitute(&sp.description)).xalign(0.0).expand(true, false).ellipsize(),
             ])
             .focusable(id)

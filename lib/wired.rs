@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::ui::runtime;
 use crate::ui::state::global_state;
 
-pub const WIRED_ICON: &str = "network-wired-symbolic";
+pub const WIRED_ICON: &str = "wired";
 
 global_state! {
     /// A wired link is up and carries a default route (false while it is still getting an address).

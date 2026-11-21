@@ -154,7 +154,14 @@ pub fn start() {
 }
 
 fn icon(d: &Device) -> &'static str {
-    crate::ui::icons::find(&format!("{}-symbolic", d.icon)).unwrap_or("bluetooth-symbolic")
+    // BlueZ's freedesktop icon names
+    match d.icon.as_str() {
+        "audio-headphones" | "audio-headset" => "headphones",
+        "input-keyboard" => "keyboard",
+        "input-mouse" => "mouse",
+        "phone" => "phone",
+        _ => "bluetooth",
+    }
 }
 
 pub fn menu(base: &Style, focus: Option<&str>) -> Node {
@@ -169,7 +176,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
             // gone once the device is paired, unless it still waits for an answer
             let pairing = b.pairing.as_ref().filter(|p| p.device == d.path && (!d.paired || p.confirm));
             let trailing = match pairing {
-                Some(p) if p.code.is_empty() => Trailing::Icon("dialog-password-symbolic"),
+                Some(p) if p.code.is_empty() => Trailing::Icon("key"),
                 Some(p) => Trailing::Label(p.code.clone()),
                 _ if d.connected && d.battery >= 0.0 => Trailing::Label(format!("{}%", (d.battery * 100.0).round() as i64)),
                 _ => Trailing::None,
@@ -180,7 +187,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
     device_menu(DeviceMenu {
         base,
         powered: b.powered(),
-        power_icon: "bluetooth-active-symbolic",
+        power_icon: "bluetooth-on",
         scanning: b.discovering(),
         focus,
         rows,

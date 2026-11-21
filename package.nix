@@ -145,7 +145,7 @@ in rustPlatform.buildRustPackage {
   version = "0.1.0";
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./build.rs ./icons ./app.rs ./settings.rs ./lib ./ui ./widgets ./sideview/src/claude.rs ];
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./build.rs ./app.rs ./settings.rs ./lib ./ui ./widgets ./sideview/src/claude.rs ];
   };
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false; # tests run in the dev shell; skipping them saves a second LTO compile per rebuild

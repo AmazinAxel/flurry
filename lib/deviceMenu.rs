@@ -103,7 +103,7 @@ pub fn device_menu(m: DeviceMenu) -> Node {
         .align(if m.powered { Align::Start } else { Align::Center }, Align::Fill)
         .focusable("power");
     let scan = aside_button(base, m.scanning, false, m.focus == Some("scan"));
-    let scan_btn = Node::hbox(scan.clone(), 0.0, vec![Node::icon(scan.inherit(), "view-refresh-symbolic", 16.0)]).show(m.powered).focusable("scan");
+    let scan_btn = Node::hbox(scan.clone(), 0.0, vec![Node::icon(scan.inherit(), "refresh", 16.0)]).show(m.powered).focusable("scan");
     let center = m.focus.and_then(|f| m.rows.iter().position(|r| r.id.as_deref() == Some(f)));
     // SPACE_M + SPACE_S from the separator to a focused row's outline, which stays inside the clip
     let list = Node::vbox(Style { padding: Sides::trbl(SPACE_S + BORDER, 0.0, 0.0, 0.0), ..base.inherit() }, 0.0, m.rows);

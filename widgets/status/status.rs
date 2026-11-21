@@ -61,7 +61,7 @@ fn media(base: &Style, focus: Option<&str>) -> Node {
     let bar = Style { min_height: info(" ".into(), " ".into()).measure_h(f32::MAX).1, ..base.inherit() };
     // the volume bar overlays the card's bottom edge, above its border, so the card keeps its size
     let card = Style { background: Some(playlist), margin: Sides::vh(SPACE_M, 0.0), ..base.inherit() }.border(Sides::all(BORDER), lighter(playlist));
-    let icon = if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" };
+    let icon = if playing { "pause" } else { "play" };
     let mut btn_style = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
     if focus == Some("mediaBtn") {
         btn_style = focus_outline(btn_style);

@@ -22,7 +22,7 @@ pub fn record_menu() {
             let img = hs.inherit();
             let mut label = hs.inherit();
             label.font.size = 35.0;
-            let mic = if rec_mic().peek() { "audio-input-microphone-symbolic" } else { "microphone-disabled-symbolic" };
+            let mic = if rec_mic().peek() { "mic" } else { "mic-off" };
             let header = Node::hbox(hs.inherit(), SPACE_M, vec![Node::icon(img, mic, 32.0), Node::label(label, rec_quality().peek())])
                 .expand(true, true)
                 .align(Align::Center, Align::Center);

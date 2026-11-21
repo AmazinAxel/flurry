@@ -67,15 +67,15 @@ impl Sink {
 
     pub fn volume_icon(&self) -> &'static str {
         if self.mute || self.volume == 0.0 {
-            "audio-volume-muted-symbolic"
+            "volume-muted"
         } else if self.volume <= 0.33 {
-            "audio-volume-low-symbolic"
+            "volume-low"
         } else if self.volume <= 0.66 {
-            "audio-volume-medium-symbolic"
+            "volume-medium"
         } else if self.volume <= 1.0 {
-            "audio-volume-high-symbolic"
+            "volume-high"
         } else {
-            "audio-volume-overamplified-symbolic"
+            "volume-over"
         }
     }
 }
