@@ -39,7 +39,7 @@ pub fn status(base: &Style) -> Node {
     // recording: a plain red square in an icon-sized slot
     let mut rec = base.inherit();
     rec.background = Some(red());
-    let rec = Node::hbox(rec, 0.0, vec![]).size(18.0, 18.0).align(Align::Center, Align::Center);
+    let rec = Node::hbox(rec, 0.0, vec![]).size(18.0, 18.0).align(Align::Center, Align::Center).expand(true, false);
 
     // one evenly spaced column, centered on the row whatever is shown
     Node::vbox(base.inherit(), SPACE_M, vec![
