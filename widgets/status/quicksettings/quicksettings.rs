@@ -7,7 +7,7 @@ use xkbcommon::xkb::Keysym;
 
 use crate::lib::audio;
 use crate::lib::brightness::{self, brightness, set_brightness};
-use crate::lib::deviceMenu::{aside_row, separator};
+use crate::lib::deviceMenu::{Trailing, aside_row, device_row, separator};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash, rgba};
 use crate::ui::wayland::KeyEvent;
@@ -88,13 +88,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             if !is_sel {
                 s.background = Some(rgba(255, 255, 255, 0.08));
             }
-            let mut check = s.inherit();
-            check.margin = Sides::trbl(0.0, SPACE_M, 0.0, 0.0);
-            Node::hbox(s.clone(), 0.0, vec![
-                Node::icon(check, "check", 32.0).show(is_sel),
-                Node::label(s.inherit(), name_substitute(&sp.description)).xalign(0.0).expand(true, false).ellipsize(),
-            ])
-            .focusable(id)
+            device_row(s, id, is_sel.then_some("check"), name_substitute(&sp.description), Trailing::None)
         })
         .collect();
     // same gaps around the separator as the device menus; the knob's tip stops 5px into the slider's padding

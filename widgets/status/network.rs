@@ -262,7 +262,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
         let id = row_id(&path);
         let s = aside_row(base, path == conn && path != joining, path == joining, focus == Some(id.as_str()));
         let lock = if net.security != "open" { Trailing::Icon("lock") } else { Trailing::None };
-        rows.push(device_row(s, id, LEVEL_ICONS[net.level], net.ssid, lock));
+        rows.push(device_row(s, id, Some(LEVEL_ICONS[net.level]),net.ssid, lock));
         if let Some((p, e)) = &pw
             && *p == path
         {

@@ -44,9 +44,10 @@ pub enum Trailing {
     Label(String),
 }
 
-/// Icon, name and trailing part on one row, focusable as `id`.
-pub fn device_row(s: Style, id: String, icon: &'static str, name: String, trailing: Trailing) -> Node {
-    let mut kids = vec![Node::icon(s.inherit(), icon, 16.0), Node::label(s.inherit(), name).xalign(0.0).expand(true, false).ellipsize()];
+/// Icon (if any), name and trailing part on one row, focusable as `id`.
+pub fn device_row(s: Style, id: String, icon: Option<&'static str>, name: String, trailing: Trailing) -> Node {
+    let mut kids: Vec<Node> = icon.map(|i| Node::icon(s.inherit(), i, 16.0)).into_iter().collect();
+    kids.push(Node::label(s.inherit(), name).xalign(0.0).expand(true, false).ellipsize());
     match trailing {
         Trailing::None => {}
         Trailing::Icon(i) => kids.push(Node::icon(s.inherit(), i, 16.0)),

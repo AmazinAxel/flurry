@@ -29,6 +29,7 @@ pub fn battery_percent(base: &Style) -> Node {
         return img(base, "battery-full").show(has);
     }
     let mut pct_style = base.inherit();
+    pct_style.font.family = IOSEVKA;
     pct_style.font.size = 24.0;
     pct_style.font.weight = 700;
     pct_style.color = if b.charging() { green() } else { alpha(blue1(), 0.9) };

@@ -181,7 +181,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
                 _ if d.connected && d.battery >= 0.0 => Trailing::Label(format!("{}%", (d.battery * 100.0).round() as i64)),
                 _ => Trailing::None,
             };
-            device_row(s, id, icon(d), name_substitute(&d.alias), trailing)
+            device_row(s, id, Some(icon(d)),name_substitute(&d.alias), trailing)
         })
         .collect();
     device_menu(DeviceMenu {
