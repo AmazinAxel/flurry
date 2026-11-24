@@ -88,7 +88,7 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
             if !is_sel {
                 s.background = Some(rgba(255, 255, 255, 0.08));
             }
-            device_row(s, id, is_sel.then_some("check"), name_substitute(&sp.description), Trailing::None)
+            device_row(s, id, None, name_substitute(&sp.description), Trailing::None)
         })
         .collect();
     // same gaps around the separator as the device menus; the knob's tip stops 5px into the slider's padding

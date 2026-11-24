@@ -157,6 +157,7 @@ fn icon(d: &Device) -> &'static str {
     // BlueZ's freedesktop icon names
     match d.icon.as_str() {
         "audio-headphones" | "audio-headset" => "headphones",
+        "audio-card" => "speaker",
         "input-keyboard" => "keyboard",
         "input-mouse" => "mouse",
         "phone" => "phone",
@@ -172,12 +173,11 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
         .map(|d| {
             let id = row_id(d);
             let s = aside_row(base, d.connected && !d.connecting, d.connecting, focus == Some(id.as_str()));
-            // a pairing code takes the battery's place (an authorization has no code: a key icon);
+            // a pairing code takes the battery's place (an authorization has no code: nothing);
             // gone once the device is paired, unless it still waits for an answer
             let pairing = b.pairing.as_ref().filter(|p| p.device == d.path && (!d.paired || p.confirm));
             let trailing = match pairing {
-                Some(p) if p.code.is_empty() => Trailing::Icon("key"),
-                Some(p) => Trailing::Label(p.code.clone()),
+                Some(p) if !p.code.is_empty() => Trailing::Label(p.code.clone()),
                 _ if d.connected && d.battery >= 0.0 => Trailing::Label(format!("{}%", (d.battery * 100.0).round() as i64)),
                 _ => Trailing::None,
             };

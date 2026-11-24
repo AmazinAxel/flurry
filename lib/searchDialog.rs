@@ -32,11 +32,16 @@ pub fn search_entry(base: &Style, entry: &EntryRef) -> Node {
 
 /// Graphite `entry` (passSave fields, wifi password) with flurry's square corners.
 pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str) -> Node {
+    plain_entry_bordered(base, e, id, dark4())
+}
+
+/// `plain_entry` with another border color.
+pub fn plain_entry_bordered(base: &Style, e: &EntryRef, id: &'static str, border: tiny_skia::Color) -> Node {
     let mut s = base.inherit();
     s.min_height = 36.0;
     s.padding = Sides::vh(0.0, SPACE_M);
     s.background = Some(rgba(255, 255, 255, 0.04));
-    s = s.border(Sides::all(BORDER), dark4());
+    s = s.border(Sides::all(BORDER), border);
     // Graphite entry text; :focus-within never matches (GTK does not consider layer windows active)
     s.color = rgba(255, 255, 255, 0.7);
     Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look(&s))]).focusable(id).expand(true, false)

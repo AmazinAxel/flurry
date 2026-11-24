@@ -9,10 +9,10 @@ use crate::lib::inputControl::{EntryBinding, Opts, input_control};
 use crate::lib::notifySend::notify_send;
 use crate::lib::process::{exec, output};
 use crate::lib::random::Rng;
-use crate::lib::searchDialog::plain_entry;
+use crate::lib::searchDialog::{plain_entry, plain_entry_bordered};
 use crate::lib::style::*;
 use crate::ui::entry::{self, wipe};
-use crate::ui::node::{Align, Node, Sides};
+use crate::ui::node::{Align, Node};
 use crate::ui::state::global_state;
 use crate::ui::{runtime, window};
 
@@ -138,16 +138,10 @@ pub fn pass_save() {
         move |_: Option<&str>| {
             let base = window();
             let generated = generated().peek();
-            let mut icon = base.inherit();
-            icon.color = if generated { blue2() } else { dark4() };
-            icon.margin = Sides::trbl(0.0, SPACE_S, 0.0, 0.0);
             let content = Node::vbox(base.inherit(), SPACE_S, vec![
                 plain_entry(&base, &site, "site"),
                 plain_entry(&base, &user, "user"),
-                Node::hbox(base.inherit(), SPACE_S, vec![
-                    plain_entry(&base, &pass, "pass"),
-                    Node::icon(icon, "key", 16.0).align(Align::Fill, Align::Center),
-                ]),
+                plain_entry_bordered(&base, &pass, "pass", if generated { blue2() } else { dark4() }),
             ]);
             let header = Node::label(header_style(&base), "Password");
             Node::hbox(base.inherit(), 0.0, vec![background_section(&base, header, Some(content), 300.0, 400.0)]).align(Align::Center, Align::Center)
