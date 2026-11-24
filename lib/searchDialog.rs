@@ -27,16 +27,16 @@ pub fn search_entry(base: &Style, entry: &EntryRef) -> Node {
     s.font.size = 24.0;
     s.padding = Sides::trbl(0.0, SPACE_M, 0.0, SPACE_L);
     s.min_height = 36.0;
-    Node::hbox(s.clone(), 0.0, vec![entry::text_node(entry, s.inherit(), look(&s))]).focusable("entry")
+    Node::hbox(s.clone(), 0.0, vec![entry::text_node(entry, s.inherit(), look(&s, true))]).focusable("entry")
 }
 
 /// Graphite `entry` (passSave fields, wifi password) with flurry's square corners.
-pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str) -> Node {
-    plain_entry_bordered(base, e, id, dark4())
+pub fn plain_entry(base: &Style, e: &EntryRef, id: &'static str, focused: bool) -> Node {
+    plain_entry_bordered(base, e, id, dark4(), focused)
 }
 
 /// `plain_entry` with another border color.
-pub fn plain_entry_bordered(base: &Style, e: &EntryRef, id: &'static str, border: tiny_skia::Color) -> Node {
+pub fn plain_entry_bordered(base: &Style, e: &EntryRef, id: &'static str, border: tiny_skia::Color, focused: bool) -> Node {
     let mut s = base.inherit();
     s.min_height = 36.0;
     s.padding = Sides::vh(0.0, SPACE_M);
@@ -44,12 +44,12 @@ pub fn plain_entry_bordered(base: &Style, e: &EntryRef, id: &'static str, border
     s = s.border(Sides::all(BORDER), border);
     // Graphite entry text; :focus-within never matches (GTK does not consider layer windows active)
     s.color = rgba(255, 255, 255, 0.7);
-    Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look(&s))]).focusable(id).expand(true, false)
+    Node::hbox(s.clone(), 0.0, vec![entry::text_node(e, s.inherit(), look(&s, focused))]).focusable(id).expand(true, false)
 }
 
-/// Entry text in the style's color, with the Graphite selection.
-fn look(s: &Style) -> Look {
-    Look { color: s.color, placeholder: s.color, selection_bg: crate::ui::node::hex(0xdbdee5), selection_fg: rgba(0, 0, 0, 0.87), caret: false }
+/// Entry text in the style's color, with the Graphite selection; the caret while typing goes there.
+fn look(s: &Style, caret: bool) -> Look {
+    Look { color: s.color, placeholder: s.color, selection_bg: crate::ui::node::hex(0xdbdee5), selection_fg: rgba(0, 0, 0, 0.87), caret }
 }
 
 /// `.searchableDialog button` row, selected/disabled states.

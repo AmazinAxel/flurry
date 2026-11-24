@@ -266,7 +266,7 @@ pub fn menu(base: &Style, focus: Option<&str>) -> Node {
         if let Some((p, e)) = &pw
             && *p == path
         {
-            let mut entry = plain_entry(base, e, "wifi-password");
+            let mut entry = plain_entry(base, e, "wifi-password", focus == Some("wifi-password"));
             entry.style.margin = Sides::all(SPACE_S);
             rows.push(entry);
         }

@@ -135,13 +135,13 @@ pub fn pass_save() {
 
     let build = {
         let (site, user, pass) = (site.clone(), user.clone(), pass.clone());
-        move |_: Option<&str>| {
+        move |focus: Option<&str>| {
             let base = window();
             let generated = generated().peek();
             let content = Node::vbox(base.inherit(), SPACE_S, vec![
-                plain_entry(&base, &site, "site"),
-                plain_entry(&base, &user, "user"),
-                plain_entry_bordered(&base, &pass, "pass", if generated { blue2() } else { dark4() }),
+                plain_entry(&base, &site, "site", focus == Some("site")),
+                plain_entry(&base, &user, "user", focus == Some("user")),
+                plain_entry_bordered(&base, &pass, "pass", if generated { blue2() } else { dark4() }, focus == Some("pass")),
             ]);
             let header = Node::label(header_style(&base), "Password");
             Node::hbox(base.inherit(), 0.0, vec![background_section(&base, header, Some(content), 300.0, 400.0)]).align(Align::Center, Align::Center)
