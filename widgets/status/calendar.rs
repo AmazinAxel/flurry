@@ -86,13 +86,17 @@ pub fn calendar(base: &Style) -> Node {
     let mut cal = frosted(base.inherit());
     cal.min_width = 0.0;
     cal.background = None;
-    let cell = Style { padding: Sides::all(SPACE_M - BORDER), ..cal.inherit() }.border(Sides::all(BORDER), tiny_skia::Color::TRANSPARENT);
+    // digits sit high in their line box (descender room below): 1px of the bottom padding moves on top
+    let pad = SPACE_M - BORDER;
+    let cell = Style { padding: Sides { top: pad + 1.0, bottom: pad - 1.0, ..Sides::all(pad) }, ..cal.inherit() }.border(Sides::all(BORDER), tiny_skia::Color::TRANSPARENT);
 
-    // "October 2026", left-aligned
+    // "October 2026", centered, bold
     let mut header = cal.inherit();
     header.padding = Sides::vh(SPACE_S, SPACE_M);
     header.min_height = 36.0;
-    let title = Node::label(header.inherit(), day_format(first, "%B %Y")).xalign(0.0).expand(true, false).align(Align::Fill, Align::Center);
+    header.font.size = 20.0;
+    header.font.weight = 700;
+    let title = Node::label(header.inherit(), day_format(first, "%B %Y")).xalign(0.5).expand(true, false).align(Align::Fill, Align::Center);
     let head = Node::hbox(header, 0.0, vec![title]);
 
     // weekday names, as tall as a day row (GtkCalendar's grid rows are homogeneous)
@@ -100,6 +104,7 @@ pub fn calendar(base: &Style) -> Node {
     let side = sample.measure_h(sample.measure_w().1).1;
     let mut names = Style { min_height: side, ..cal.inherit() };
     names.font.size = 14.0;
+    names.font.weight = 700;
     let mut rows = vec![week_row(&cal.inherit(), (0..7).map(|i| Node::label(names.clone(), day_format(start + i, "%a")).expand(true, false)).collect())];
 
     for week in 0..6 {

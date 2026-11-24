@@ -13,7 +13,7 @@ if [[ ${1:-} != __inner ]]; then
   out=$(realpath -m "${2:-$here/../golden}")
   mkdir -p "$out"
   tools='with import <nixpkgs> {}; buildEnv { name = "flurry-capture"; paths = [
-    grim wtype imagemagick dbus glib.bin bubblewrap libnotify (python3.withPackages (p: [ p.python-dbusmock ])) ]; }'
+    grim wtype imagemagick dbus glib.bin bubblewrap libnotify (python3.withPackages (p: [ p.python-dbusmock p.pygobject3 ])) ]; }'
   exec nix shell --impure --expr "$tools" -c dbus-run-session -- "$0" __inner "$flurry" "$out"
 fi
 
