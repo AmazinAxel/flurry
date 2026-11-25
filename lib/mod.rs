@@ -1,5 +1,6 @@
 pub mod menuState;
 pub mod audio;
+pub mod pipewire;
 pub mod battery;
 pub mod brightness;
 pub mod clipboard;

@@ -1,18 +1,14 @@
 // PipeWire sinks (the subset flurry uses): sink list, default sink, cubic volume + mute
 // with WirePlumber mixer semantics (device Route when the node has one, else node Props), links.
+// Spoken straight over the native protocol (lib/pipewire.rs): no libpipewire.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Cursor, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::rc::Rc;
+use std::io::Read;
+use std::os::fd::{FromRawFd, OwnedFd};
 
-use pipewire as pw;
-use pw::spa;
-use spa::pod::serialize::PodSerializer;
-use spa::pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray, deserialize::PodDeserializer};
-
+use crate::lib::pipewire::{self as pw, Conn, Dict, Fields, Pod, W};
 use crate::ui::runtime;
 use crate::ui::state::global_state;
 
@@ -92,22 +88,25 @@ struct PortInfo {
     channel: String,
 }
 
-type Global<'a> = pw::registry::GlobalObject<&'a spa::utils::dict::DictRef>;
+/// What a proxy id is bound to; bound globals by their id.
+#[derive(Clone, Copy)]
+enum Proxy {
+    Registry,
+    Node(u32),
+    Device(u32),
+    Metadata(u32),
+}
 
 struct Pw {
-    // fields (and tuples) drop in order: listeners first, a hook before the object it hangs on, then
-    // proxies, registry, core, context and the loop they all live on
-    _core_listener: pw::core::Listener,
-    _registry_listener: Option<pw::registry::Listener>,
-    /// link proxies from the last `link` call, kept until the next (object.linger keeps the links)
-    pending_links: Vec<pw::link::Link>,
-    metadata: Option<(pw::metadata::MetadataListener, pw::metadata::Metadata)>,
-    nodes: HashMap<u32, (pw::node::NodeListener, pw::node::Node)>,
-    devices: HashMap<u32, (pw::device::DeviceListener, pw::device::Device, Vec<Route>)>,
-    registry: Rc<pw::registry::Registry>,
-    core: pw::core::Core,
-    _context: pw::context::Context,
-    _main: pw::main_loop::MainLoop,
+    conn: Conn,
+    registry: u32,
+    proxies: HashMap<u32, Proxy>,
+    /// global id -> proxy id
+    nodes: HashMap<u32, u32>,
+    devices: HashMap<u32, (u32, Vec<Route>)>,
+    metadata: Option<u32>,
+    /// the initial sync: everything known so far has been announced once it's done
+    initial: i32,
     /// sink ports and sink-to-sink links only: all `link` needs
     ports: HashMap<u32, PortInfo>,
     links: HashMap<u32, (u32, u32)>, // id -> (output node, input node)
@@ -116,9 +115,7 @@ struct Pw {
 thread_local! {
     static PW: RefCell<Option<Pw>> = const { RefCell::new(None) };
     /// Route reads in flight: (core sync sequence, sink), answered after the device's params
-    static ROUTE_READS: RefCell<Vec<(spa::utils::result::AsyncSeq, u32)>> = const { RefCell::new(Vec::new()) };
-    /// a reconnect is queued: one per lost connection, however many errors it reports
-    static RECONNECT: Cell<bool> = const { Cell::new(false) };
+    static ROUTE_READS: RefCell<Vec<(i32, u32)>> = const { RefCell::new(Vec::new()) };
     /// `default.configured.audio.sink`: the user's choice WirePlumber restores
     static CONFIGURED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
@@ -137,8 +134,8 @@ pub fn default_speaker() -> Option<Sink> {
     speakers().with(|l| l.iter().find(|s| s.name == name).cloned())
 }
 
+/// try_borrow: never held across event handling, but a nested call must not panic either
 fn with<R>(f: impl FnOnce(&mut Pw) -> R) -> Option<R> {
-    // try_borrow: a callback re-entering while PW is borrowed must not panic across the C boundary
     PW.with(|p| p.try_borrow_mut().ok()?.as_mut().map(f))
 }
 
@@ -163,19 +160,28 @@ fn try_settle() {
 
 /// Connects to PipeWire, or waits for its socket to appear and connects then.
 pub fn start() {
-    pw::init();
     if !connect() {
         eprintln!("flurry: pipewire: can't connect, waiting for its socket");
         wait_for_socket();
     }
 }
 
-/// inotify on the runtime dir until the socket is (re)created: a restarted PipeWire that isn't
+/// `PIPEWIRE_REMOTE` (a path, or a name in the runtime dir: `PIPEWIRE_RUNTIME_DIR`, else
+/// `XDG_RUNTIME_DIR`), else pipewire-0 there, as libpipewire resolves it.
+fn socket_path() -> Option<String> {
+    let name = std::env::var("PIPEWIRE_REMOTE").ok().filter(|r| !r.is_empty()).unwrap_or_else(|| "pipewire-0".into());
+    if name.starts_with('/') {
+        return Some(name);
+    }
+    let dir = std::env::var("PIPEWIRE_RUNTIME_DIR").ok().filter(|v| v.starts_with('/')).or_else(crate::lib::xdg::runtime_dir)?;
+    Some(format!("{dir}/{name}"))
+}
+
+/// inotify on the socket's directory until it is (re)created: a restarted PipeWire that isn't
 /// socket-activated binds a fresh one.
 fn wait_for_socket() {
-    let Some(dir) = crate::lib::xdg::runtime_dir() else { return };
-    let name = std::env::var("PIPEWIRE_REMOTE").ok().filter(|r| !r.is_empty() && !r.contains('/')).unwrap_or_else(|| "pipewire-0".into());
-    let Ok(cdir) = std::ffi::CString::new(dir) else { return };
+    let Some((dir, name)) = socket_path().and_then(|p| p.rsplit_once('/').map(|(d, n)| (d.to_string(), n.to_string()))) else { return };
+    let Ok(cdir) = std::ffi::CString::new(if dir.is_empty() { "/".into() } else { dir }) else { return };
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if fd < 0 {
         return;
@@ -212,171 +218,188 @@ fn inotify_names(mut buf: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 fn connect() -> bool {
-    let Ok(main) = pw::main_loop::MainLoop::new(None) else { return false };
-    let Ok(context) = pw::context::Context::new(&main) else { return false };
-    let Ok(core) = context.connect(None) else { return false };
-    let Ok(registry) = core.get_registry() else { return false };
-    let registry = Rc::new(registry);
-    let fd = main.loop_().fd().as_raw_fd();
-
-    let reg = Rc::downgrade(&registry);
-    let listener = registry
-        .add_listener_local()
-        .global(move |g| {
-            let Some(reg) = reg.upgrade() else { return };
-            let props = g.props;
-            let get = |k: &str| props.and_then(|p| p.get(k)).map(String::from);
-            match g.type_ {
-                pw::types::ObjectType::Node if get("media.class").as_deref() == Some("Audio/Sink") => {
-                    bind_node(&reg, g, &get);
-                }
-                pw::types::ObjectType::Device if get("media.class").as_deref() == Some("Audio/Device") => bind_device(&reg, g),
-                pw::types::ObjectType::Metadata if get("metadata.name").as_deref() == Some("default") => bind_metadata(&reg, g),
-                // a node is announced before its ports and links
-                pw::types::ObjectType::Port => {
-                    if let Some(node) = get("node.id").and_then(|v| v.parse().ok()) {
-                        let info = PortInfo { node, output: get("port.direction").as_deref() == Some("out"), channel: get("audio.channel").unwrap_or_default() };
-                        with(|p| p.nodes.contains_key(&node).then(|| p.ports.insert(g.id, info)));
-                    }
-                }
-                pw::types::ObjectType::Link => {
-                    let out = get("link.output.node").and_then(|v| v.parse().ok());
-                    let inp = get("link.input.node").and_then(|v| v.parse().ok());
-                    if let (Some(o), Some(i)) = (out, inp) {
-                        with(|p| (p.nodes.contains_key(&o) && p.nodes.contains_key(&i)).then(|| p.links.insert(g.id, (o, i))));
-                    }
-                }
-                _ => {}
-            }
-        })
-        .global_remove(|id| {
-            with(|p| {
-                p.nodes.remove(&id);
-                p.devices.remove(&id);
-                p.ports.remove(&id);
-                p.links.remove(&id);
-            });
-            speakers().update(|l| {
-                let n = l.len();
-                l.retain(|s| s.id != id);
-                l.len() != n
-            });
-        })
-        .register();
-
-    // initial sync done: everything known so far has been announced
-    let pending = core.sync(0).ok();
-    let core_listener = core
-        .add_listener_local()
-        .done(move |_, seq| {
-            if Some(seq) == pending {
-                ready().set(true);
-            }
-            // the device has no Route for this sink: its node Props are all there is
-            let read = ROUTE_READS.with(|r| {
-                let mut r = r.borrow_mut();
-                r.iter().position(|(s, _)| *s == seq).map(|i| r.remove(i).1)
-            });
-            if let Some(id) = read {
-                update_sink(id, |s| s.known = true);
-            }
-        })
-        .error(move |id, _, res, _| {
-            // core connection lost (pipewire restarted): drop everything and reconnect
-            if id == 0 && res == -libc::EPIPE && !RECONNECT.replace(true) {
-                runtime::idle(|| {
-                    RECONNECT.set(false);
-                    let fd = PW.with(|p| p.borrow_mut().take().map(|p| p._main.loop_().fd().as_raw_fd()));
-                    if let Some(fd) = fd {
-                        runtime::unwatch(fd);
-                    }
-                    ROUTE_READS.with(|r| r.borrow_mut().clear());
-                    speakers().set(vec![]);
-                    default_name().set(None);
-                    CONFIGURED.with(|c| c.borrow_mut().take());
-                    settled().set(false);
-                    ready().set(false);
-                    start();
-                });
-            }
-        })
-        .register();
-
-    let main_loop = main.clone();
+    let Some(mut conn) = socket_path().and_then(|p| Conn::connect(&p)) else { return false };
+    let registry = conn.new_id();
+    conn.send(pw::CORE, pw::CORE_GET_REGISTRY, |w| {
+        w.int(3).int(registry as i32);
+    });
+    let initial = conn.sync();
+    let fd = conn.fd();
     PW.with(|p| {
         *p.borrow_mut() = Some(Pw {
-            _core_listener: core_listener,
-            _registry_listener: Some(listener),
-            pending_links: vec![],
-            metadata: None,
+            conn,
+            registry,
+            proxies: HashMap::from([(registry, Proxy::Registry)]),
             nodes: HashMap::new(),
             devices: HashMap::new(),
-            registry,
-            core,
-            _context: context,
-            _main: main,
+            metadata: None,
+            initial,
             ports: HashMap::new(),
             links: HashMap::new(),
         })
     });
-    // the loop is dispatched without holding PW: its callbacks (registry, params) borrow PW themselves
-    runtime::watch(fd, move || {
-        main_loop.loop_().iterate(std::time::Duration::ZERO);
+    // messages are handled without holding PW: the handlers borrow it themselves
+    runtime::watch(fd, || {
+        let Some(read) = with(|p| {
+            p.conn.flush();
+            p.conn.recv()
+        }) else {
+            return;
+        };
+        match read {
+            Ok(buf) => pw::messages(&buf).for_each(|(id, op, body)| {
+                if let Some(f) = Fields::new(body) {
+                    event(id, op, f);
+                }
+            }),
+            Err(_) => lost(),
+        }
     });
     true
 }
 
-fn bind_node(reg: &pw::registry::Registry, g: &Global, get: &dyn Fn(&str) -> Option<String>) {
-    let id = g.id;
-    let sink = Sink {
-        id,
-        name: get("node.name").unwrap_or_default(),
-        description: get("node.description").or_else(|| get("node.nick")).unwrap_or_default(),
-        serial: get("object.serial").and_then(|v| v.parse().ok()).unwrap_or(0),
-        device: get("device.id").and_then(|v| v.parse().ok()),
-        profile_device: get("card.profile.device").and_then(|v| v.parse().ok()),
-        ..Default::default()
-    };
-    let Ok(node) = reg.bind::<pw::node::Node, _>(g) else { return };
-    let listener = node
-        .add_listener_local()
-        // registry globals omit card.profile.device: without it no Route matched and volume went to
-        // node Props, which never reach the hardware mixer and drift from what wpctl shows
-        .info(move |info| {
-            let Some(props) = info.props() else { return };
-            let device: Option<u32> = props.get("device.id").and_then(|v| v.parse().ok());
-            let pd: Option<i32> = props.get("card.profile.device").and_then(|v| v.parse().ok());
-            update_sink(id, |s| {
-                s.device = device.or(s.device);
-                s.profile_device = pd.or(s.profile_device);
-            });
-            // a device's cached Route can predate the volume restore: always ask for the current one
-            let unread = speakers().with(|l| l.iter().any(|s| s.id == id && !s.known));
-            if let (Some(dev), Some(_), true) = (device, pd, unread) {
+/// The connection is gone (pipewire restarted): drop everything and reconnect.
+fn lost() {
+    if let Some(fd) = PW.with(|p| p.borrow_mut().take().map(|p| p.conn.fd())) {
+        runtime::unwatch(fd);
+    }
+    ROUTE_READS.with(|r| r.borrow_mut().clear());
+    speakers().set(vec![]);
+    default_name().set(None);
+    CONFIGURED.with(|c| c.borrow_mut().take());
+    settled().set(false);
+    ready().set(false);
+    start();
+}
+
+fn event(id: u32, op: u8, mut f: Fields) -> Option<()> {
+    if id == pw::CORE {
+        match op {
+            pw::CORE_DONE => done(f.skip(1)?.int()?),
+            pw::CORE_PING => {
+                let (id, seq) = (f.int()?, f.int()?);
                 with(|p| {
-                    if read_routes(p, dev)
-                        && let Ok(seq) = p.core.sync(0)
-                    {
-                        ROUTE_READS.with(|r| r.borrow_mut().push((seq, id)));
-                    }
+                    p.conn.send(pw::CORE, pw::CORE_PONG, |w| {
+                        w.int(id).int(seq);
+                    })
                 });
             }
-        })
-        .param(move |_, _, _, _, pod| {
-            let Some(pod) = pod else { return };
-            if let Some(Value::Object(o)) = deserialize(pod.as_bytes()) {
-                let (channels, mute) = parse_props(o);
-                update_sink(id, |s| s.set_node_props(channels, mute));
-                // a routed sink's volume lives on its device, whose Route param isn't re-sent when
-                // it changes (only at subscribe): the node's Props change is the cue to re-read it
-                let device = speakers().with(|l| l.iter().find(|s| s.id == id && s.profile_device.is_some()).and_then(|s| s.device));
-                if let Some(dev) = device {
-                    with(|p| read_routes(p, dev));
-                }
+            _ => {}
+        }
+        return Some(());
+    }
+    match (with(|p| p.proxies.get(&id).copied())??, op) {
+        (Proxy::Registry, pw::REGISTRY_GLOBAL) => {
+            let (gid, ty) = (f.int()? as u32, f.skip(1)?.str()??);
+            global(gid, ty, &f.skip(1)?.dict()?);
+        }
+        (Proxy::Registry, pw::REGISTRY_GLOBAL_REMOVE) => global_remove(f.int()? as u32),
+        // id, max in/out ports, change mask, in/out ports, state, error, then props
+        (Proxy::Node(gid), pw::NODE_INFO) => node_info(gid, &f.skip(8)?.dict()?),
+        // seq, param id, index, next, then the param
+        (Proxy::Node(gid), pw::PARAM) => node_param(gid, f.skip(4)?.next()?),
+        (Proxy::Device(gid), pw::PARAM) => device_param(gid, f.skip(4)?.next()?),
+        (Proxy::Metadata(_), pw::METADATA_PROPERTY) => {
+            let (subject, key, value) = (f.int()?, f.str()?, f.skip(1)?.str()?);
+            metadata_property(subject, key, value);
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+fn done(seq: i32) {
+    if with(|p| p.initial == seq) == Some(true) {
+        ready().set(true);
+    }
+    // the device has no Route for this sink: its node Props are all there is
+    let read = ROUTE_READS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.iter().position(|(s, _)| *s == seq).map(|i| r.remove(i).1)
+    });
+    if let Some(id) = read {
+        update_sink(id, |s| s.known = true);
+    }
+}
+
+/// Binds global `gid` as `ty` (version 3, all of these are) under a fresh proxy id.
+fn bind(p: &mut Pw, gid: u32, ty: &str, proxy: Proxy) -> u32 {
+    let id = p.conn.new_id();
+    p.conn.send(p.registry, pw::REGISTRY_BIND, |w| {
+        w.int(gid as i32).str(ty).int(3).int(id as i32);
+    });
+    p.proxies.insert(id, proxy);
+    id
+}
+
+fn global(gid: u32, ty: &str, props: &Dict) {
+    let class = props.get("media.class");
+    match ty.strip_prefix("PipeWire:Interface:") {
+        Some("Node") if class == Some("Audio/Sink") => bind_node(gid, props),
+        Some("Device") if class == Some("Audio/Device") => {
+            with(|p| {
+                let id = bind(p, gid, "PipeWire:Interface:Device", Proxy::Device(gid));
+                p.conn.send(id, pw::PARAMS_SUBSCRIBE, |w| {
+                    w.ids(&[pw::PARAM_ROUTE]);
+                });
+                p.devices.insert(gid, (id, vec![]));
+            });
+        }
+        Some("Metadata") if props.get("metadata.name") == Some("default") => {
+            with(|p| p.metadata = Some(bind(p, gid, "PipeWire:Interface:Metadata", Proxy::Metadata(gid))));
+        }
+        // a node is announced before its ports and links
+        Some("Port") => {
+            if let Some(node) = props.parse("node.id") {
+                let info = PortInfo { node, output: props.get("port.direction") == Some("out"), channel: props.get("audio.channel").unwrap_or_default().into() };
+                with(|p| p.nodes.contains_key(&node).then(|| p.ports.insert(gid, info)));
             }
-        })
-        .register();
-    node.subscribe_params(&[spa::param::ParamType::Props]);
+        }
+        Some("Link") => {
+            if let (Some(o), Some(i)) = (props.parse("link.output.node"), props.parse("link.input.node")) {
+                with(|p| (p.nodes.contains_key(&o) && p.nodes.contains_key(&i)).then(|| p.links.insert(gid, (o, i))));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn global_remove(gid: u32) {
+    with(|p| {
+        p.nodes.remove(&gid);
+        p.devices.remove(&gid);
+        p.ports.remove(&gid);
+        p.links.remove(&gid);
+        p.proxies.retain(|_, x| !matches!(x, Proxy::Node(g) | Proxy::Device(g) | Proxy::Metadata(g) if *g == gid));
+        p.metadata = p.metadata.filter(|m| p.proxies.contains_key(m));
+    });
+    speakers().update(|l| {
+        let n = l.len();
+        l.retain(|s| s.id != gid);
+        l.len() != n
+    });
+}
+
+fn bind_node(id: u32, props: &Dict) {
+    let sink = Sink {
+        id,
+        name: props.get("node.name").unwrap_or_default().into(),
+        description: props.get("node.description").or_else(|| props.get("node.nick")).unwrap_or_default().into(),
+        serial: props.parse("object.serial").unwrap_or(0),
+        device: props.parse("device.id"),
+        profile_device: props.parse("card.profile.device"),
+        ..Default::default()
+    };
+    let bound = with(|p| {
+        let proxy = bind(p, id, "PipeWire:Interface:Node", Proxy::Node(id));
+        p.conn.send(proxy, pw::PARAMS_SUBSCRIBE, |w| {
+            w.ids(&[pw::PARAM_PROPS]);
+        });
+        p.nodes.insert(id, proxy);
+    });
+    if bound.is_none() {
+        return;
+    }
     speakers().update(|l| {
         if l.last() == Some(&sink) {
             return false;
@@ -385,142 +408,141 @@ fn bind_node(reg: &pw::registry::Registry, g: &Global, get: &dyn Fn(&str) -> Opt
         l.push(sink);
         true
     });
-    with(|p| p.nodes.insert(id, (listener, node)));
 }
 
-/// Asks device `dev` for its Routes (answered through its param listener); false if it isn't bound.
-fn read_routes(p: &Pw, dev: u32) -> bool {
-    let Some((_, d, _)) = p.devices.get(&dev) else { return false };
-    d.enum_params(0, Some(spa::param::ParamType::Route), 0, u32::MAX);
+// registry globals omit card.profile.device: without it no Route matched and volume went to
+// node Props, which never reach the hardware mixer and drift from what wpctl shows
+fn node_info(id: u32, props: &Dict) {
+    let device: Option<u32> = props.parse("device.id");
+    let pd: Option<i32> = props.parse("card.profile.device");
+    update_sink(id, |s| {
+        s.device = device.or(s.device);
+        s.profile_device = pd.or(s.profile_device);
+    });
+    // a device's cached Route can predate the volume restore: always ask for the current one
+    let unread = speakers().with(|l| l.iter().any(|s| s.id == id && !s.known));
+    if let (Some(dev), Some(_), true) = (device, pd, unread) {
+        with(|p| {
+            if read_routes(p, dev) {
+                let seq = p.conn.sync();
+                ROUTE_READS.with(|r| r.borrow_mut().push((seq, id)));
+            }
+        });
+    }
+}
+
+fn node_param(id: u32, param: Pod) {
+    if !matches!(param, Pod::Object { .. }) {
+        return;
+    }
+    let (channels, mute) = parse_props(param);
+    update_sink(id, |s| s.set_node_props(channels, mute));
+    // a routed sink's volume lives on its device, whose Route param isn't re-sent when it changes
+    // (only at subscribe): the node's Props change is the cue to re-read it
+    let device = speakers().with(|l| l.iter().find(|s| s.id == id && s.profile_device.is_some()).and_then(|s| s.device));
+    if let Some(dev) = device {
+        with(|p| read_routes(p, dev));
+    }
+}
+
+/// Asks device `dev` for its Routes (answered through its param events); false if it isn't bound.
+fn read_routes(p: &mut Pw, dev: u32) -> bool {
+    let Some((proxy, _)) = p.devices.get(&dev) else { return false };
+    p.conn.send(*proxy, pw::PARAMS_ENUM, |w| {
+        w.int(0).id(pw::PARAM_ROUTE).int(0).int(-1).none();
+    });
     true
 }
 
-fn bind_device(reg: &pw::registry::Registry, g: &Global) {
-    let id = g.id;
-    let Ok(dev) = reg.bind::<pw::device::Device, _>(g) else { return };
-    let listener = dev
-        .add_listener_local()
-        .param(move |_, _, _, _, pod| {
-            let Some(pod) = pod else { return };
-            let Some(Value::Object(o)) = deserialize(pod.as_bytes()) else { return };
-            let int = |k: u32| o.properties.iter().find(|p| p.key == k).and_then(|p| match p.value {
-                Value::Int(v) => Some(v),
-                Value::Id(v) => Some(v.0 as i32),
-                _ => None,
-            });
-            let (Some(index), Some(device), Some(dir)) =
-                (int(spa::sys::SPA_PARAM_ROUTE_index), int(spa::sys::SPA_PARAM_ROUTE_device), int(spa::sys::SPA_PARAM_ROUTE_direction))
-            else {
-                return;
-            };
-            if dir != spa::sys::SPA_DIRECTION_OUTPUT as i32 {
-                return;
-            }
-            let (channels, mute) = match o.properties.into_iter().find(|p| p.key == spa::sys::SPA_PARAM_ROUTE_props).map(|p| p.value) {
-                Some(Value::Object(props)) => parse_props(props),
-                _ => (None, None),
-            };
-            with(|p| {
-                if let Some((_, _, routes)) = p.devices.get_mut(&id) {
-                    routes.retain(|r| r.device != device);
-                    routes.push(Route { index, device });
-                }
-            });
-            speakers().update(|list| {
-                let mut changed = false;
-                for s in list.iter_mut().filter(|s| s.device == Some(id) && s.profile_device == Some(device)) {
-                    let old = s.clone();
-                    s.set_route_props(channels.clone(), mute);
-                    changed |= *s != old;
-                }
-                changed
-            });
-            try_settle();
+fn device_param(id: u32, param: Pod) {
+    // Int or Id: the direction is an Id
+    let int = |k: u32| {
+        param.props().find(|p| p.0 == k).and_then(|p| match p.1 {
+            Pod::Int(v) => Some(v),
+            Pod::Id(v) => Some(v as i32),
+            _ => None,
         })
-        .register();
-    dev.subscribe_params(&[spa::param::ParamType::Route]);
-    with(|p| p.devices.insert(id, (listener, dev, vec![])));
+    };
+    let (Some(index), Some(device), Some(pw::DIRECTION_OUTPUT)) = (int(pw::ROUTE_INDEX), int(pw::ROUTE_DEVICE), int(pw::ROUTE_DIRECTION)) else {
+        return;
+    };
+    let (channels, mute) = param.props().find(|p| p.0 == pw::ROUTE_PROPS).map_or((None, None), |p| parse_props(p.1));
+    with(|p| {
+        if let Some((_, routes)) = p.devices.get_mut(&id) {
+            routes.retain(|r| r.device != device);
+            routes.push(Route { index, device });
+        }
+    });
+    speakers().update(|list| {
+        let mut changed = false;
+        for s in list.iter_mut().filter(|s| s.device == Some(id) && s.profile_device == Some(device)) {
+            let old = s.clone();
+            s.set_route_props(channels.clone(), mute);
+            changed |= *s != old;
+        }
+        changed
+    });
+    try_settle();
 }
 
-fn bind_metadata(reg: &pw::registry::Registry, g: &Global) {
-    let Ok(md) = reg.bind::<pw::metadata::Metadata, _>(g) else { return };
-    let listener = md
-        .add_listener_local()
-        .property(|subject, key, _, value| {
-            let name = || value.and_then(crate::lib::json::parse).and_then(|j| j.get("name").str().map(String::from));
-            match key {
-                Some("default.audio.sink") if subject == 0 => default_name().set(name()),
-                Some("default.configured.audio.sink") if subject == 0 => CONFIGURED.with(|c| *c.borrow_mut() = name()),
-                _ => return 0,
-            }
-            try_settle();
-            0
-        })
-        .register();
-    with(|p| p.metadata = Some((listener, md)));
+fn metadata_property(subject: i32, key: Option<&str>, value: Option<&str>) {
+    let name = || value.and_then(crate::lib::json::parse).and_then(|j| j.get("name").str().map(String::from));
+    match key {
+        Some("default.audio.sink") if subject == 0 => default_name().set(name()),
+        Some("default.configured.audio.sink") if subject == 0 => CONFIGURED.with(|c| *c.borrow_mut() = name()),
+        _ => return,
+    }
+    try_settle();
 }
 
-fn deserialize(bytes: &[u8]) -> Option<Value> {
-    PodDeserializer::deserialize_any_from(bytes).ok().map(|(_, v)| v)
-}
-
-fn parse_props(o: Object) -> (Option<Vec<f32>>, Option<bool>) {
+/// channelVolumes and mute of a Props object.
+fn parse_props(o: Pod) -> (Option<Vec<f32>>, Option<bool>) {
     let mut channels = None;
     let mut mute = None;
-    for p in o.properties {
-        match (p.key, p.value) {
-            (spa::sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) => channels = Some(v),
-            (spa::sys::SPA_PROP_mute, Value::Bool(m)) => mute = Some(m),
+    for (k, v) in o.props() {
+        match (k, v) {
+            (pw::PROP_CHANNEL_VOLUMES, v) => channels = v.floats().or(channels),
+            (pw::PROP_MUTE, Pod::Bool(m)) => mute = Some(m),
             _ => {}
         }
     }
     (channels, mute)
 }
 
-fn serialize(v: Value) -> Option<Vec<u8>> {
-    PodSerializer::serialize(Cursor::new(Vec::new()), &v).ok().map(|(c, _)| c.into_inner())
-}
-
-fn props_object(channels: Option<Vec<f32>>, mute: Option<bool>) -> Object {
-    let mut properties = vec![];
-    if let Some(c) = channels {
-        properties.push(Property { key: spa::sys::SPA_PROP_channelVolumes, flags: PropertyFlags::empty(), value: Value::ValueArray(ValueArray::Float(c)) });
-    }
-    if let Some(m) = mute {
-        properties.push(Property { key: spa::sys::SPA_PROP_mute, flags: PropertyFlags::empty(), value: Value::Bool(m) });
-    }
-    Object { type_: spa::sys::SPA_TYPE_OBJECT_Props, id: spa::sys::SPA_PARAM_Props, properties }
+fn props_object(w: &mut W, channels: Option<&[f32]>, mute: Option<bool>) {
+    w.object(pw::OBJECT_PROPS, pw::PARAM_PROPS, |w| {
+        if let Some(c) = channels {
+            w.prop(pw::PROP_CHANNEL_VOLUMES).floats(c);
+        }
+        if let Some(m) = mute {
+            w.prop(pw::PROP_MUTE).bool(m);
+        }
+    });
 }
 
 /// Writes volume/mute like WirePlumber's mixer-api: through the device Route if present, else node Props.
 fn apply(sink: &Sink, channels: Option<Vec<f32>>, mute: Option<bool>) {
     settled().set(true);
-    let props = props_object(channels, mute);
+    let channels = channels.as_deref();
     with(|p| {
         let route = sink.device.zip(sink.profile_device).and_then(|(dev, pd)| {
-            p.devices.get(&dev).and_then(|(_, d, routes)| routes.iter().find(|r| r.device == pd).map(|r| (d, *r)))
+            p.devices.get(&dev).and_then(|(proxy, routes)| routes.iter().find(|r| r.device == pd).map(|r| (*proxy, *r)))
         });
         if let Some((dev, r)) = route {
-            let obj = Object {
-                type_: spa::sys::SPA_TYPE_OBJECT_ParamRoute,
-                id: spa::sys::SPA_PARAM_Route,
-                properties: vec![
-                    Property { key: spa::sys::SPA_PARAM_ROUTE_index, flags: PropertyFlags::empty(), value: Value::Int(r.index) },
-                    Property { key: spa::sys::SPA_PARAM_ROUTE_device, flags: PropertyFlags::empty(), value: Value::Int(r.device) },
-                    Property { key: spa::sys::SPA_PARAM_ROUTE_props, flags: PropertyFlags::empty(), value: Value::Object(props) },
-                    Property { key: spa::sys::SPA_PARAM_ROUTE_save, flags: PropertyFlags::empty(), value: Value::Bool(true) },
-                ],
-            };
-            if let Some(bytes) = serialize(Value::Object(obj))
-                && let Some(pod) = Pod::from_bytes(&bytes)
-            {
-                dev.set_param(spa::param::ParamType::Route, 0, pod);
-            }
-        } else if let Some((_, node)) = p.nodes.get(&sink.id)
-            && let Some(bytes) = serialize(Value::Object(props))
-            && let Some(pod) = Pod::from_bytes(&bytes)
-        {
-            node.set_param(spa::param::ParamType::Props, 0, pod);
+            p.conn.send(dev, pw::PARAMS_SET, |w| {
+                w.id(pw::PARAM_ROUTE).int(0).object(pw::OBJECT_ROUTE, pw::PARAM_ROUTE, |w| {
+                    w.prop(pw::ROUTE_INDEX).int(r.index);
+                    w.prop(pw::ROUTE_DEVICE).int(r.device);
+                    w.prop(pw::ROUTE_PROPS);
+                    props_object(w, channels, mute);
+                    w.prop(pw::ROUTE_SAVE).bool(true);
+                });
+            });
+        } else if let Some(&node) = p.nodes.get(&sink.id) {
+            p.conn.send(node, pw::PARAMS_SET, |w| {
+                w.id(pw::PARAM_PROPS).int(0);
+                props_object(w, channels, mute);
+            });
         }
     });
 }
@@ -574,8 +596,10 @@ pub fn set_mute(sink: &Sink, mute: bool) {
 pub fn set_default(sink: &Sink) {
     let value = format!("{{\"name\":{}}}", crate::lib::json::quote(&sink.name));
     with(|p| {
-        if let Some((_, md)) = &p.metadata {
-            md.set_property(0, "default.configured.audio.sink", Some("Spa:String:JSON"), Some(&value));
+        if let Some(md) = p.metadata {
+            p.conn.send(md, pw::METADATA_SET_PROPERTY, |w| {
+                w.int(0).str("default.configured.audio.sink").str("Spa:String:JSON").str(&value);
+            });
         }
     });
 }
@@ -586,28 +610,25 @@ pub fn link(output: &str, input: &str, connect: bool) {
     let Some(o) = list.iter().find(|s| s.name == output).map(|s| s.id) else { return };
     let Some(i) = list.iter().find(|s| s.name == input).map(|s| s.id) else { return };
     with(|p| {
-        p.pending_links.clear();
         if !connect {
-            let ids: Vec<u32> = p.links.iter().filter(|(_, (a, b))| *a == o && *b == i).map(|(id, _)| *id).collect();
-            for id in ids {
-                p.registry.destroy_global(id);
+            for (&id, _) in p.links.iter().filter(|(_, (a, b))| *a == o && *b == i) {
+                p.conn.send(p.registry, pw::REGISTRY_DESTROY, |w| {
+                    w.int(id as i32);
+                });
             }
             return;
         }
-        let outs: Vec<(u32, String)> = p.ports.iter().filter(|(_, x)| x.node == o && x.output).map(|(id, x)| (*id, x.channel.clone())).collect();
-        let ins: Vec<(u32, String)> = p.ports.iter().filter(|(_, x)| x.node == i && !x.output).map(|(id, x)| (*id, x.channel.clone())).collect();
-        for (op, ch) in &outs {
-            let Some((ip, _)) = ins.iter().find(|(_, c)| c == ch) else { continue };
-            let props = pw::properties::properties! {
-                "link.output.port" => op.to_string(),
-                "link.input.port" => ip.to_string(),
-                "link.output.node" => o.to_string(),
-                "link.input.node" => i.to_string(),
-                "object.linger" => "true",
-            };
-            if let Ok(l) = p.core.create_object::<pw::link::Link>("link-factory", &props) {
-                p.pending_links.push(l);
-            }
+        let ports = |node: u32, out: bool| p.ports.iter().filter(move |(_, x)| x.node == node && x.output == out);
+        for (op, x) in ports(o, true) {
+            let Some((ip, _)) = ports(i, false).find(|(_, y)| y.channel == x.channel) else { continue };
+            // the link outlives this proxy (object.linger), which is never destroyed: nothing to keep
+            let id = p.conn.new_id();
+            let (op, ip, o, i) = (op.to_string(), ip.to_string(), o.to_string(), i.to_string());
+            p.conn.send(pw::CORE, pw::CORE_CREATE_OBJECT, |w| {
+                w.str("link-factory").str("PipeWire:Interface:Link").int(3);
+                w.dict(&[("link.output.port", &op), ("link.input.port", &ip), ("link.output.node", &o), ("link.input.node", &i), ("object.linger", "true")]);
+                w.int(id as i32);
+            });
         }
     });
 }
@@ -634,5 +655,74 @@ mod tests {
         s.set_node_props(Some(vec![0.125, 0.125]), Some(false));
         assert!(s.known());
         assert!((s.volume - 0.5).abs() < 1e-3);
+    }
+
+    /// Against the session's PipeWire (`cargo test live_pipewire -- --ignored --nocapture`):
+    /// lists the sinks, then re-applies the default's own volume and waits for its round trip.
+    #[test]
+    #[ignore]
+    fn live_pipewire() {
+        start();
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let late = std::rc::Rc::new(std::cell::Cell::new(false));
+            let l = late.clone();
+            let _t = runtime::timeout(3000, move || l.set(true));
+            while !done() && !late.get() {
+                runtime::iterate(true);
+            }
+            assert!(done(), "timed out waiting for {what}");
+        };
+        until("ready", &|| ready().peek());
+        for s in speakers().peek() {
+            println!("{} {:?} {:?} vol={:.3} mute={} routed={} known={}", s.id, s.name, s.description, s.volume, s.mute, s.routed, s.known);
+        }
+        println!("default: {:?} configured: {:?}", default_name().peek(), CONFIGURED.with(|c| c.borrow().clone()));
+        until("the default sink's volume", &|| default_speaker().is_some_and(|s| s.known));
+        for s in speakers().peek() {
+            println!("{} {:?} vol={:.3} mute={} routed={} known={}", s.id, s.name, s.volume, s.mute, s.routed, s.known);
+        }
+        let d = default_speaker().expect("a default sink");
+        set_volume(&d, d.volume);
+        let seq = with(|p| p.conn.sync()).unwrap();
+        ROUTE_READS.with(|r| r.borrow_mut().push((seq, u32::MAX)));
+        until("the write's round trip", &|| ROUTE_READS.with(|r| r.borrow().iter().all(|(s, _)| *s != seq)));
+        let after = default_speaker().unwrap();
+        assert!((after.volume - d.volume).abs() < 1e-3, "{} -> {}", d.volume, after.volume);
+        assert_eq!(after.mute, d.mute);
+        let wpctl = |id: u32| String::from_utf8(std::process::Command::new("wpctl").args(["get-volume", &id.to_string()]).output().unwrap().stdout).unwrap();
+        let wait_for = |what: &str, id: u32, want: &dyn Fn(&Sink) -> bool| until(what, &|| speakers().peek().iter().any(|s| s.id == id && want(s)));
+        // a routed sink: mute through its device Route, then back
+        let routed = speakers().peek().into_iter().find(|s| s.routed).expect("a routed sink");
+        set_mute(&routed, !routed.mute);
+        wait_for("the routed mute", routed.id, &|s| s.mute != routed.mute);
+        println!("wpctl after mute: {}", wpctl(routed.id).trim());
+        set_mute(&routed, routed.mute);
+        wait_for("the routed unmute", routed.id, &|s| s.mute == routed.mute);
+        println!("wpctl restored: {}", wpctl(routed.id).trim());
+        // a deviceless sink: node Props
+        if let Some(null) = speakers().peek().into_iter().find(|s| !s.routed && s.device.is_none()) {
+            let v = if null.volume > 0.5 { 0.25 } else { 0.75 };
+            set_volume(&null, v);
+            let seq = with(|p| p.conn.sync()).unwrap();
+            ROUTE_READS.with(|r| r.borrow_mut().push((seq, u32::MAX)));
+            until("the props write", &|| ROUTE_READS.with(|r| r.borrow().iter().all(|(s, _)| *s != seq)));
+            println!("wpctl after set {v}: {}", wpctl(null.id).trim());
+            let now = speakers().peek().into_iter().find(|s| s.id == null.id).unwrap();
+            set_volume(&now, null.volume);
+            let seq = with(|p| p.conn.sync()).unwrap();
+            ROUTE_READS.with(|r| r.borrow_mut().push((seq, u32::MAX)));
+            until("the props restore", &|| ROUTE_READS.with(|r| r.borrow().iter().all(|(s, _)| *s != seq)));
+            println!("wpctl restored: {}", wpctl(null.id).trim());
+        }
+        // link the deviceless sink's monitor into the routed one, then unlink
+        if let Some(null) = speakers().peek().into_iter().find(|s| s.device.is_none()) {
+            let count = || with(|p| p.links.values().filter(|l| **l == (null.id, routed.id)).count()).unwrap();
+            let before = count();
+            link(&null.name, &routed.name, true);
+            until("the links", &|| count() > before);
+            println!("links made: {}", count() - before);
+            link(&null.name, &routed.name, false);
+            until("the unlink", &|| count() == 0);
+        }
     }
 }

@@ -701,10 +701,10 @@ mod tests {
             let lx = x as f32 + ((CELL_W as f32 - l.width()) / 2.0).round();
             text::draw(&mut sheet.as_mut(), &l, lx, (y + GAP + SIZE + GAP) as f32, label, Transform::identity());
         }
-        let file = std::io::BufWriter::new(std::fs::File::create(&out).unwrap());
-        let mut enc = png::Encoder::new(file, sheet.width(), sheet.height());
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        enc.write_header().unwrap().write_image_data(sheet.data()).unwrap();
+        let png = crate::ui::image::encode_png::<4>(sheet.width(), sheet.height(), |y, row| {
+            let n = row.len();
+            row.copy_from_slice(&sheet.data()[y as usize * n..(y as usize + 1) * n]);
+        });
+        std::fs::write(&out, png).unwrap();
     }
 }

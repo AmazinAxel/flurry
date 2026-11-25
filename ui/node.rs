@@ -1027,10 +1027,87 @@ fn paint_border(pm: &mut PixmapMut, r: Rect, b: Sides, c: [Color; 4], ts: Transf
     }
 }
 
+/// A finished layer and, per row, its non-transparent span and the longest opaque run in it:
+/// compositing skips the clear margins (source-over of nothing keeps the target) and copies the
+/// opaque run (source-over of an opaque pixel is that pixel). Shadows are mostly margin; blurred
+/// wallpaper is mostly opaque.
+struct Layer {
+    pix: Pixmap,
+    /// per row: left, opaque start, opaque end, right
+    rows: Vec<[u32; 4]>,
+}
+
+impl Layer {
+    fn new(pix: Pixmap) -> Self {
+        let w = pix.width() as usize;
+        let rows = pix
+            .data()
+            .chunks_exact(w * 4)
+            .map(|row| {
+                let px = row.as_chunks::<4>().0;
+                let l = px.iter().position(|p| *p != [0; 4]).unwrap_or(w);
+                let r = px.iter().rposition(|p| *p != [0; 4]).map_or(l, |i| i + 1);
+                let (mut best, mut i) = ((l, l), l);
+                while i < r {
+                    let Some(s) = px[i..r].iter().position(|p| p[3] == 255).map(|s| i + s) else { break };
+                    let run = px[s..r].iter().take_while(|p| p[3] == 255).count();
+                    if run > best.1 - best.0 {
+                        best = (s, s + run);
+                    }
+                    i = s + run;
+                }
+                [l, best.0, best.1, r].map(|v| v as u32)
+            })
+            .collect();
+        Self { pix, rows }
+    }
+
+    /// Composited whole, like `blit` (box shadows: `draw_around` skips their cut-out instead).
+    fn plain(pix: Pixmap) -> Self {
+        let w = pix.width();
+        let rows = vec![[0, 0, 0, w]; pix.height() as usize];
+        Self { pix, rows }
+    }
+}
+
+impl std::ops::Deref for Layer {
+    type Target = Pixmap;
+    fn deref(&self) -> &Pixmap {
+        &self.pix
+    }
+}
+
+/// `layer` composited (source-over) with its top-left at whole pixel (x, y), row by row: blended
+/// up to the opaque run, copied across it, blended after it.
+fn blit_layer(pm: &mut PixmapMut, layer: &Layer, x: i32, y: i32) {
+    let src = layer.pix.as_ref();
+    for (row, &[l, ol, or, r]) in layer.rows.iter().enumerate() {
+        let (t, [l, ol, or, r]) = (row as i32, [l, ol, or, r].map(|v| v as i32));
+        blit_part(pm, src, x, y, (l, t, ol, t + 1), 255);
+        copy_part(pm, src, x, y, (ol, t, or, t + 1));
+        blit_part(pm, src, x, y, (or, t, r, t + 1), 255);
+    }
+}
+
+/// The (left, top, right, bottom) part of `src` copied over the target at (x, y).
+fn copy_part(pm: &mut PixmapMut, src: tiny_skia::PixmapRef, x: i32, y: i32, (l, t, r, b): (i32, i32, i32, i32)) {
+    let (sw, pw, ph) = (src.width() as i32, pm.width() as i32, pm.height() as i32);
+    let (l, r) = (l.max(-x), r.min(pw - x));
+    let (t, b) = (t.max(-y), b.min(ph - y));
+    if l >= r || t >= b {
+        return;
+    }
+    let (s, d) = (src.data(), pm.data_mut());
+    for row in t..b {
+        let srow = &s[(row * sw + l) as usize * 4..(row * sw + r) as usize * 4];
+        d[((row + y) * pw + l + x) as usize * 4..((row + y) * pw + r + x) as usize * 4].copy_from_slice(srow);
+    }
+}
+
 /// Finished shadow layers by what they depend on, least recently used dropped past a byte budget
 /// (changing text like the clock would otherwise grow it forever).
 struct LayerCache {
-    map: crate::ui::fxhash::FxHashMap<u64, (Rc<Pixmap>, u64)>,
+    map: crate::ui::fxhash::FxHashMap<u64, (Rc<Layer>, u64)>,
     bytes: usize,
     tick: u64,
     budget: usize,
@@ -1041,7 +1118,7 @@ impl LayerCache {
         Self { map: Default::default(), bytes: 0, tick: 0, budget }
     }
 
-    fn get(&mut self, key: u64) -> Option<Rc<Pixmap>> {
+    fn get(&mut self, key: u64) -> Option<Rc<Layer>> {
         self.tick += 1;
         let tick = self.tick;
         self.map.get_mut(&key).map(|(p, t)| {
@@ -1050,7 +1127,7 @@ impl LayerCache {
         })
     }
 
-    fn insert(&mut self, key: u64, p: Rc<Pixmap>) {
+    fn insert(&mut self, key: u64, p: Rc<Layer>) {
         self.bytes += p.data().len();
         self.tick += 1;
         if let Some((old, _)) = self.map.insert(key, (p, self.tick)) {
@@ -1073,13 +1150,10 @@ thread_local! {
 
 /// `layer`'s alpha blurred, then tinted `color` (premultiplied).
 fn blur_tint(layer: &mut Pixmap, radius: f32, color: Color) {
-    super::image::blur_alpha(layer, radius);
     let c = color.premultiply().to_color_u8();
-    let (r, g, b, a) = (c.red() as u32, c.green() as u32, c.blue() as u32, c.alpha() as u32);
-    for px in layer.data_mut().as_chunks_mut::<4>().0 {
-        let al = px[3] as u32;
-        *px = [((r * al + 127) / 255) as u8, ((g * al + 127) / 255) as u8, ((b * al + 127) / 255) as u8, ((a * al + 127) / 255) as u8];
-    }
+    // all four channels per alpha in two multiplies (the same rounding as (c * a + 127) / 255)
+    let packed = u32::from_le_bytes([c.red(), c.green(), c.blue(), c.alpha()]);
+    super::image::blur_alpha(layer, radius, |al| mul_div255(packed, al as u32).to_le_bytes());
 }
 
 /// Renders `draw` into an alpha layer in device space, blurs it, and composites it tinted.
@@ -1098,12 +1172,12 @@ pub(crate) fn blurred(pm: &mut PixmapMut, bounds: Rect, radius: f32, color: Colo
             let Some(mut layer) = Pixmap::new(w, h) else { return };
             draw(&mut layer.as_mut(), ts.post_translate(-ox, -oy));
             blur_tint(&mut layer, radius * scale, color);
-            let layer = Rc::new(layer);
+            let layer = Rc::new(Layer::new(layer));
             SHADOWS.with(|s| s.borrow_mut().insert(key, layer.clone()));
             layer
         }
     };
-    blit(pm, Pixmap::as_ref(&layer), ox as i32, oy as i32, 1.0);
+    blit_layer(pm, &layer, ox as i32, oy as i32);
 }
 
 fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
@@ -1138,7 +1212,7 @@ fn paint_box_shadow(pm: &mut PixmapMut, r: Rect, s: &Shadow, ts: Transform) {
     let clear = Paint { blend_mode: tiny_skia::BlendMode::Clear, anti_alias: false, ..Default::default() };
     layer.fill_rect(r, &clear, lts, None);
     draw_around(pm, &layer, ox, oy, hole);
-    SHADOWS.with(|m| m.borrow_mut().insert(key, Rc::new(layer)));
+    SHADOWS.with(|m| m.borrow_mut().insert(key, Rc::new(Layer::plain(layer))));
 }
 
 /// Composites a box shadow layer except the cut-out border box (transparent): for a window-sized
@@ -1285,12 +1359,12 @@ fn paint_picture(pm: &mut PixmapMut, img: &Img, c: Rect, cover: bool, radius: f3
                 layer.draw_pixmap(0, 0, pix, &smooth, lts, Some(&clip));
                 blur(&mut layer, radius * ts.sx);
             }
-            let l = Rc::new(layer);
+            let l = Rc::new(Layer::new(layer));
             BLURRED.with(|b| b.borrow_mut().layers.insert(key, l.clone()));
             l
         }
     };
-    blit(pm, Pixmap::as_ref(&layer), ox as i32, oy as i32, 1.0);
+    blit_layer(pm, &layer, ox as i32, oy as i32);
 }
 
 /// Bytes of finished wallpaper blurs kept (the headers of a few windows on each output).
@@ -1303,11 +1377,13 @@ struct Blurred {
     layers: LayerCache,
     /// (radius bucket, blurred image, image px per blurred px x/y)
     sources: Vec<(i32, Rc<(Pixmap, f32, f32)>)>,
+    /// the image shrunk to (w, h) before blurring: nearby buckets share a shrink factor
+    shrunk: Vec<((u32, u32), Pixmap)>,
 }
 
 impl Default for Blurred {
     fn default() -> Self {
-        Self { img: 0, layers: LayerCache::new(BLUR_BUDGET), sources: vec![] }
+        Self { img: 0, layers: LayerCache::new(BLUR_BUDGET), sources: vec![], shrunk: vec![] }
     }
 }
 
@@ -1347,8 +1423,16 @@ fn cut_from_blurred(layer: &mut Pixmap, img: &Img, t: Transform, area: Rect, rad
     let src = match found {
         Some(s) => s,
         None => {
-            let Some(mut small) = Pixmap::new(bw, bh) else { return false };
-            downscale(pix.data(), iw as usize, ih as usize, small.data_mut(), bw as usize, bh as usize);
+            let cached = BLURRED.with(|b| b.borrow().shrunk.iter().find(|s| s.0 == (bw, bh)).map(|s| s.1.clone()));
+            let mut small = match cached {
+                Some(s) => s,
+                None => {
+                    let Some(mut s) = Pixmap::new(bw, bh) else { return false };
+                    downscale(pix.data(), iw as usize, ih as usize, s.data_mut(), bw as usize, bh as usize);
+                    BLURRED.with(|b| b.borrow_mut().shrunk.push(((bw, bh), s.clone())));
+                    s
+                }
+            };
             let (fx, fy) = (iw as f32 / bw as f32, ih as f32 / bh as f32);
             blur(&mut small, r_img / fx.max(fy));
             let s = Rc::new((small, fx, fy));
@@ -1371,23 +1455,27 @@ fn cut_from_blurred(layer: &mut Pixmap, img: &Img, t: Transform, area: Rect, rad
     let xs: Vec<(usize, usize, f32)> = (0..lw).map(|x| tap(x, t.sx, t.tx, fx, sw)).collect();
     let src = small.data();
     let out = layer.data_mut();
+    let mut mixed = vec![0f32; sw * 4];
+    // only the columns the box's fade-out reaches (outside them the layer stays clear), branch-free
+    let lo = mx.iter().position(|&v| v > 0.0).unwrap_or(lw);
+    let hi = mx.iter().rposition(|&v| v > 0.0).map_or(lo, |i| i + 1);
     for (y, &wy) in my.iter().enumerate() {
         if wy <= 0.0 {
             continue;
         }
         let (y0, y1, ty) = tap(y, t.sy, t.ty, fy, sh);
         let (r0, r1) = (&src[y0 * sw * 4..(y0 + 1) * sw * 4], &src[y1 * sw * 4..(y1 + 1) * sw * 4]);
+        // the two source rows mixed once (the blurred source is a few times smaller than the layer),
+        // then one lerp per channel along x
+        mixed.iter_mut().zip(r0.iter().zip(r1)).for_each(|(m, (&a, &b))| *m = a as f32 + (b as f32 - a as f32) * ty);
         let row = &mut out[y * lw * 4..(y + 1) * lw * 4];
-        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let w = wy * mx[x];
-            if w <= 0.0 {
-                continue;
-            }
-            let (a, b, tx) = xs[x];
+        let mixed4 = mixed.as_chunks::<4>().0;
+        let cols = row.as_chunks_mut::<4>().0[lo..hi].iter_mut().zip(&mx[lo..hi]).zip(&xs[lo..hi]);
+        for ((px, &m), &(a, b, tx)) in cols {
+            // w <= 0 rounds to 0, what the clear layer holds
+            let (w, pa, pb) = (wy * m, mixed4[a], mixed4[b]);
             for ch in 0..4 {
-                let top = r0[a * 4 + ch] as f32 + (r0[b * 4 + ch] as f32 - r0[a * 4 + ch] as f32) * tx;
-                let bottom = r1[a * 4 + ch] as f32 + (r1[b * 4 + ch] as f32 - r1[a * 4 + ch] as f32) * tx;
-                px[ch] = ((top + (bottom - top) * ty) * w + 0.5) as u8;
+                px[ch] = ((pa[ch] + (pb[ch] - pa[ch]) * tx) * w + 0.5) as u8;
             }
         }
     }
@@ -1459,7 +1547,8 @@ impl Img {
 
 #[cfg(test)]
 mod tests {
-    use super::{mul_div255, over};
+    use super::{Layer, blit, blit_layer, mul_div255, over};
+    use tiny_skia::Pixmap;
 
     #[test]
     fn packed_math_matches_per_channel() {
@@ -1469,12 +1558,42 @@ mod tests {
                 let want = |c: u32| (c * k + 127) / 255;
                 let got = mul_div255(p, k);
                 for (i, c) in [v, 255 - v, v, 255 - v].into_iter().enumerate() {
-                    assert!((((got >> (8 * i)) & 255) as i32 - want(c) as i32).abs() <= 1);
+                    assert_eq!((got >> (8 * i)) & 255, want(c));
                 }
             }
         }
         // opaque source replaces, transparent keeps
         assert_eq!(over(0x1234_5678, 0xff10_2030), 0xff10_2030);
         assert_eq!(over(0x1234_5678, 0), 0x1234_5678);
+    }
+
+    /// Skipping clear pixels and copying opaque runs changes nothing, wherever the layer lands.
+    #[test]
+    fn layer_blit_matches_blending_every_pixel() {
+        let (w, h) = (23u32, 9u32);
+        let mut src = Pixmap::new(w, h).unwrap();
+        for (i, px) in src.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % w as usize, i / w as usize);
+            // clear margins, an opaque middle with a translucent hole, translucent edges
+            let a: u8 = match x {
+                0..3 => 0,
+                3..6 => 90,
+                10 if y % 3 == 0 => 128,
+                6..18 => 255,
+                18..20 => 40,
+                _ => 0,
+            };
+            let c = (i * 37 % 256) as u8;
+            *px = [c.min(a), (c / 2).min(a), (255 - c).min(a), a];
+        }
+        let layer = Layer::new(src.clone());
+        let mut base = Pixmap::new(30, 14).unwrap();
+        base.data_mut().iter_mut().enumerate().for_each(|(i, v)| *v = (i * 53 % 256) as u8 | 0x80);
+        for (x, y) in [(0, 0), (4, 3), (-5, -2), (20, 10), (-30, 0), (12, -8)] {
+            let (mut want, mut got) = (base.clone(), base.clone());
+            blit(&mut want.as_mut(), src.as_ref(), x, y, 1.0);
+            blit_layer(&mut got.as_mut(), &layer, x, y);
+            assert!(want.data() == got.data(), "at {x},{y}");
+        }
     }
 }

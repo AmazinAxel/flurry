@@ -228,25 +228,15 @@ fn take(i: usize, region: Option<(i32, i32, i32, i32)>) {
     let Ok(image) = Rc::try_unwrap(image) else { return };
     let px = image.into_mapped();
     runtime::spawn(async move {
-        let png = runtime::blocking(move || {
-            let (w, h, rgb) = crop(px.as_ref(), dims, bgr, y_invert, size, region)?;
-            drop(px);
-            let mut out = Vec::new();
-            let mut e = png::Encoder::new(&mut out, w, h);
-            e.set_color(png::ColorType::Rgb);
-            e.set_depth(png::BitDepth::Eight);
-            e.set_compression(png::Compression::Fast);
-            e.write_header().ok()?.write_image_data(&rgb).ok()?;
-            Some(out)
-        });
+        let png = runtime::blocking(move || encode(px.as_ref(), dims, bgr, y_invert, size, region));
         if let Some(png) = png.await.flatten() {
             crate::lib::clipboard::copy_png(png);
         }
     });
 }
 
-/// `region` (logical, of a `sw`×`sh` surface) of an `iw`×`ih` 32-bit frame as packed RGB.
-fn crop(src: &[u8], (iw, ih): (u32, u32), bgr: bool, y_invert: bool, (sw, sh): (u32, u32), region: Option<(i32, i32, i32, i32)>) -> Option<(u32, u32, Vec<u8>)> {
+/// `region` (logical, of a `sw`×`sh` surface) of an `iw`×`ih` 32-bit frame as an RGB PNG.
+fn encode(src: &[u8], (iw, ih): (u32, u32), bgr: bool, y_invert: bool, (sw, sh): (u32, u32), region: Option<(i32, i32, i32, i32)>) -> Option<Vec<u8>> {
     let (l, t, r, b) = match region {
         None => (0, 0, iw, ih),
         Some((x, y, w, h)) => {
@@ -255,18 +245,16 @@ fn crop(src: &[u8], (iw, ih): (u32, u32), bgr: bool, y_invert: bool, (sw, sh): (
             (px(x, fx, iw), px(y, fy, ih), px(x + w, fx, iw), px(y + h, fy, ih))
         }
     };
-    let (w, h) = (r.checked_sub(l).filter(|&w| w > 0)? as usize, b.checked_sub(t).filter(|&h| h > 0)?);
-    let mut rgb = vec![0; w * h as usize * 3];
-    for (y, out) in (t..b).zip(rgb.chunks_exact_mut(w * 3)) {
-        let row = if y_invert { ih - 1 - y } else { y } as usize;
+    let (w, h) = (r.checked_sub(l).filter(|&w| w > 0)?, b.checked_sub(t).filter(|&h| h > 0)?);
+    Some(crate::ui::image::encode_png::<3>(w, h, |y, out| {
+        let row = if y_invert { ih - 1 - (t + y) } else { t + y } as usize;
         let start = (row * iw as usize + l as usize) * 4;
-        let px = out.as_chunks_mut::<3>().0.iter_mut().zip(src[start..start + w * 4].as_chunks::<4>().0);
+        let px = out.as_chunks_mut::<3>().0.iter_mut().zip(src[start..start + w as usize * 4].as_chunks::<4>().0);
         // the order checked per row, not per pixel: the loops vectorize
         if bgr {
             px.for_each(|(o, p)| *o = [p[2], p[1], p[0]]);
         } else {
             px.for_each(|(o, p)| *o = [p[0], p[1], p[2]]);
         }
-    }
-    Some((w as u32, h, rgb))
+    }))
 }

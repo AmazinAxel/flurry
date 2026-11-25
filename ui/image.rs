@@ -1,4 +1,4 @@
-// Image decoding (png, jpeg) into premultiplied pixmaps, gaussian blur, and box-fit scaling.
+// Image decoding (png, jpeg) into premultiplied pixmaps, png encoding, gaussian blur, and box-fit scaling.
 
 use tiny_skia::{IntSize, Pixmap};
 
@@ -15,27 +15,40 @@ fn too_big(w: usize, h: usize, max: u64) -> bool {
     (w as u64).checked_mul(h as u64).is_none_or(|n| n > max)
 }
 
-fn png_reader(bytes: &[u8], max: u64) -> Option<png::Reader<&[u8]>> {
-    let mut decoder = png::Decoder::new(bytes);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let reader = decoder.read_info().ok()?;
-    let i = reader.info();
-    (!too_big(i.width as usize, i.height as usize, max)).then_some(reader)
+type Cursor<'a> = zune_jpeg::zune_core::bytestream::ZCursor<&'a [u8]>;
+type PngDecoder<'a> = zune_png::PngDecoder<Cursor<'a>>;
+
+/// Palette and tRNS expanded, 16-bit cut to 8: Luma, LumaA, RGB or RGBA.
+fn png_reader(bytes: &[u8], max: u64) -> Option<PngDecoder<'_>> {
+    let opts = zune_jpeg::zune_core::options::DecoderOptions::default()
+        .png_set_strip_to_8bit(true)
+        .set_max_width(1 << 15)
+        .set_max_height(1 << 15);
+    let mut d = zune_png::PngDecoder::new_with_options(Cursor::new(bytes), opts);
+    d.decode_headers().ok()?;
+    let (w, h) = d.dimensions()?;
+    (!too_big(w, h, max)).then_some(d)
+}
+
+fn png_dims(d: &PngDecoder) -> (u32, u32) {
+    d.dimensions().map_or((0, 0), |(w, h)| (w as u32, h as u32))
 }
 
 /// Decodes the frame into the front of `dst` (sized w*h*4), then expands it in place, back to
 /// front, to premultiplied RGBA: no intermediate buffer.
-fn png_frame(reader: &mut png::Reader<&[u8]>, dst: &mut [u8]) -> Option<()> {
-    let info = reader.next_frame(dst).ok()?;
-    let n = info.width as usize * info.height as usize;
-    if dst.len() != n * 4 || info.bit_depth != png::BitDepth::Eight {
+fn png_frame(d: &mut PngDecoder, dst: &mut [u8]) -> Option<()> {
+    let (w, h) = d.dimensions()?;
+    let n = w * h;
+    let ch = d.colorspace()?.num_components();
+    if dst.len() != n * 4 {
         return None;
     }
-    match info.color_type {
-        png::ColorType::Rgba => expand::<4>(dst, n, |p| [p[0], p[1], p[2], p[3]]),
-        png::ColorType::Rgb => expand::<3>(dst, n, |p| [p[0], p[1], p[2], 255]),
-        png::ColorType::GrayscaleAlpha => expand::<2>(dst, n, |p| [p[0], p[0], p[0], p[1]]),
-        png::ColorType::Grayscale => expand::<1>(dst, n, |p| [p[0], p[0], p[0], 255]),
+    d.decode_into(dst).ok()?;
+    match ch {
+        4 => expand::<4>(dst, n, |p| [p[0], p[1], p[2], p[3]]),
+        2 => expand::<2>(dst, n, |p| [p[0], p[0], p[0], p[1]]),
+        3 => expand::<3>(dst, n, |p| [p[0], p[1], p[2], 255]),
+        1 => expand::<1>(dst, n, |p| [p[0], p[0], p[0], 255]),
         _ => return None,
     }
     Some(())
@@ -49,6 +62,40 @@ fn expand<const CH: usize>(dst: &mut [u8], n: usize, f: impl Fn(&[u8]) -> [u8; 4
     }
 }
 
+/// A PNG of `w`×`h` 8-bit pixels of `CH` channels (3: RGB, 4: RGBA), `row(y, out)` writing each
+/// row: Up-filtered (flat UI turns into zero runs) and compressed by fdeflate as it goes, with no
+/// whole-image intermediate buffer.
+pub fn encode_png<const CH: usize>(w: u32, h: u32, mut row: impl FnMut(u32, &mut [u8])) -> Vec<u8> {
+    let stride = w as usize * CH;
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = [0u8; 13];
+    ihdr[..4].copy_from_slice(&w.to_be_bytes());
+    ihdr[4..8].copy_from_slice(&h.to_be_bytes());
+    ihdr[8] = 8;
+    ihdr[9] = if CH == 4 { 6 } else { 2 };
+    png_chunk(&mut out, b"IHDR", &ihdr);
+    let (mut cur, mut prev, mut line) = (vec![0u8; stride], vec![0u8; stride], vec![2u8; stride + 1]);
+    let mut z = fdeflate::Compressor::new(Vec::with_capacity(stride * h as usize / 8)).expect("Vec writes can't fail");
+    for y in 0..h {
+        row(y, &mut cur);
+        line[1..].iter_mut().zip(cur.iter().zip(&prev)).for_each(|(o, (c, p))| *o = c.wrapping_sub(*p));
+        z.write_data(&line).expect("Vec writes can't fail");
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    png_chunk(&mut out, b"IDAT", &z.finish().expect("Vec writes can't fail"));
+    png_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let crc = crc32fast::hash(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
 /// A color glyph's bitmap.
 pub fn decode_png(bytes: &[u8]) -> Option<Pixmap> {
     let (buf, w, h) = png_pixels(bytes, GLYPH_PIXELS)?;
@@ -57,22 +104,22 @@ pub fn decode_png(bytes: &[u8]) -> Option<Pixmap> {
 
 fn png_pixels(bytes: &[u8], max: u64) -> Option<(Vec<u8>, u32, u32)> {
     let mut reader = png_reader(bytes, max)?;
-    let (w, h) = (reader.info().width, reader.info().height);
+    let (w, h) = png_dims(&reader);
     let mut buf = vec![0; w as usize * h as usize * 4];
     png_frame(&mut reader, &mut buf)?;
     Some((buf, w, h))
 }
 
-fn jpeg_decoder(bytes: &[u8]) -> zune_jpeg::JpegDecoder<&[u8]> {
+fn jpeg_decoder(bytes: &[u8]) -> zune_jpeg::JpegDecoder<Cursor<'_>> {
     let opts = zune_jpeg::zune_core::options::DecoderOptions::default()
         .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA)
         .set_max_width(1 << 15)
         .set_max_height(1 << 15);
-    zune_jpeg::JpegDecoder::new_with_options(bytes, opts)
+    zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), opts)
 }
 
 /// Header read and size checked; also the EXIF orientation (1: upright).
-fn jpeg_dims(d: &mut zune_jpeg::JpegDecoder<&[u8]>, max: u64) -> Option<(u32, u32, u8)> {
+fn jpeg_dims(d: &mut zune_jpeg::JpegDecoder<Cursor<'_>>, max: u64) -> Option<(u32, u32, u8)> {
     d.decode_headers().ok()?;
     let (w, h) = d.dimensions()?;
     let o = d.exif().map_or(1, |e| exif_orientation(e));
@@ -81,10 +128,10 @@ fn jpeg_dims(d: &mut zune_jpeg::JpegDecoder<&[u8]>, max: u64) -> Option<(u32, u3
 
 /// Decodes into the front of `dst` (sized w*h*4), then widens it to RGBA in place: grayscale
 /// JPEGs come out as Luma whatever colorspace was asked for. Opaque, so already premultiplied.
-fn jpeg_frame(d: &mut zune_jpeg::JpegDecoder<&[u8]>, dst: &mut [u8]) -> Option<()> {
+fn jpeg_frame(d: &mut zune_jpeg::JpegDecoder<Cursor<'_>>, dst: &mut [u8]) -> Option<()> {
     let (w, h) = d.dimensions()?;
     let n = w * h;
-    let ch = d.get_output_colorspace()?.num_components();
+    let ch = d.output_colorspace()?.num_components();
     let dst = dst.get_mut(..n * 4)?;
     d.decode_into(dst).ok()?;
     match ch {
@@ -183,7 +230,7 @@ pub fn decode_into<T: AsMut<[u8]>>(
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => {
             let mut reader = png_reader(bytes, max)?;
-            let (w, h) = (reader.info().width, reader.info().height);
+            let (w, h) = png_dims(&reader);
             if target(w, h) == (w, h) {
                 let mut t = alloc(w, h)?;
                 png_frame(&mut reader, t.as_mut())?;
@@ -220,27 +267,44 @@ pub fn downscale(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], dw: usize, dh
         return;
     }
     let xs: Vec<usize> = (0..=dw).map(|x| x * sw / dw).collect();
-    let mut acc = vec![0u32; dw * 4];
+    let q = sw / dw;
+    // an output row's source rows summed per column first (a straight add over whole rows, which
+    // vectorizes), then each output pixel's span of columns once
+    let mut cols = vec![0u32; sw * 4];
     for y in 0..dh {
         let (y0, y1) = (y * sh / dh, (y + 1) * sh / dh);
-        acc.fill(0);
+        cols.fill(0);
         for row in src[y0 * sw * 4..y1 * sw * 4].chunks_exact(sw * 4) {
-            for (x, a) in acc.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                for px in row[xs[x] * 4..xs[x + 1] * 4].as_chunks::<4>().0 {
-                    for c in 0..4 {
-                        a[c] += px[c] as u32;
-                    }
-                }
-            }
+            cols.iter_mut().zip(row).for_each(|(c, &v)| *c += v as u32);
         }
+        let rows = y1 - y0;
+        // spans are q or q + 1 columns wide: a reciprocal per pixel count, not a division per channel
+        let magic = [q, q + 1].map(|s| recip(s * rows));
+        let exact = (q + 1) * rows < 1 << 16;
+        let cols4 = cols.as_chunks::<4>().0;
         let out = &mut dst[y * dw * 4..(y + 1) * dw * 4];
-        for (x, (o, a)) in out.as_chunks_mut::<4>().0.iter_mut().zip(acc.as_chunks::<4>().0).enumerate() {
-            let n = ((xs[x + 1] - xs[x]) * (y1 - y0)) as u32;
+        for (x, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let a = cols4[xs[x]..xs[x + 1]].iter().fold([0u32; 4], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2], a[3] + c[3]]);
+            let span = xs[x + 1] - xs[x];
+            let (n, m) = ((span * rows) as u32, magic[span - q]);
             for c in 0..4 {
-                o[c] = ((a[c] + n / 2) / n) as u8;
+                let v = a[c] + n / 2;
+                o[c] = if exact { div_recip(v, m) as u8 } else { (v / n) as u8 };
             }
         }
     }
+}
+
+/// 2^40 / n rounded up: `div_recip(v, recip(n))` is v / n for every v < 256n while n <= 2^16 (the
+/// estimate's error, under 256n / 2^40, stays below 1 / n).
+#[inline(always)]
+fn recip(n: usize) -> u64 {
+    (1u64 << 40) / n as u64 + 1
+}
+
+#[inline(always)]
+fn div_recip(v: u32, m: u64) -> u32 {
+    ((v as u64 * m) >> 40) as u32
 }
 
 /// Coverage along one axis of `len` px of the span [start, end) blurred like `blur` by `radius`:
@@ -283,14 +347,17 @@ pub fn blur(p: &mut Pixmap, radius: f32) {
     }
 }
 
-/// `blur` of the alpha channel only (a quarter of the work), color left black: for shadows,
-/// which are tinted from alpha afterwards.
-pub fn blur_alpha(p: &mut Pixmap, radius: f32) {
+/// `blur` of the alpha channel only (a quarter of the work), each pixel then `tint`ed from its
+/// blurred alpha: for shadows (colored from alpha in the same pass).
+pub fn blur_alpha(p: &mut Pixmap, radius: f32, tint: impl Fn(u8) -> [u8; 4]) {
     let (w, h) = (p.width() as usize, p.height() as usize);
     let src: Vec<f32> = p.data().iter().skip(3).step_by(4).map(|&v| v as f32).collect();
-    let Some(a) = gaussian(src, w, h, 1, radius) else { return };
+    let Some(a) = gaussian(src, w, h, 1, radius) else {
+        p.data_mut().as_chunks_mut::<4>().0.iter_mut().for_each(|px| *px = tint(px[3]));
+        return;
+    };
     for (px, v) in p.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(a) {
-        *px = [0, 0, 0, (v + 0.5) as u8];
+        *px = tint((v + 0.5) as u8);
     }
 }
 
@@ -307,10 +374,19 @@ fn gaussian(src: Vec<f32>, w: usize, h: usize, ch: usize, radius: f32) -> Option
     if f > 1 {
         let (sw, sh) = (w.div_ceil(f), h.div_ceil(f));
         let mut small = vec![0f32; sw * sh * ch];
-        for (y, row) in src.chunks_exact(w * ch).enumerate() {
-            let dst = &mut small[(y / f) * sw * ch..(y / f + 1) * sw * ch];
-            for (x, px) in row.chunks_exact(ch).enumerate() {
-                dst[(x / f) * ch..(x / f + 1) * ch].iter_mut().zip(px).for_each(|(d, s)| *d += s);
+        // a block row's source rows summed first (whole rows, vectorized), then its columns in
+        // blocks; the samples are whole numbers, so the f32 sums are exact in any order
+        let mut sum = vec![0f32; w * ch];
+        for (sy, rows) in src.chunks(f * w * ch).enumerate() {
+            sum.fill(0.0);
+            for row in rows.chunks_exact(w * ch) {
+                sum.iter_mut().zip(row).for_each(|(d, s)| *d += s);
+            }
+            let dst = &mut small[sy * sw * ch..(sy + 1) * sw * ch];
+            for (d, cols) in dst.chunks_exact_mut(ch).zip(sum.chunks(f * ch)) {
+                for px in cols.chunks_exact(ch) {
+                    d.iter_mut().zip(px).for_each(|(d, s)| *d += s);
+                }
             }
         }
         // edge blocks may be partial: average over what they cover
@@ -467,6 +543,37 @@ mod tests {
     }
 
     #[test]
+    fn reciprocal_division_is_exact() {
+        for n in 1..1u32 << 16 {
+            let m = recip(n as usize);
+            // the quotient's steps: each multiple of n, the value just below it, and the largest v
+            for v in (0..256 * n).step_by(n as usize).flat_map(|k| [k.saturating_sub(1), k, k + n / 2]).chain([256 * n - 1]) {
+                assert_eq!(div_recip(v, m), v / n, "{v} / {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn downscale_matches_per_pixel_box() {
+        let (sw, sh) = (37, 23);
+        let src: Vec<u8> = (0..sw * sh * 4).map(|i| (i * 7919 % 251) as u8).collect();
+        for (dw, dh) in [(37, 23), (10, 7), (5, 23), (1, 1), (36, 22)] {
+            let mut got = vec![0u8; dw * dh * 4];
+            downscale(&src, sw, sh, &mut got, dw, dh);
+            for y in 0..dh {
+                for x in 0..dw {
+                    let (x0, x1, y0, y1) = (x * sw / dw, (x + 1) * sw / dw, y * sh / dh, (y + 1) * sh / dh);
+                    let n = ((x1 - x0) * (y1 - y0)) as u32;
+                    for c in 0..4 {
+                        let s: u32 = (y0..y1).flat_map(|sy| (x0..x1).map(move |sx| (sy, sx))).map(|(sy, sx)| src[(sy * sw + sx) * 4 + c] as u32).sum();
+                        assert_eq!(got[(y * dw + x) * 4 + c], ((s + n / 2) / n) as u8, "{dw}x{dh} at {x},{y}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn expands_in_place_premultiplied() {
         // two gray+alpha pixels at the front, widened to RGBA
         let mut buf = [200, 255, 100, 0, 0, 0, 0, 0];
@@ -482,5 +589,41 @@ mod tests {
         let total: u32 = p.data().chunks(4).map(|c| c[3] as u32).sum();
         assert!((200..=300).contains(&total), "{total}");
     }
-}
 
+    #[test]
+    fn png_round_trips() {
+        let px: [[u8; 4]; 6] = [[255, 0, 0, 255], [0, 255, 0, 128], [0, 0, 255, 0], [10, 20, 30, 255], [10, 20, 30, 255], [200, 100, 50, 64]];
+        let png = encode_png::<4>(3, 2, |y, row| row.copy_from_slice(px[y as usize * 3..][..3].as_flattened()));
+        let (got, w, h) = decode_pixels(&png, 100).unwrap();
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(got, px.map(premultiply).as_flattened());
+        let png = encode_png::<3>(3, 2, |y, row| row.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, y as u8]));
+        let (got, _, _) = decode_pixels(&png, 100).unwrap();
+        assert_eq!(got, [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 0, 255, 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 1, 255]);
+        assert!(decode_pixels(&png, 5).is_none(), "over the pixel cap");
+    }
+
+    /// Hand-built PNGs: what the decoder must expand (palette + tRNS, 16-bit gray).
+    fn raw_png(ihdr: [u8; 5], extra: &[(&[u8; 4], &[u8])], rows: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut hdr = [0u8; 13];
+        hdr[..4].copy_from_slice(&w.to_be_bytes());
+        hdr[4..8].copy_from_slice(&h.to_be_bytes());
+        hdr[8..].copy_from_slice(&ihdr);
+        png_chunk(&mut out, b"IHDR", &hdr);
+        for (k, d) in extra {
+            png_chunk(&mut out, k, d);
+        }
+        png_chunk(&mut out, b"IDAT", &fdeflate::compress_to_vec(rows));
+        png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn png_expands_palette_and_16_bit() {
+        let pal = raw_png([8, 3, 0, 0, 0], &[(b"PLTE", &[255, 0, 0, 0, 0, 255]), (b"tRNS", &[0])], &[0, 0, 1], 2, 1);
+        assert_eq!(decode_pixels(&pal, 100).unwrap().0, [0, 0, 0, 0, 0, 0, 255, 255]);
+        let gray = raw_png([16, 0, 0, 0, 0], &[], &[0, 0x80, 0xff, 0xff, 0x00], 2, 1);
+        assert_eq!(decode_pixels(&gray, 100).unwrap().0, [128, 128, 128, 255, 255, 255, 255, 255]);
+    }
+}

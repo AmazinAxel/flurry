@@ -1,4 +1,4 @@
-{ lib, rustPlatform, writeText, runCommand, settings ? {}, sideview, pkg-config, makeBinaryWrapper, harfbuzz, fontconfig, woff2, libxkbcommon, dbus, pipewire, pam,
+{ lib, rustPlatform, writeText, runCommand, settings ? {}, sideview, pkg-config, makeBinaryWrapper, harfbuzz, fontconfig, woff2, libxkbcommon, dbus, pam,
   nerd-fonts, noto-fonts-color-emoji, dejavu_fonts,
   swappy, ffmpeg-headless }: let
   bins = [ swappy ffmpeg-headless ];
@@ -150,8 +150,8 @@ in rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false; # tests run in the dev shell; skipping them saves a second LTO compile per rebuild
 
-  nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook makeBinaryWrapper ];
-  buildInputs = [ harfbuzz libxkbcommon dbus pipewire pam ];
+  nativeBuildInputs = [ pkg-config makeBinaryWrapper ];
+  buildInputs = [ harfbuzz libxkbcommon dbus pam ];
 
   postPatch = ''
     cat ${settingsRs} ${fonts}/fonts.rs > settings.rs

@@ -382,12 +382,20 @@ pub fn text_node(this: &EntryRef, style: Style, look: Look) -> Node {
         // paint into a layer bounded horizontally to the text area (vertical slack for descenders)
         let bound = Rect::from_ltrb(r.left(), r.top() - r.height(), r.right(), r.bottom() + r.height()).unwrap_or(r);
         // shadows blur only the glyphs that are shown, so they fade out past the text area's edges
-        for sh in shadows.iter().filter(|_| !blank) {
+        // and only around them: the text area is mostly empty, and every keystroke re-blurs (a font
+        // size of slack covers ink past the advances). Its corner stays on the area's grid of 8 device
+        // px, the most a wide blur shrinks by: the same blocks get averaged, so the same pixels come out.
+        let m = font.size;
+        let step = 8.0 / ts.sx.max(f32::EPSILON);
+        let snap = |v: f32, o: f32| o + ((v - o) / step).floor().max(0.0) * step;
+        let (il, it) = (snap(x - m, bound.left()), snap(y - m, bound.top()));
+        let ink = Rect::from_ltrb(il, it, x + layout.width() + m, y + layout.height() + m).and_then(|i| i.intersect(&bound));
+        for (sh, ink) in shadows.iter().filter(|_| !blank).filter_map(|sh| Some((sh, ink?))) {
             let content = super::node::hash(&(layout.content_hash(), (x - r.x()).to_bits(), (y - r.y()).to_bits(), r.width().to_bits(), r.height().to_bits()));
-            let area = bound.transform(Transform::from_translate(sh.x, sh.y)).unwrap_or(bound);
+            let area = ink.transform(Transform::from_translate(sh.x, sh.y)).unwrap_or(ink);
             let tint = sh.over(color).color;
             super::node::blurred(pm, area, sh.blur, tint, ts, content, |p, t| {
-                if let Some((mut layer, (ox, oy))) = super::node::clip_layer(bound, t) {
+                if let Some((mut layer, (ox, oy))) = super::node::clip_layer(ink, t) {
                     text::draw(&mut layer.as_mut(), &layout, x, y, Color::BLACK, t.post_translate(-ox, -oy));
                     super::node::blit(p, layer.as_ref(), (ox + sh.x * ts.sx) as i32, (oy + sh.y * ts.sy) as i32, 1.0);
                 }
