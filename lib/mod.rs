@@ -33,3 +33,4 @@ pub mod notifySend;
 pub mod outTransition;
 pub mod menuWindow;
 pub mod deviceMenu;
+pub mod reminders;

@@ -41,6 +41,9 @@ thread_local! {
     static CURRENT: RefCell<Option<String>> = const { RefCell::new(None) };
     static WIDTH: Cell<u32> = const { Cell::new(style::SIDEVIEW_WIDTH) };
     static OPENED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// a closed helper not yet exited: (pid, pidfd), killed only if it's still there when the
+    /// sideview is opened or closed again
+    static CLOSING: RefCell<Option<(u32, Rc<OwnedFd>)>> = const { RefCell::new(None) };
 }
 
 /// The dim goes up only with the panel actually on screen, and only while it has the keyboard.
@@ -69,6 +72,13 @@ fn kill(pidfd: &OwnedFd) {
     unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) };
 }
 
+/// Kills a closed helper that hasn't exited yet (its exit watch still reaps it).
+fn kill_closing() {
+    if let Some((_, pidfd)) = CLOSING.with(|c| c.borrow_mut().take()) {
+        kill(&pidfd);
+    }
+}
+
 /// Reaps the helper on exit; the current one's exit also takes its panel down.
 fn watch_exit(child: Child, pidfd: Rc<OwnedFd>) {
     let pid = child.id();
@@ -79,6 +89,12 @@ fn watch_exit(child: Child, pidfd: Rc<OwnedFd>) {
         let _keep = &pidfd;
         let _ = child.borrow_mut().try_wait();
         // a closed helper's exit (close_sideview) leaves the current one alone
+        CLOSING.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.as_ref().is_some_and(|(p, _)| *p == pid) {
+                c.take();
+            }
+        });
         if HELPER.with(|h| h.borrow().as_ref().is_some_and(|h| h.pid == pid)) {
             helper_gone();
         }
@@ -158,6 +174,7 @@ fn ensure_helper(h: &mut Option<Helper>) -> bool {
     if h.is_some() {
         return true;
     }
+    kill_closing();
     let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("flurry-sideview")));
     let exe = exe.filter(|p| p.exists()).map(|p| p.into_os_string()).unwrap_or_else(|| "flurry-sideview".into());
     // its one argument: the panel background before a page paints
@@ -265,9 +282,11 @@ pub fn toggle_sideview() {
 /// Destroys all web views (the whole helper process).
 pub fn close_sideview() {
     hide_sideview();
-    if let Some(Helper { pidfd, stdin, .. }) = HELPER.with(|h| h.borrow_mut().take()) {
+    // asked again while the last one is still exiting: it's stuck
+    kill_closing();
+    if let Some(Helper { pid, pidfd, stdin }) = HELPER.with(|h| h.borrow_mut().take()) {
         drop(stdin); // EOF: the helper exits by itself (stopping Claude Code); its watch reaps it
-        runtime::timeout(1000, move || kill(&pidfd));
+        CLOSING.with(|c| *c.borrow_mut() = Some((pid, pidfd)));
     }
     CURRENT.with(|c| c.borrow_mut().take());
 }

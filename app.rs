@@ -121,82 +121,6 @@ fn parse_request(line: &str) -> Option<(&str, Option<&str>)> {
     })
 }
 
-thread_local! {
-    /// each reminder last sent (id, unix secs): not again while it's up or for a day after
-    static SYNC_NOTE: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
-    static DOWNLOADS_NOTE: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
-}
-
-/// True when `note`'s reminder is still up or under a day old.
-fn recent(note: &'static std::thread::LocalKey<std::cell::Cell<Option<(u32, u64)>>>, app: &str) -> bool {
-    note.with(|n| n.get()).is_some_and(|(id, at)| lib::time::now_secs() < at + 86_400 || lib::notifd::get(id).is_some_and(|n| n.app_name == app))
-}
-
-/// Checked at startup, then once a day (a one-shot timer chain, no polling).
-fn reminders() {
-    let _ = runtime::timeout(86_400_000, reminders);
-    sync_reminder();
-    let downloads = xdg::user_dir("DOWNLOAD");
-    // no Downloads dir configured: user-dirs points it at $HOME, whose size means nothing here
-    if downloads.trim_end_matches('/') == xdg::home_dir().trim_end_matches('/') || recent(&DOWNLOADS_NOTE, "Cleanup") {
-        return;
-    }
-    // the walk can take a while on a full folder: off the loop
-    ui::runtime::spawn(async move {
-        let d = downloads.clone();
-        // Greater than 100MB
-        if ui::runtime::blocking(move || dir_size(std::path::Path::new(&d))).await.unwrap_or(0) > 100_000_000 {
-            let argv: Vec<String> = settings::FILE_MANAGER.iter().map(|s| s.to_string()).chain([downloads]).collect();
-            let id = lib::notifySend::notify_send("Cleanup", "Empty Downloads", "", vec![(1, "View folder".into(), argv)]);
-            DOWNLOADS_NOTE.with(|n| n.set(Some((id, lib::time::now_secs()))));
-        }
-    });
-}
-
-/// Reminds to sync when the last successful one is over a week old (wall clock, so time asleep
-/// counts).
-fn sync_reminder() {
-    // lastSync: unix ms
-    let last_sync = format!("{}/flurry/lastSync", xdg::state_dir());
-    let last: u64 = std::fs::read_to_string(&last_sync).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    let now = lib::time::now_secs() * 1000;
-    if settings::SYNC_COMMAND.is_empty() || now.saturating_sub(last) <= 7 * 86_400_000 || recent(&SYNC_NOTE, "Sync") {
-        return;
-    }
-    let id = lib::notifd::send_local("Sync", "Sync system", "", &[("1".into(), "Update & Sync".into())], move |action| {
-        if action != "1" {
-            return;
-        }
-        let last_sync = last_sync.clone();
-        runtime::spawn(async move {
-            if lib::process::status(settings::SYNC_COMMAND).await != Some(0) {
-                return;
-            }
-            if let Some(dir) = std::path::Path::new(&last_sync).parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = xdg::write_atomic(&last_sync, (lib::time::now_secs() * 1000).to_string().as_bytes(), 0o644) {
-                eprintln!("flurry: {last_sync}: {e}");
-            }
-        });
-    });
-    SYNC_NOTE.with(|n| n.set(Some((id, now / 1000))));
-}
-
-/// `du -sb`: apparent size of everything under `p`.
-fn dir_size(p: &std::path::Path) -> u64 {
-    let Ok(meta) = std::fs::symlink_metadata(p) else { return 0 };
-    let mut total = meta.len();
-    if meta.is_dir()
-        && let Ok(rd) = std::fs::read_dir(p)
-    {
-        for e in rd.flatten() {
-            total += dir_size(&e.path());
-        }
-    }
-    total
-}
-
 fn main() {
     // big temporaries (paint layers, decodes) straight from/back to the kernel: glibc's adaptive
     // threshold otherwise moves them onto the heap after the first free, where they stay resident
@@ -253,13 +177,7 @@ fn main() {
         lib::brightness::monitor();
         service::start();
         lib::apps::reload();
-        reminders();
-        // monotonic timers stand still while suspended: a resume re-checks too
-        lib::logind::sleeping().subscribe(|| {
-            if !lib::logind::sleeping().peek() {
-                sync_reminder();
-            }
-        });
+        lib::reminders::start();
         service::start_clipping_service();
         unsafe { libc::malloc_trim(0) };
     };

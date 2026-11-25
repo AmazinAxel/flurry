@@ -80,3 +80,65 @@ pub fn start() {
         }
     });
 }
+
+/// A one-shot timer on the wall clock (CLOCK_REALTIME timerfd): counts time asleep, unlike the
+/// loop's monotonic timers. Dropped: cancelled.
+pub struct WallTimer(std::os::fd::OwnedFd);
+
+impl Drop for WallTimer {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        runtime::unwatch(self.0.as_raw_fd());
+    }
+}
+
+/// Runs `f` once the wall clock reaches `secs` (unix), at once if it already has. A clock change
+/// (set by hand, NTP stepping it) runs it early too: the caller re-checks its deadline then.
+pub fn at_wall(secs: u64, f: impl FnOnce() + 'static) -> Option<WallTimer> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let fd = unsafe { libc::timerfd_create(libc::CLOCK_REALTIME, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // 0 would disarm it: a deadline in the past is due now all the same
+    let at = libc::timespec { tv_sec: secs.clamp(1, i64::MAX as u64) as libc::time_t, tv_nsec: 0 };
+    let spec = libc::itimerspec { it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 }, it_value: at };
+    let flags = libc::TFD_TIMER_ABSTIME | libc::TFD_TIMER_CANCEL_ON_SET;
+    if unsafe { libc::timerfd_settime(fd.as_raw_fd(), flags, &spec, std::ptr::null_mut()) } < 0 {
+        return None;
+    }
+    let raw = fd.as_raw_fd();
+    let f = std::cell::Cell::new(Some(f));
+    runtime::watch(raw, move || {
+        runtime::unwatch(raw);
+        if let Some(f) = f.take() {
+            f();
+        }
+    });
+    Some(WallTimer(fd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn wall_timer_fires_when_due_and_not_once_dropped() {
+        let (due, later) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        let (d, l) = (due.clone(), later.clone());
+        // already past: due at once
+        let _t = at_wall(now_secs() - 5, move || d.set(true)).expect("timerfd");
+        let dropped = at_wall(now_secs() - 5, move || l.set(true)).expect("timerfd");
+        drop(dropped);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !due.get() && std::time::Instant::now() < end {
+            runtime::iterate(false);
+        }
+        assert!(due.get());
+        runtime::iterate(false);
+        assert!(!later.get());
+    }
+}

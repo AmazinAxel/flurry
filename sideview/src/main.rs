@@ -1031,7 +1031,11 @@ fn main() {
             // a paste coming in
             libc::pollfd { fd: shared.receive.borrow().as_ref().map_or(-1, |r| r.file.as_raw_fd()), events: libc::POLLIN, revents: 0 },
         ];
-        let timeout = state.repeat_key.map(|r| r.1.saturating_duration_since(Instant::now()).as_millis() as i32).unwrap_or(-1);
+        // rounded up: a truncated wait wakes just before the repeat is due and spins until it is
+        let timeout = state
+            .repeat_key
+            .map(|r| r.1.saturating_duration_since(Instant::now()).as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
+            .unwrap_or(-1);
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if fds[0].revents & libc::POLLIN != 0 {
             if guard.read().is_err() {

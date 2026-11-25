@@ -1,14 +1,18 @@
-// i3-ipc over $SWAYSOCK: requests on one kept socket, subscriptions on their own.
+// i3-ipc over $SWAYSOCK: requests on one kept socket, every subscription on one shared event socket.
 
 use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::rc::Rc;
 
 use crate::lib::json::{self, Json};
 use crate::ui::runtime;
 
 const MAGIC: &[u8] = b"i3-ipc";
+/// set on event message types
+const EVENT: u32 = 0x8000_0000;
+const WINDOW: u32 = 3;
 
 fn encode(kind: u32, payload: &str) -> Vec<u8> {
     let mut m = Vec::with_capacity(14 + payload.len());
@@ -19,19 +23,19 @@ fn encode(kind: u32, payload: &str) -> Vec<u8> {
     m
 }
 
-/// Pops one complete message (type, body) off `buf`.
-fn decode(buf: &mut Vec<u8>) -> Option<(u32, String)> {
-    if buf.len() < 14 {
-        return None;
+/// Takes every complete message (type, body) off `buf` in one pass, keeping a partial tail.
+fn decode(buf: &mut Vec<u8>) -> Vec<(u32, String)> {
+    let mut out = vec![];
+    let mut off = 0;
+    while let Some(head) = buf.get(off..off + 14) {
+        let len = u32::from_le_bytes([head[6], head[7], head[8], head[9]]) as usize;
+        let kind = u32::from_le_bytes([head[10], head[11], head[12], head[13]]);
+        let Some(body) = buf.get(off + 14..off + 14 + len) else { break };
+        out.push((kind, String::from_utf8_lossy(body).into_owned()));
+        off += 14 + len;
     }
-    let len = u32::from_le_bytes(buf[6..10].try_into().ok()?) as usize;
-    let kind = u32::from_le_bytes(buf[10..14].try_into().ok()?);
-    if buf.len() < 14 + len {
-        return None;
-    }
-    let body = String::from_utf8_lossy(&buf[14..14 + len]).into_owned();
-    buf.drain(..14 + len);
-    Some((kind, body))
+    buf.drain(..off);
+    out
 }
 
 fn connect() -> Option<UnixStream> {
@@ -94,39 +98,120 @@ pub fn workspaces() -> Option<Json> {
     roundtrip(1, "")
 }
 
-/// Subscribes to `events`; `cb` gets each event body.
+/// The event type sway numbers `name` with (the low bits of its message type).
+fn event_kind(name: &str) -> Option<u32> {
+    Some(match name {
+        "workspace" => 0,
+        "output" => 1,
+        "mode" => 2,
+        "window" => WINDOW,
+        "barconfig_update" => 4,
+        "binding" => 5,
+        "shutdown" => 6,
+        "tick" => 7,
+        "bar_state_update" => 0x14,
+        "input" => 0x15,
+        _ => return None,
+    })
+}
+
+/// An event's "change" (sway writes it first), read without parsing the rest. A "change" inside a
+/// string value is escaped, so the first unescaped one is the event's own.
+fn change_of(body: &str) -> Option<&str> {
+    let rest = &body[body.find("\"change\"")? + 8..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    rest.split('"').next()
+}
+
+type EventCb = Rc<dyn Fn(&Json)>;
+
+struct Events {
+    sock: UnixStream,
+    buf: Vec<u8>,
+    /// event types already subscribed on `sock`
+    subscribed: Vec<u32>,
+    subs: Vec<(Vec<u32>, EventCb)>,
+}
+
+thread_local! {
+    static EVENTS: RefCell<Option<Events>> = const { RefCell::new(None) };
+}
+
+/// Subscribes to `events`; `cb` gets each event body. All subscribers share one socket and each
+/// event is parsed once. Window title changes are dropped unparsed: nothing here uses them, and
+/// terminals send one per prompt.
 pub fn subscribe(events: &[&str], cb: impl Fn(&Json) + 'static) {
-    let Some(mut s) = connect() else { return };
-    let list = format!("[{}]", events.iter().map(|e| json::quote(e)).collect::<Vec<_>>().join(","));
-    if s.write_all(&encode(2, &list)).is_err() {
+    let kinds: Vec<u32> = events.iter().filter_map(|e| event_kind(e)).collect();
+    if kinds.is_empty() {
         return;
     }
-    let _ = s.set_nonblocking(true);
-    let fd = s.as_raw_fd();
-    let buf = RefCell::new(Vec::new());
-    runtime::watch(fd, move || {
-        let mut chunk = [0u8; 65536];
+    EVENTS.with(|ev| {
+        let mut ev = ev.borrow_mut();
+        if ev.is_none() {
+            let Some(sock) = connect() else { return };
+            if sock.set_nonblocking(true).is_err() {
+                return;
+            }
+            runtime::watch(sock.as_raw_fd(), read_events);
+            *ev = Some(Events { sock, buf: vec![], subscribed: vec![], subs: vec![] });
+        }
+        let Some(e) = ev.as_mut() else { return };
+        let new: Vec<&str> = events.iter().copied().filter(|n| event_kind(n).is_some_and(|k| !e.subscribed.contains(&k))).collect();
+        if !new.is_empty() {
+            // its reply comes back among the events (not an event type: skipped)
+            let list = format!("[{}]", new.iter().map(|n| json::quote(n)).collect::<Vec<_>>().join(","));
+            if (&e.sock).write_all(&encode(2, &list)).is_err() {
+                return;
+            }
+            e.subscribed.extend(new.iter().filter_map(|n| event_kind(n)));
+        }
+        e.subs.push((kinds, Rc::new(cb)));
+    });
+}
+
+fn read_events() {
+    let mut chunk = [0u8; 65536];
+    // None: the socket is gone
+    let got = EVENTS.with(|ev| {
+        let mut ev = ev.borrow_mut();
+        let e = ev.as_mut()?;
         loop {
-            match (&s).read(&mut chunk) {
-                Ok(n) if n > 0 => buf.borrow_mut().extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            match (&e.sock).read(&mut chunk) {
+                Ok(n) if n > 0 => e.buf.extend_from_slice(&chunk[..n]),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
                 // EOF or a reset socket: poll() would report it forever
                 _ => {
-                    runtime::unwatch(fd);
-                    return;
+                    runtime::unwatch(e.sock.as_raw_fd());
+                    *ev = None;
+                    return None;
                 }
             }
         }
-        while let Some((kind, body)) = decode(&mut buf.borrow_mut()) {
-            if kind & 0x8000_0000 != 0
-                && let Some(j) = json::parse(&body)
-            {
+        Some((decode(&mut e.buf), e.subs.clone()))
+    });
+    let Some((msgs, subs)) = got else { return };
+    // run outside the borrow: a handler may subscribe
+    for (kind, body) in msgs {
+        if kind & EVENT == 0 {
+            continue;
+        }
+        let kind = kind & !EVENT;
+        if kind == WINDOW && change_of(&body) == Some("title") {
+            continue;
+        }
+        if !subs.iter().any(|(k, _)| k.contains(&kind)) {
+            continue;
+        }
+        let Some(j) = json::parse(&body) else { continue };
+        for (k, cb) in &subs {
+            if k.contains(&kind) {
                 cb(&j);
             }
         }
-    });
+    }
 }
+
 
 /// Next/previous workspace from `cur` (the tracked focused one), clamped to 1-9; `take` moves the
 /// focused window along.
@@ -210,9 +295,15 @@ mod tests {
         let mut buf = encode(4, "{}");
         buf.extend(encode(0x8000_0000, "[1]"));
         buf.extend_from_slice(b"i3-ip");
-        assert_eq!(decode(&mut buf), Some((4, "{}".into())));
-        assert_eq!(decode(&mut buf), Some((0x8000_0000, "[1]".into())));
-        assert_eq!(decode(&mut buf), None);
+        assert_eq!(decode(&mut buf), vec![(4, "{}".into()), (0x8000_0000, "[1]".into())]);
         assert_eq!(buf, b"i3-ip");
+        assert_eq!(decode(&mut buf), vec![]);
+    }
+
+    #[test]
+    fn change_read_without_parsing() {
+        assert_eq!(change_of(r#"{ "change": "title", "container": { "name": "x" } }"#), Some("title"));
+        assert_eq!(change_of(r#"{"change":"new","container":{"name":"\"change\": \"title\""}}"#), Some("new"));
+        assert_eq!(change_of(r#"{ "container": {} }"#), None);
     }
 }

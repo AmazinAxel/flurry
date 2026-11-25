@@ -1387,6 +1387,36 @@ impl Default for Blurred {
     }
 }
 
+/// Bytes of whole-image blurs and shrinks kept for the current wallpaper, oldest dropped first.
+const SOURCE_BUDGET: usize = 32 << 20;
+
+impl Blurred {
+    fn keep_shrunk(&mut self, size: (u32, u32), p: Pixmap) {
+        self.make_room(p.data().len());
+        self.shrunk.push((size, p));
+    }
+
+    fn keep_source(&mut self, bucket: i32, s: Rc<(Pixmap, f32, f32)>) {
+        self.make_room(s.0.data().len());
+        self.sources.push((bucket, s));
+    }
+
+    /// Drops the oldest entries until `incoming` more bytes fit (everything, if it alone is over).
+    /// Shrinks go first: losing one costs a downscale, a source a blur.
+    fn make_room(&mut self, incoming: usize) {
+        let used = |b: &Self| b.sources.iter().map(|s| s.1.0.data().len()).sum::<usize>() + b.shrunk.iter().map(|s| s.1.data().len()).sum::<usize>();
+        while used(self) + incoming > SOURCE_BUDGET {
+            if !self.shrunk.is_empty() {
+                self.shrunk.remove(0);
+            } else if !self.sources.is_empty() {
+                self.sources.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 thread_local! {
     static BLURRED: std::cell::RefCell<Blurred> = std::cell::RefCell::new(Blurred::default());
 }
@@ -1429,14 +1459,14 @@ fn cut_from_blurred(layer: &mut Pixmap, img: &Img, t: Transform, area: Rect, rad
                 None => {
                     let Some(mut s) = Pixmap::new(bw, bh) else { return false };
                     downscale(pix.data(), iw as usize, ih as usize, s.data_mut(), bw as usize, bh as usize);
-                    BLURRED.with(|b| b.borrow_mut().shrunk.push(((bw, bh), s.clone())));
+                    BLURRED.with(|b| b.borrow_mut().keep_shrunk((bw, bh), s.clone()));
                     s
                 }
             };
             let (fx, fy) = (iw as f32 / bw as f32, ih as f32 / bh as f32);
             blur(&mut small, r_img / fx.max(fy));
             let s = Rc::new((small, fx, fy));
-            BLURRED.with(|b| b.borrow_mut().sources.push((bucket, s.clone())));
+            BLURRED.with(|b| b.borrow_mut().keep_source(bucket, s.clone()));
             s
         }
     };

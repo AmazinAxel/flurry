@@ -53,6 +53,8 @@ pub const METADATA_SET_PROPERTY: u8 = 1;
 // events, by interface
 pub const CORE_DONE: u8 = 1;
 pub const CORE_PING: u8 = 2;
+/// the server dropped one of our proxies: its id may be taken again
+pub const CORE_REMOVE_ID: u8 = 4;
 pub const REGISTRY_GLOBAL: u8 = 0;
 pub const REGISTRY_GLOBAL_REMOVE: u8 = 1;
 pub const NODE_INFO: u8 = 0;
@@ -287,6 +289,8 @@ pub struct Conn {
     inbuf: Vec<u8>,
     seq: u32,
     next_id: u32,
+    /// ids the server has released (Core::RemoveId), taken before new ones
+    free_ids: Vec<u32>,
 }
 
 impl Conn {
@@ -294,7 +298,7 @@ impl Conn {
     pub fn connect(path: &str) -> Option<Conn> {
         let sock = UnixStream::connect(path).ok()?;
         sock.set_nonblocking(true).ok()?;
-        let mut c = Conn { sock, out: vec![], inbuf: vec![], seq: 0, next_id: 2 };
+        let mut c = Conn { sock, out: vec![], inbuf: vec![], seq: 0, next_id: 2, free_ids: vec![] };
         // Core::Hello(PW_VERSION_CORE), then Client::UpdateProperties
         c.send(CORE, 1, |w| {
             w.int(4);
@@ -310,11 +314,20 @@ impl Conn {
         self.sock.as_raw_fd()
     }
 
-    /// A fresh proxy id. Never reused: the server only takes the next one in line (or a slot
-    /// it has released), and a counter never runs out at this rate.
+    /// A proxy id: one the server has released, else the next in line (the server takes either).
     pub fn new_id(&mut self) -> u32 {
-        self.next_id += 1;
-        self.next_id - 1
+        self.free_ids.pop().unwrap_or_else(|| {
+            self.next_id += 1;
+            self.next_id - 1
+        })
+    }
+
+    /// Core::RemoveId: the server holds nothing more under `id`, so it may be bound again.
+    pub fn release_id(&mut self, id: u32) {
+        // the core and client proxies live as long as the connection
+        if id > CLIENT && id < self.next_id && !self.free_ids.contains(&id) {
+            self.free_ids.push(id);
+        }
     }
 
     /// Sends method `op` on proxy `id`; `f` writes its fields, straight after the header.

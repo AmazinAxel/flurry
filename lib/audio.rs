@@ -284,6 +284,7 @@ fn event(id: u32, op: u8, mut f: Fields) -> Option<()> {
                     })
                 });
             }
+            pw::CORE_REMOVE_ID => remove_id(f.int()? as u32),
             _ => {}
         }
         return Some(());
@@ -362,6 +363,22 @@ fn global(gid: u32, ty: &str, props: &Dict) {
         }
         _ => {}
     }
+}
+
+/// The server destroyed proxy `id` (its global went, usually announced first): nothing may still
+/// map to it once the id is taken again.
+fn remove_id(id: u32) {
+    with(|p| {
+        p.proxies.remove(&id);
+        p.nodes.retain(|_, x| *x != id);
+        p.devices.retain(|_, (x, _)| *x != id);
+        if p.metadata == Some(id) {
+            p.metadata = None;
+        }
+        if p.registry != id {
+            p.conn.release_id(id);
+        }
+    });
 }
 
 fn global_remove(gid: u32) {
