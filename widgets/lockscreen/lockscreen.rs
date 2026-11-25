@@ -255,8 +255,8 @@ fn build() -> Node {
     if let Kind::Label(LabelSpec { line_height, .. }) = &mut clock.kind {
         *line_height = Some(0.75);
     }
-    let mut bat = battery_percent(&base).align(Align::Start, Align::End);
-    bat.style.margin = Sides::all(SPACE_L);
+    // margin on a wrapper: a size request covers the margin box, so on the slot it would shrink it
+    let bat = Node::hbox(Style { margin: Sides::all(SPACE_L), ..base.inherit() }, 0.0, vec![battery_percent(&base)]).align(Align::Start, Align::End);
     Node::overlay(base.inherit(), vec![clock, bat])
 }
 

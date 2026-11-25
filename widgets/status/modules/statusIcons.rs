@@ -14,10 +14,13 @@ fn icon_for(state: &str) -> &'static str {
     }
 }
 
+/// Side of every status slot: icons, the battery number, the recording square's box.
+const ICON: f32 = 36.0;
+
 fn img(base: &Style, name: &'static str) -> Node {
     let mut s = base.inherit();
     s.color = light1();
-    Node::icon(s, name, 36.0)
+    Node::icon(s, name, ICON)
 }
 
 /// Battery percentage, or the full icon from 99%; hidden without a battery.
@@ -33,7 +36,9 @@ pub fn battery_percent(base: &Style) -> Node {
     pct_style.font.size = 24.0;
     pct_style.font.weight = 700;
     pct_style.color = if b.charging() { green() } else { alpha(blue1(), 0.9) };
-    Node::label(pct_style, pct.to_string()).align(Align::Center, Align::Center).show(has)
+    // in an icon-sized slot, so 1 or 2 digits take the full icon's place in the column
+    let label = Node::label(pct_style, pct.to_string()).align(Align::Center, Align::Center).expand(true, false);
+    Node::hbox(base.inherit(), 0.0, vec![label]).size(ICON, ICON).show(has)
 }
 
 pub fn status(base: &Style) -> Node {
@@ -44,7 +49,7 @@ pub fn status(base: &Style) -> Node {
 
     // one evenly spaced column, centered on the row whatever is shown
     Node::vbox(base.inherit(), SPACE_M, vec![
-        Node::hbox(base.inherit(), 0.0, vec![rec]).size(36.0, 36.0).show(crate::widgets::record::service::is_rec().peek()),
+        Node::hbox(base.inherit(), 0.0, vec![rec]).size(ICON, ICON).show(crate::widgets::record::service::is_rec().peek()),
         battery_percent(base),
         // a wired link carries the traffic over Wi-Fi
         img(base, if wired::online().peek() { wired::WIRED_ICON } else { iwd::state().with(|s| icon_for(s)) }),
