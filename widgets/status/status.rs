@@ -42,7 +42,7 @@ pub fn media_source() -> MediaSource {
 
 /// Play/pause on the left with the mpd song, or the MPRIS track while mpd is paused;
 /// just a centered button when there is neither. Always as tall as title plus artist.
-fn media(base: &Style, focus: Option<&str>) -> Node {
+fn media(base: &Style) -> Node {
     let info = |title: String, artist: String| {
         let mut t = base.inherit();
         t.font.size = 22.0;
@@ -62,11 +62,8 @@ fn media(base: &Style, focus: Option<&str>) -> Node {
     // the volume bar overlays the card's bottom edge, above its border, so the card keeps its size
     let card = Style { background: Some(playlist), margin: Sides::vh(SPACE_M, 0.0), ..base.inherit() }.border(Sides::all(BORDER), lighter(playlist));
     let icon = if playing { "pause" } else { "play" };
-    let mut btn_style = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
-    if focus == Some("mediaBtn") {
-        btn_style = focus_outline(btn_style);
-    }
-    let btn = Node::hbox(btn_style, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]).focusable("mediaBtn");
+    let btn_style = Style { padding: Sides::vh(SPACE_M, SPACE_L), ..base.inherit() };
+    let btn = Node::hbox(btn_style, 0.0, vec![Node::icon(base.inherit(), icon, 32.0).align(Align::Center, Align::Center)]);
     let (text, volume) = match media_source() {
         MediaSource::Mpd(text) => (text, mpd_volume().peek()),
         MediaSource::Mpris(text) => (Some(text), mpris::volume().peek()),
@@ -94,5 +91,5 @@ pub fn quickstatus(base: &Style, focus: Option<&str>) -> (Node, Option<Node>) {
     let top = Node::hbox(base.inherit(), GAP, vec![clock, icons, date]).expand(true, false).align(Align::Center, Align::Center);
     let mut big = base.clone();
     big.font.size = CONTROL_FONT;
-    (top, Some(Node::vbox(big.inherit(), 0.0, vec![media(&big, focus), quick_settings(&big, focus)]).expand(true, false)))
+    (top, Some(Node::vbox(big.inherit(), 0.0, vec![media(&big), quick_settings(&big, focus)]).expand(true, false)))
 }

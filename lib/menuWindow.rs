@@ -129,9 +129,6 @@ pub fn menu_window() -> Rc<Win> {
         if name == "bluetooth" && bluetooth::key(&focus, ev) {
             return w.redraw();
         }
-        if name == "status" && !ev.shift && !ev.ctrl && !ev.alt && qs::key(&focus, ev) {
-            return w.redraw();
-        }
         if matches!(ev.sym, Keysym::Return | Keysym::KP_Enter | Keysym::space) {
             match name {
                 "status" if matches!(ev.sym, Keysym::Return | Keysym::KP_Enter) => {

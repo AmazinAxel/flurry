@@ -46,21 +46,20 @@ global_state! {
     pub fn brightness() -> f64 = read(&path()) as f64 / max().max(1) as f64;
 }
 
+/// Leveled like `Sink::volume_icon`: the core, then the straight rays, then all of them.
+pub fn icon(level: f64) -> &'static str {
+    if level <= 0.33 {
+        "brightness-low"
+    } else if level <= 0.66 {
+        "brightness-medium"
+    } else {
+        "brightness-high"
+    }
+}
+
 /// Direct sysfs write: synchronous, no bus round trip.
 fn write(v: u32) -> bool {
     std::fs::write(path(), v.to_string()).is_ok()
-}
-
-pub fn set_brightness(percent: f64) {
-    let max = max();
-    if max == 0 {
-        return;
-    }
-    let steps = (percent * max as f64).floor().clamp(0.0, max as f64) as u32;
-    brightness().set(steps as f64 / max as f64);
-    if !write(steps) {
-        crate::lib::logind::set_brightness(&screen(), steps);
-    }
 }
 
 fn actual() -> u32 {
@@ -109,7 +108,7 @@ pub fn step(up: bool) {
 
 /// The backlight core sysfs_notify()s actual_brightness on every change (keys, logind, other tools),
 /// so this wakes only for brightness changes, not for every kernel uevent; shown is the requested
-/// level, as the keys and the slider set it.
+/// level, as the keys set it.
 pub fn monitor() {
     let Ok(file) = std::fs::File::open(format!("{DIR}/{}/actual_brightness", screen())) else { return };
     // reading re-arms the notification; None once it fails (device gone)

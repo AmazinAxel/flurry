@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::lib::audio;
-use crate::lib::brightness::brightness;
+use crate::lib::brightness::{self, brightness};
 use crate::lib::outTransition::Flash;
 use crate::lib::style::*;
 use crate::ui::node::{Node, Sides, Style, levelbar};
@@ -59,7 +59,10 @@ pub fn osd() {
     SHOW.with(|f| *f.borrow_mut() = Some(show.clone()));
     let b = brightness();
     let s1 = show.clone();
-    b.subscribe(move || s1("brightness", brightness().peek()));
+    b.subscribe(move || {
+        let v = brightness().peek();
+        s1(brightness::icon(v), v)
+    });
 
     // volume/mute changes and default speaker switches, after the first sync; a default that is
     // briefly unknown (new sink not bound yet) keeps the last one so the switch still shows

@@ -132,13 +132,7 @@ pub fn reboot() {
     power("Reboot");
 }
 
-pub fn set_brightness(device: &str, value: u32) {
-    if let Some(bus) = dbus::system() {
-        bus.send(method(NAME, &session_path(), SESSION, "SetBrightness").append3("backlight", device, value));
-    }
-}
-
-/// `set_brightness`, then `done(written)` on logind's reply; false (and `done` never runs) without a bus.
+/// logind SetBrightness, then `done(written)` on its reply; false (and `done` never runs) without a bus.
 pub fn set_brightness_then(device: &str, value: u32, done: impl FnOnce(bool) + 'static) -> bool {
     let Some(bus) = dbus::system() else { return false };
     bus.call_cb(method(NAME, &session_path(), SESSION, "SetBrightness").append3("backlight", device, value), move |r| done(r.is_ok()));

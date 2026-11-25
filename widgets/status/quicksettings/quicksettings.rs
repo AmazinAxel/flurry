@@ -1,23 +1,19 @@
-// Volume + brightness sliders and the output selector.
+// Volume + brightness sliders (display only) and the output selector, its only focusable part.
 
 use std::rc::Rc;
 
 use tiny_skia::{PathBuilder, Rect, Transform};
-use xkbcommon::xkb::Keysym;
 
 use crate::lib::audio;
-use crate::lib::brightness::{self, brightness, set_brightness};
+use crate::lib::brightness::{self, brightness};
 use crate::lib::deviceMenu::{Trailing, aside_row, device_row, separator};
 use crate::lib::style::*;
 use crate::ui::node::{Align, Kind, Node, Sides, Style, alpha, blurred, fill_rect, hash, rgba};
-use crate::ui::wayland::KeyEvent;
 use crate::widgets::status::quicksettings::sound::{self, apply_selection, name_substitute, selected};
 
 /// Slider horizontal padding and the trough's end caps.
 const PAD_X: f32 = SPACE_M;
 const CAP: f32 = 10.0;
-/// Left/Right on a focused slider.
-const STEP: f64 = 0.05;
 
 fn volume_icon() -> &'static str {
     audio::default_speaker().map(|s| s.volume_icon()).unwrap_or("volume-muted")
@@ -25,7 +21,7 @@ fn volume_icon() -> &'static str {
 
 /// `window scale` look: trough @light1 5px with the 10px end caps as shadows, @blue2 highlight,
 /// a 19px diamond knob (9px + 5px @blue2 border, rotated 45deg).
-pub fn slider(base: &Style, id: &str, value: f64, focused: bool) -> Node {
+fn slider(base: &Style, value: f64) -> Node {
     let paint = Rc::new(move |pm: &mut tiny_skia::PixmapMut, r: Rect, ts: Transform| {
         // r is the content box (padding already removed); trough margin 0 CAP
         let Some(trough) = Rect::from_xywh(r.x() + CAP, r.y() + (r.height() - 5.0) / 2.0, (r.width() - 2.0 * CAP).max(1.0), 5.0) else { return };
@@ -56,26 +52,23 @@ pub fn slider(base: &Style, id: &str, value: f64, focused: bool) -> Node {
             }
         }
     });
-    let mut s = Style { padding: Sides::vh(SPACE_L, PAD_X), min_height: 5.0, ..base.inherit() };
-    if focused {
-        s = focus_outline(s);
-    }
+    let s = Style { padding: Sides::vh(SPACE_L, PAD_X), min_height: 5.0, ..base.inherit() };
     // what the paint depends on besides its box: repainted only when one changes
     let colors = [blue2(), light1(), dark1()].map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(f32::to_bits));
     let key = Some(hash(&(value.to_bits(), colors)));
-    Node::new(Kind::Custom { width: 0.0, height: 5.0, key, paint }, s).expand(true, false).focusable(id)
+    Node::new(Kind::Custom { width: 0.0, height: 5.0, key, paint }, s).expand(true, false)
 }
 
 pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
     let vol = audio::default_speaker().map(|s| s.volume).unwrap_or(0.0);
     let mut rows = vec![Node::hbox(base.inherit(), 0.0, vec![
         Node::icon(base.inherit(), volume_icon(), 32.0).align(Align::Fill, Align::Center),
-        slider(base, "volume", vol, focus == Some("volume")),
+        slider(base, vol),
     ])];
     if brightness::available() {
         rows.push(Node::hbox(base.inherit(), 0.0, vec![
-            Node::icon(base.inherit(), "brightness", 32.0).align(Align::Fill, Align::Center),
-            slider(base, "brightness", brightness().peek(), focus == Some("brightness")),
+            Node::icon(base.inherit(), brightness::icon(brightness().peek()), 32.0).align(Align::Fill, Align::Center),
+            slider(base, brightness().peek()),
         ]));
     }
     let sel = selected().peek();
@@ -100,34 +93,9 @@ pub fn quick_settings(base: &Style, focus: Option<&str>) -> Node {
 
 /// Enter selects only this sink, Shift+Enter toggles it into a combined output.
 pub fn activate(id: &str, shift: bool) -> bool {
-    if id == "mediaBtn" {
-        crate::lib::mediaPlayer::play_pause();
-        return true;
-    }
     let Some(name) = id.strip_prefix("sink:") else { return false };
     let Some(sp) = sound::listed().into_iter().find(|s| s.name == name) else { return false };
     if shift { sound::toggle_sink(&sp) } else { apply_selection(&[name.to_string()]) }
-    true
-}
-
-/// Left/Right (h/l) on a focused slider step its value.
-pub fn key(id: &str, ev: &KeyEvent) -> bool {
-    let delta = match ev.sym {
-        Keysym::Left | Keysym::h => -STEP,
-        Keysym::Right | Keysym::l => STEP,
-        _ => return false,
-    };
-    match id {
-        "volume" => {
-            let Some(s) = audio::default_speaker() else { return true };
-            audio::set_volume(&s, (s.volume + delta).clamp(0.0, 1.0));
-            if s.mute {
-                audio::set_mute(&s, false);
-            }
-        }
-        "brightness" => set_brightness((brightness().peek() + delta).clamp(0.0, 1.0)),
-        _ => return false,
-    }
     true
 }
 
