@@ -75,6 +75,7 @@ fn set_display(on: bool) {
     entry().borrow_mut().set_text(""); // keys typed around a display toggle are no attempt
     DISPLAY_OFF.with(|d| d.set(!on));
     sway::command(&format!("output * power {}", if on { "on" } else { "off" }));
+    logind::inhibit_lid(!on);
     if on {
         fprint_kick();
     }
@@ -321,6 +322,7 @@ fn end_lock() {
     // unconditional: a shell restarted while the display was off doesn't know it is
     DISPLAY_OFF.with(|d| d.set(false));
     sway::command("output * power on");
+    logind::inhibit_lid(false);
     if let Some(f) = FPRINT.with(|f| f.borrow().clone()) {
         f.sync();
     }

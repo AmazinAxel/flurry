@@ -18,6 +18,9 @@ thread_local! {
     /// this session's object path, once GetSession answers
     static SESSION_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
     static ON_LOCK: RefCell<Option<Rc<dyn Fn()>>> = RefCell::default();
+    /// a handle-lid-switch block inhibitor: the display was turned off on purpose
+    static LID: RefCell<Option<OwnedFd>> = const { RefCell::new(None) };
+    static LID_WANTED: Cell<bool> = const { Cell::new(false) };
 }
 
 global_state! {
@@ -105,6 +108,29 @@ pub fn inhibit_sleep(why: &str) {
             }
         }
         None => WANTED.with(|w| w.set(false)),
+    });
+}
+
+/// Holds (or drops) a block on logind's lid action, so closing the lid with the display off doesn't
+/// suspend. Dies with the shell: a crash can't leave the lid ignored.
+pub fn inhibit_lid(on: bool) {
+    LID_WANTED.with(|w| w.set(on));
+    if !on {
+        LID.with(|l| l.borrow_mut().take());
+        return;
+    }
+    if LID.with(|l| l.borrow().is_some()) {
+        return;
+    }
+    let Some(bus) = dbus::system() else { return };
+    let msg = method(NAME, PATH, MANAGER, "Inhibit").append3("handle-lid-switch", "flurry", "display off").append1("block");
+    bus.call_cb(msg, |r| {
+        if let Some(fd) = r.ok().and_then(|m| m.read1::<OwnedFd>().ok()) {
+            // released while the call was pending: the fd drops here
+            if LID_WANTED.with(Cell::get) {
+                LID.with(|l| *l.borrow_mut() = Some(fd));
+            }
+        }
     });
 }
 
